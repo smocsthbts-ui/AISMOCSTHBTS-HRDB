@@ -1,0 +1,8 @@
+{
+  "name": "Siemens Multi-Department Shift & TimeSheet Management",
+  "description": "Industrial multi-department employee shift planning, biometric time attendance, OT import, and Siemens-standard TimeSheet management system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

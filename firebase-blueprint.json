@@ -1,0 +1,168 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "Siemens employee record",
+      "type": "object",
+      "properties": {
+        "empNo": { "type": "string", "maxLength": 32 },
+        "gid": { "type": "string", "maxLength": 32 },
+        "firstName": { "type": "string", "maxLength": 100 },
+        "familyName": { "type": "string", "maxLength": 100 },
+        "department": { "type": "string", "maxLength": 32 },
+        "isShiftWorker": { "type": "boolean" },
+        "position": { "type": "string", "maxLength": 100 },
+        "hireDate": { "type": "string", "maxLength": 32 }
+      },
+      "required": ["empNo", "gid", "firstName", "familyName", "department"]
+    },
+    "DailyShiftPlan": {
+      "title": "DailyShiftPlan",
+      "description": "Shift schedule assignment for an employee on a specific date",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "empNo": { "type": "string", "maxLength": 32 },
+        "gid": { "type": "string", "maxLength": 32 },
+        "date": { "type": "string", "maxLength": 16 },
+        "shiftCode": { "type": "string", "maxLength": 16 },
+        "department": { "type": "string", "maxLength": 32 },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "empNo", "date", "shiftCode", "department"]
+    },
+    "ShiftCode": {
+      "title": "ShiftCode",
+      "description": "Shift code definition and working hours",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "maxLength": 16 },
+        "name": { "type": "string", "maxLength": 64 },
+        "nameTh": { "type": "string", "maxLength": 64 },
+        "startTime": { "type": "string", "maxLength": 16 },
+        "endTime": { "type": "string", "maxLength": 16 },
+        "workHours": { "type": "number" },
+        "color": { "type": "string", "maxLength": 32 },
+        "isWorkingDay": { "type": "boolean" },
+        "isOvernight": { "type": "boolean" }
+      },
+      "required": ["code", "name", "startTime", "endTime"]
+    },
+    "BiometricRawPunch": {
+      "title": "BiometricRawPunch",
+      "description": "Biometric card/fingerprint swipe entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "empIdentifier": { "type": "string", "maxLength": 32 },
+        "type": { "type": "string", "enum": ["I", "O"] },
+        "timestamp": { "type": "string", "maxLength": 32 },
+        "date": { "type": "string", "maxLength": 16 },
+        "time": { "type": "string", "maxLength": 16 },
+        "deviceId": { "type": "string", "maxLength": 16 },
+        "rawLine": { "type": "string", "maxLength": 256 }
+      },
+      "required": ["id", "empIdentifier", "type", "date", "time"]
+    },
+    "OTRecord": {
+      "title": "OTRecord",
+      "description": "Approved overtime record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "empNo": { "type": "string", "maxLength": 32 },
+        "gid": { "type": "string", "maxLength": 32 },
+        "date": { "type": "string", "maxLength": 16 },
+        "otHours": { "type": "number" },
+        "otMultiplier": { "type": "number" },
+        "reason": { "type": "string", "maxLength": 256 },
+        "approvedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["id", "empNo", "date", "otHours", "otMultiplier"]
+    },
+    "OtherAllowance": {
+      "title": "OtherAllowance",
+      "description": "Shift and food allowances",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "empNo": { "type": "string", "maxLength": 32 },
+        "gid": { "type": "string", "maxLength": 32 },
+        "date": { "type": "string", "maxLength": 16 },
+        "allowanceType": { "type": "string", "maxLength": 64 },
+        "amount": { "type": "number" },
+        "description": { "type": "string", "maxLength": 256 }
+      },
+      "required": ["id", "empNo", "date", "allowanceType", "amount"]
+    },
+    "ManualOverride": {
+      "title": "ManualOverride",
+      "description": "Manual timesheet edit override per employee date",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "empNo": { "type": "string", "maxLength": 32 },
+        "date": { "type": "string", "maxLength": 16 },
+        "shiftCode": { "type": "string", "maxLength": 16 },
+        "actualIn": { "type": "string", "maxLength": 16 },
+        "actualOut": { "type": "string", "maxLength": 16 },
+        "normalHours": { "type": "number" },
+        "ot10": { "type": "number" },
+        "ot15": { "type": "number" },
+        "ot20": { "type": "number" },
+        "ot30": { "type": "number" },
+        "remark": { "type": "string", "maxLength": 256 },
+        "updatedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["id", "empNo", "date"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "System user account",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "role": { "type": "string", "enum": ["Admin", "User"] },
+        "department": { "type": "string", "maxLength": 32 },
+        "gid": { "type": "string", "maxLength": 32 }
+      },
+      "required": ["email", "name", "role", "department"]
+    }
+  },
+  "firestore": {
+    "/employees/{employeeId}": {
+      "schema": "Employee",
+      "description": "All Siemens employee profiles"
+    },
+    "/shift_plans/{planId}": {
+      "schema": "DailyShiftPlan",
+      "description": "Monthly shift plan entries per employee per date"
+    },
+    "/shift_codes/{codeId}": {
+      "schema": "ShiftCode",
+      "description": "Shift code definitions"
+    },
+    "/raw_punches/{punchId}": {
+      "schema": "BiometricRawPunch",
+      "description": "Biometric time punch records"
+    },
+    "/ot_records/{recordId}": {
+      "schema": "OTRecord",
+      "description": "Approved overtime records"
+    },
+    "/other_allowances/{allowanceId}": {
+      "schema": "OtherAllowance",
+      "description": "Other shift and duty allowances"
+    },
+    "/manual_overrides/{overrideId}": {
+      "schema": "ManualOverride",
+      "description": "Timesheet manual adjustment overrides"
+    },
+    "/user_accounts/{userEmail}": {
+      "schema": "UserAccount",
+      "description": "Application user authorization records"
+    }
+  }
+}

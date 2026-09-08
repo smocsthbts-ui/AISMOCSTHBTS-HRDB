@@ -1,0 +1,34 @@
+--- src/components/SiemensSidebar.tsx
++++ src/components/SiemensSidebar.tsx
+@@ -19,7 +19,8 @@
+   Moon,
+   Maximize2,
+   Minimize2,
+   Layers,
+   Sparkles,
+-  FileSpreadsheet
++  FileSpreadsheet,
++  LogOut
+ } from 'lucide-react';
+ import { UserAccount } from '../types';
++import { logOut } from '../firebase';
+ 
+@@ -193,8 +194,14 @@
+             </div>
+           )}
+         </div>
++        
++        {/* Controls */}
++        <div className={`mt-2 flex items-center justify-between px-1 ${isCollapsed ? 'flex-col space-y-2' : ''}`}>
++          <button
++            onClick={() => logOut()}
++            className="p-1.5 rounded text-slate-400 hover:text-white hover:bg-red-500/20 transition"
++            title="ออกจากระบบ (Logout)"
++          >
++            <LogOut className="w-4 h-4" />
++          </button>
+ 
+-        {/* Quick Controls */}
+-        <div className={`mt-2 flex items-center justify-between px-1 ${isCollapsed ? 'flex-col space-y-2' : ''}`}>
+           <button
+             onClick={onToggleTheme}

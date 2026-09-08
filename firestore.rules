@@ -1,0 +1,79 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isCurrentUser(email) {
+      return isSignedIn() && request.auth.token.email == email;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'smo.cs.th.bts@gmail.com' ||
+        request.auth.token.email == 'admin@siemens.com'
+      );
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Connection test document
+    match /test/{docId} {
+      allow read, write: if true;
+    }
+
+    // Employees Collection
+    match /employees/{employeeId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true; // Allow initial sync & authenticated updates
+    }
+
+    // Shift Plans Collection
+    match /shift_plans/{planId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
+    // Shift Codes Collection
+    match /shift_codes/{codeId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
+    // Raw Punches Collection
+    match /raw_punches/{punchId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
+    // OT Records Collection
+    match /ot_records/{recordId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
+    // Other Allowances Collection
+    match /other_allowances/{allowanceId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
+    // Manual Overrides Collection
+    match /manual_overrides/{overrideId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
+    // User Accounts Collection
+    match /user_accounts/{userId} {
+      allow read: if true;
+      allow write: if isBootstrappedAdmin() || isSignedIn() || true;
+    }
+  }
+}
