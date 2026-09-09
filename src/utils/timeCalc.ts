@@ -20,6 +20,55 @@ export function minutesToHHMM(totalMinutes: number): string {
 }
 
 /**
+ * Standard Shift Category Color Resolver
+ * Group shift codes by family (D, M/E, A, N, ST, OFF, H, SL/AL/TR, SBY)
+ */
+export function getShiftCategoryColor(code: string, fallbackColor?: string): string {
+  if (!code) return '#6b7280';
+  const c = code.trim().toUpperCase();
+
+  // 1. Day Shifts (D, D1, D2, D3, etc.) - Siemens Teal / Cyan family
+  if (c === 'D') return '#008b99';       // Primary Siemens Teal
+  if (c === 'D1') return '#0891b2';      // Dark Cyan
+  if (c === 'D2') return '#0284c7';      // Sky Blue
+  if (c.startsWith('D')) return '#008b99';
+
+  // 2. Morning / Early Shifts (M, M1, E, E1, etc.) - Blue family
+  if (c === 'M' || c === 'E') return '#06b6d4';   // Morning Cyan
+  if (c === 'M1' || c === 'E1') return '#3b82f6'; // Bright Royal Blue
+  if (c.startsWith('M') || c.startsWith('E')) return '#0284c7';
+
+  // 3. Afternoon Shifts (A, A1, A2, etc.) - Orange / Amber family
+  if (c === 'A') return '#f59e0b';       // Gold Amber
+  if (c === 'A1') return '#ea580c';      // Warm Orange
+  if (c === 'A2') return '#d97706';      // Dark Amber
+  if (c.startsWith('A')) return '#f59e0b';
+
+  // 4. Night Shifts (N, N1, N2, etc.) - Indigo / Purple family
+  if (c === 'N') return '#6366f1';       // Indigo Night
+  if (c === 'N1') return '#7c3aed';      // Violet Track Work
+  if (c === 'N2') return '#4f46e5';      // Deep Indigo Overhaul
+  if (c.startsWith('N')) return '#6366f1';
+
+  // 5. Special / Station Shifts (S1, ST1, ST2)
+  if (c === 'S1') return '#10b981';      // Emerald
+  if (c === 'ST1') return '#14b8a6';     // Teal
+  if (c === 'ST2') return '#d97706';     // Amber
+
+  // 6. Day Off & Holidays
+  if (c === 'OFF') return '#475569';     // Slate Dark
+  if (c === 'H') return '#ef4444';       // Red
+
+  // 7. Leaves & Training
+  if (c === 'AL') return '#ec4899';      // Pink
+  if (c === 'SL') return '#f43f5e';      // Rose
+  if (c === 'TR') return '#059669';      // Green
+  if (c === 'SBY') return '#8b5cf6';     // Violet
+
+  return fallbackColor || '#4b5563';
+}
+
+/**
  * Convert "HH:mm" to total minutes from midnight
  */
 export function hhmmToMinutes(timeStr: string): number {

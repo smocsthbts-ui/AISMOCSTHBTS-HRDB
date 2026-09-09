@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { storage } from '../utils/storage';
 import { generateShiftPlanTemplate, downloadBlob } from '../utils/fileParser';
+import { getShiftCategoryColor } from '../utils/timeCalc';
 import { MonthYearFilter } from './MonthYearFilter';
 import { ShiftPickerModal } from './ShiftPickerModal';
 
@@ -399,7 +400,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                         ? 'ring-2 ring-white ring-offset-1 ring-offset-slate-900 scale-105 shadow-sm'
                         : 'opacity-85 hover:opacity-100 hover:scale-102'
                     }`}
-                    style={{ backgroundColor: sc.color, color: '#ffffff' }}
+                    style={{ backgroundColor: getShiftCategoryColor(code, sc.color), color: '#ffffff' }}
                     title={`${sc.code}: ${sc.name} (${sc.startTime}-${sc.endTime})`}
                   >
                     <span>{code}</span>
@@ -682,7 +683,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                           >
                             <span 
                               className="inline-block w-6 h-6 leading-6 rounded text-[10px] font-mono font-bold text-white shadow-xs transition-transform hover:scale-110 active:scale-95"
-                              style={{ backgroundColor: shiftInfo?.color || '#4b5563' }}
+                              style={{ backgroundColor: getShiftCategoryColor(code, shiftInfo?.color) }}
                             >
                               {code}
                             </span>

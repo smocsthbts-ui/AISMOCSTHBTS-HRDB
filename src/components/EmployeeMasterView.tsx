@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Employee, UserAccount, Department } from '../types';
 import { storage } from '../utils/storage';
 import { 
@@ -11,9 +11,15 @@ import {
   Upload, 
   Download, 
   Lock,
-  Building2
+  Building2,
+  Filter,
+  RotateCcw,
+  X,
+  Layers,
+  Briefcase
 } from 'lucide-react';
 import { readFileAsArrayBuffer, parseSheetToRows, downloadBlob } from '../utils/fileParser';
+import { isDemoDepartment, firestoreSync } from '../firebase';
 import * as XLSX from 'xlsx';
 
 interface EmployeeMasterViewProps {
@@ -22,6 +28,7 @@ interface EmployeeMasterViewProps {
   theme: 'dark' | 'light';
   employees: Employee[];
   selectedDepartment: string;
+  onSelectDepartment?: (dept: string) => void;
   onDataChanged: () => void;
 }
 
@@ -31,15 +38,90 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
   theme,
   employees,
   selectedDepartment,
+  onSelectDepartment,
   onDataChanged,
 }) => {
   const isDark = theme === 'dark';
   const isAdmin = currentUser.role === 'Admin';
 
   const [searchTerm, setSearchTerm] = useState('');
+  const [selectedSection, setSelectedSection] = useState<string>(selectedDepartment || 'ALL');
+  const [shiftTypeFilter, setShiftTypeFilter] = useState<'ALL' | 'SHIFT' | 'OFFICE'>('ALL');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL');
+
   const [editingEmp, setEditingEmp] = useState<Employee | null>(null);
   const [isNew, setIsNew] = useState(false);
   const [activeTab, setActiveTab] = useState<'employees' | 'departments'>('employees');
+
+  // Synchronize when selectedDepartment changes from props
+  useEffect(() => {
+    if (selectedDepartment) {
+      setSelectedSection(selectedDepartment);
+    }
+  }, [selectedDepartment]);
+
+  // Handle section filter selection
+  const handleSectionChange = (section: string) => {
+    setSelectedSection(section);
+    if (onSelectDepartment) {
+      onSelectDepartment(section);
+    }
+  };
+
+  // Reset all filters
+  const handleResetFilters = () => {
+    setSelectedSection('ALL');
+    setSearchTerm('');
+    setShiftTypeFilter('ALL');
+    setStatusFilter('ALL');
+    if (onSelectDepartment) {
+      onSelectDepartment('ALL');
+    }
+  };
+
+  // Dynamically compute available sections
+  const availableSections = useMemo(() => {
+    const map = new Map<string, { code: string; name: string }>();
+
+    // 1. From departments list (excluding demo departments)
+    departments.forEach(d => {
+      const code = (d.code || '').trim().toUpperCase();
+      if (code && code !== 'ALL' && !isDemoDepartment(code)) {
+        map.set(code, { code, name: d.name || code });
+      }
+    });
+
+    // 2. From storage.getDepartments()
+    try {
+      const storedDepts = storage.getDepartments();
+      storedDepts.forEach(d => {
+        const code = (d.code || '').trim().toUpperCase();
+        if (code && code !== 'ALL' && !isDemoDepartment(code) && !map.has(code)) {
+          map.set(code, { code, name: d.name || code });
+        }
+      });
+    } catch {}
+
+    // 3. From employee data
+    employees.forEach(e => {
+      const code = (e.department || '').trim().toUpperCase();
+      if (code && code !== 'ALL' && !isDemoDepartment(code) && !map.has(code)) {
+        map.set(code, { code, name: code });
+      }
+    });
+
+    return Array.from(map.values()).sort((a, b) => a.code.localeCompare(b.code));
+  }, [departments, employees]);
+
+  // Employee counts per section
+  const sectionCounts = useMemo(() => {
+    const counts: Record<string, number> = { ALL: employees.length };
+    employees.forEach(emp => {
+      const dept = (emp.department || '').trim().toUpperCase();
+      counts[dept] = (counts[dept] || 0) + 1;
+    });
+    return counts;
+  }, [employees]);
 
   // Form state
   const [empForm, setEmpForm] = useState<Partial<Employee>>({
@@ -65,22 +147,40 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
   const filteredEmployees = useMemo(() => {
     return employees.filter(e => {
-      if (selectedDepartment !== 'ALL' && e.department !== selectedDepartment) {
-        return false;
+      // 1. Section Filter
+      if (selectedSection !== 'ALL') {
+        const empDept = (e.department || '').trim().toUpperCase();
+        if (empDept !== selectedSection.toUpperCase()) {
+          return false;
+        }
       }
+
+      // 2. Shift Type Filter
+      if (shiftTypeFilter === 'SHIFT' && !e.isShiftWorker) return false;
+      if (shiftTypeFilter === 'OFFICE' && e.isShiftWorker) return false;
+
+      // 3. Status Filter
+      if (statusFilter === 'ACTIVE' && !e.isActive) return false;
+      if (statusFilter === 'INACTIVE' && e.isActive) return false;
+
+      // 4. Search query
       if (searchTerm) {
-        const q = searchTerm.toLowerCase();
+        const q = searchTerm.toLowerCase().trim();
         return (
           e.firstName.toLowerCase().includes(q) ||
           e.familyName.toLowerCase().includes(q) ||
           e.empNo.toLowerCase().includes(q) ||
           e.gid.toLowerCase().includes(q) ||
-          e.department.toLowerCase().includes(q)
+          e.department.toLowerCase().includes(q) ||
+          (e.functionTitle && e.functionTitle.toLowerCase().includes(q)) ||
+          (e.costCenter && e.costCenter.toLowerCase().includes(q))
         );
       }
       return true;
     });
-  }, [employees, selectedDepartment, searchTerm]);
+  }, [employees, selectedSection, shiftTypeFilter, statusFilter, searchTerm]);
+
+  const hasActiveFilters = selectedSection !== 'ALL' || searchTerm.trim() !== '' || shiftTypeFilter !== 'ALL' || statusFilter !== 'ALL';
 
   // Open Edit or Create
   const handleOpenCreate = () => {
@@ -199,11 +299,26 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     onDataChanged();
   };
 
-  const handleDeleteDept = (code: string) => {
+  const handleDeleteDept = async (code: string) => {
     if (!isAdmin) return;
-    if (confirm(`คุณต้องการลบแผนก ${code} หรือไม่?`)) {
-      const list = departments.filter(d => d.code !== code);
-      storage.setDepartments(list);
+    const upper = code.trim().toUpperCase();
+    const affectedEmployees = employees.filter(e => (e.department || '').trim().toUpperCase() === upper);
+    let promptMsg = `คุณต้องการลบแผนก ${code} หรือไม่?`;
+    if (affectedEmployees.length > 0) {
+      promptMsg += `\n(มีพนักงาน ${affectedEmployees.length} คนสังกัดแผนกนี้ ระบบจะย้ายพนักงานไปสังกัดแผนก RST อัตโนมัติ เพื่อไม่ให้ข้อมูลพนักงานสูญหาย)`;
+    }
+    if (confirm(promptMsg)) {
+      if (affectedEmployees.length > 0) {
+        const updatedEmployees = employees.map(e => 
+          (e.department || '').trim().toUpperCase() === upper
+            ? { ...e, department: 'RST' }
+            : e
+        );
+        await storage.setEmployees(updatedEmployees);
+      }
+      const list = departments.filter(d => (d.code || '').trim().toUpperCase() !== upper);
+      await storage.setDepartments(list);
+      await firestoreSync.deleteDepartment(upper);
       onDataChanged();
     }
   };
@@ -324,10 +439,10 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
         {/* Action Controls */}
         <div className="flex items-center space-x-2 flex-wrap gap-2">
-          <div className={`flex items-center rounded border px-2.5 py-1.5 text-xs w-48 ${
+          <div className={`flex items-center rounded border px-2.5 py-1.5 text-xs w-52 ${
             isDark ? 'bg-[#0f1721] border-[#273a4e]' : 'bg-slate-50 border-slate-300'
           }`}>
-            <Search className="w-3.5 h-3.5 mr-2 text-slate-400" />
+            <Search className="w-3.5 h-3.5 mr-2 text-slate-400 shrink-0" />
             <input
               type="text"
               placeholder="ค้นหาชื่อ, GID, รหัส..."
@@ -335,6 +450,16 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
               onChange={e => setSearchTerm(e.target.value)}
               className="bg-transparent outline-none w-full text-xs"
             />
+            {searchTerm && (
+              <button
+                type="button"
+                onClick={() => setSearchTerm('')}
+                className="text-slate-400 hover:text-slate-200 ml-1"
+                title="ล้างคำค้นหา"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
           <button
@@ -402,6 +527,205 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
       {/* Employee Content */}
       {activeTab === 'employees' ? (
         <>
+          {/* Section & Attribute Filter Toolbar */}
+          <div className={`p-3.5 rounded border flex flex-col space-y-3 ${
+            isDark ? 'bg-[#0f1722] border-[#203244]' : 'bg-white border-slate-200 shadow-xs'
+          }`}>
+            {/* Top row: Section Dropdown + Shift Worker Filter + Status Filter + Count & Reset */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[260px]">
+                {/* 1. Section Filter Dropdown */}
+                <div className="flex items-center space-x-2 shrink-0">
+                  <div className="p-1.5 rounded bg-teal-500/10 text-teal-400 shrink-0 border border-teal-500/20">
+                    <Building2 className="w-4 h-4" />
+                  </div>
+                  <label htmlFor="select-employee-section" className="text-xs font-bold text-teal-400 whitespace-nowrap flex items-center gap-1">
+                    <span>Section / แผนก:</span>
+                  </label>
+                  <select
+                    id="select-employee-section"
+                    aria-label="เลือก Section หรือแผนก"
+                    value={selectedSection}
+                    onChange={e => handleSectionChange(e.target.value)}
+                    className={`px-3 py-1.5 rounded border text-xs font-medium cursor-pointer outline-none transition min-w-[190px] ${
+                      isDark 
+                        ? 'bg-[#14202c] border-[#273a4e] text-white focus:border-[#00e5e5]' 
+                        : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-[#008b99]'
+                    }`}
+                  >
+                    <option value="ALL">
+                      ทุกแผนก (All Sections) ({employees.length} คน)
+                    </option>
+                    {availableSections.map(s => (
+                      <option key={s.code} value={s.code}>
+                        {s.code} - {s.name} ({sectionCounts[s.code] || 0} คน)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* 2. Shift Worker Type Filter */}
+                <div className={`flex items-center space-x-1 border rounded px-1.5 py-0.5 text-[11px] shrink-0 ${
+                  isDark ? 'border-[#273a4e] bg-[#14202c]' : 'border-slate-300 bg-slate-100'
+                }`}>
+                  <span className="text-slate-400 px-1 font-medium">กะ:</span>
+                  <button
+                    type="button"
+                    onClick={() => setShiftTypeFilter('ALL')}
+                    className={`px-2 py-0.5 rounded transition font-medium ${
+                      shiftTypeFilter === 'ALL'
+                        ? 'bg-teal-600 text-white font-bold shadow-xs'
+                        : isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    ทั้งหมด
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShiftTypeFilter('SHIFT')}
+                    className={`px-2 py-0.5 rounded transition font-medium ${
+                      shiftTypeFilter === 'SHIFT'
+                        ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                        : isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    เข้ากะ (Shift)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShiftTypeFilter('OFFICE')}
+                    className={`px-2 py-0.5 rounded transition font-medium ${
+                      shiftTypeFilter === 'OFFICE'
+                        ? 'bg-slate-600 text-white font-bold shadow-xs'
+                        : isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    ออฟฟิศ
+                  </button>
+                </div>
+
+                {/* 3. Active Status Filter */}
+                <div className={`flex items-center space-x-1 border rounded px-1.5 py-0.5 text-[11px] shrink-0 ${
+                  isDark ? 'border-[#273a4e] bg-[#14202c]' : 'border-slate-300 bg-slate-100'
+                }`}>
+                  <span className="text-slate-400 px-1 font-medium">สถานะ:</span>
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter('ALL')}
+                    className={`px-2 py-0.5 rounded transition font-medium ${
+                      statusFilter === 'ALL'
+                        ? 'bg-teal-600 text-white font-bold shadow-xs'
+                        : isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    ทั้งหมด
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter('ACTIVE')}
+                    className={`px-2 py-0.5 rounded transition font-medium ${
+                      statusFilter === 'ACTIVE'
+                        ? 'bg-emerald-600 text-white font-bold shadow-xs'
+                        : isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Active
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStatusFilter('INACTIVE')}
+                    className={`px-2 py-0.5 rounded transition font-medium ${
+                      statusFilter === 'INACTIVE'
+                        ? 'bg-rose-600 text-white font-bold shadow-xs'
+                        : isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Deactivated
+                  </button>
+                </div>
+              </div>
+
+              {/* Counter and Clear Filter Button */}
+              <div className="flex items-center space-x-2 shrink-0">
+                <span className={`px-2.5 py-1 rounded text-xs font-mono font-semibold border ${
+                  isDark ? 'bg-[#14202c] border-[#273a4e] text-teal-300' : 'bg-slate-100 border-slate-300 text-teal-700'
+                }`}>
+                  พบ {filteredEmployees.length} จาก {employees.length} คน
+                </span>
+
+                {hasActiveFilters && (
+                  <button
+                    type="button"
+                    onClick={handleResetFilters}
+                    className={`flex items-center space-x-1 px-2.5 py-1 rounded text-xs transition border cursor-pointer ${
+                      isDark 
+                        ? 'bg-rose-950/40 border-rose-700/50 text-rose-300 hover:bg-rose-900/50' 
+                        : 'bg-rose-50 border-rose-300 text-rose-700 hover:bg-rose-100'
+                    }`}
+                    title="ล้างการกรองทั้งหมด"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>ล้างตัวกรอง</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Quick Section Chips (ชิปคลิกเลือก Section / แผนกอย่างรวดเร็ว) */}
+            <div className="flex items-center space-x-1.5 overflow-x-auto pt-1 pb-0.5 scrollbar-thin">
+              <span className="text-[11px] text-slate-400 shrink-0 mr-1 flex items-center gap-1">
+                <Filter className="w-3 h-3 text-teal-400" />
+                <span>Quick Filter:</span>
+              </span>
+
+              <button
+                type="button"
+                onClick={() => handleSectionChange('ALL')}
+                className={`px-2.5 py-1 rounded text-xs font-medium transition shrink-0 cursor-pointer flex items-center space-x-1.5 ${
+                  selectedSection === 'ALL'
+                    ? 'bg-teal-500 text-white font-bold shadow-xs'
+                    : isDark
+                      ? 'bg-[#14202c] hover:bg-[#1a2838] text-slate-300 border border-[#273a4e]'
+                      : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300'
+                }`}
+              >
+                <span>ทุกแผนก</span>
+                <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono ${
+                  selectedSection === 'ALL' ? 'bg-black/30 text-white' : 'bg-slate-600/30 text-slate-300'
+                }`}>
+                  {employees.length}
+                </span>
+              </button>
+
+              {availableSections.map(s => {
+                const count = sectionCounts[s.code] || 0;
+                const isSelected = selectedSection === s.code;
+                return (
+                  <button
+                    key={s.code}
+                    type="button"
+                    onClick={() => handleSectionChange(s.code)}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition shrink-0 cursor-pointer flex items-center space-x-1.5 ${
+                      isSelected
+                        ? 'bg-teal-500 text-white font-bold shadow-xs ring-1 ring-teal-300'
+                        : isDark
+                          ? 'bg-[#14202c] hover:bg-[#1a2838] text-slate-300 border border-[#273a4e]'
+                          : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300'
+                    }`}
+                    title={`${s.code}: ${s.name} (${count} คน)`}
+                  >
+                    <span>{s.code}</span>
+                    <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono ${
+                      isSelected ? 'bg-black/30 text-white' : 'bg-slate-600/30 text-slate-300'
+                    }`}>
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <div className={`p-4 rounded border text-xs overflow-hidden ${
             isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
           }`}>

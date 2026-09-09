@@ -169,12 +169,18 @@ export default function App() {
   // Manual cloud sync trigger
   const handleSyncCloud = async () => {
     setCloudStatus((prev) => ({ ...prev, isSyncing: true }));
-    const success = await storage.syncAllToCloud();
-    setCloudStatus({
-      isConnected: success,
-      isSyncing: false,
-      lastSync: new Date().toLocaleTimeString('th-TH'),
-    });
+    try {
+      const res = await storage.initCloudSync();
+      reloadData();
+      setCloudStatus({
+        isConnected: res.connected,
+        isSyncing: false,
+        lastSync: new Date().toLocaleTimeString('th-TH'),
+      });
+    } catch (e) {
+      console.error('Manual sync failed:', e);
+      setCloudStatus((prev) => ({ ...prev, isSyncing: false }));
+    }
   };
 
   // Handle Theme Toggle
@@ -200,6 +206,18 @@ export default function App() {
   // Reset to default initial dataset
   const handleResetData = () => {
     storage.resetToDefaults();
+    reloadData();
+  };
+
+  // Clear demo transaction data (shifts, biometric punches, OT, allowances)
+  const handleClearDemoData = async () => {
+    await storage.clearAllDemoData();
+    reloadData();
+  };
+
+  // Clear all data including employees
+  const handleClearAllData = async () => {
+    await storage.clearAllData();
     reloadData();
   };
 
@@ -361,6 +379,7 @@ export default function App() {
               theme={theme}
               employees={employees}
               selectedDepartment={selectedDepartment}
+              onSelectDepartment={setSelectedDepartment}
               onDataChanged={reloadData}
             />
           )}
@@ -385,6 +404,8 @@ export default function App() {
               currentUser={currentUser}
               theme={theme}
               onResetData={handleResetData}
+              onClearDemoData={handleClearDemoData}
+              onClearAllData={handleClearAllData}
             />
           )}
         </main>

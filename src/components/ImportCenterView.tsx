@@ -22,7 +22,12 @@ import {
   FileCheck2,
   Calendar,
   AlertCircle,
-  ArrowRight
+  ArrowRight,
+  Plus,
+  PlusCircle,
+  Edit2,
+  Trash2,
+  X
 } from 'lucide-react';
 import { 
   readFileAsArrayBuffer, 
@@ -38,7 +43,7 @@ import {
   downloadBlob
 } from '../utils/fileParser';
 import { storage, parseBiometricText } from '../utils/storage';
-import { INITIAL_RAW_PUNCHES_TEXT } from '../data/initialData';
+import { firestoreSync } from '../firebase';
 
 interface ImportCenterViewProps {
   currentUser: UserAccount;
@@ -78,6 +83,166 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
   // Retroactive OT inspection modal
   const [retroactiveOTs, setRetroactiveOTs] = useState<OTRecord[]>([]);
   const [showRetroModal, setShowRetroModal] = useState<boolean>(false);
+
+  // Shift Code Filter by Department/Section
+  const [shiftCodeDeptFilter, setShiftCodeDeptFilter] = useState<string>('SHOW_ALL');
+
+  // Edit/Delete Shift Code Admin Mode States
+  const [editingShiftCodeKey, setEditingShiftCodeKey] = useState<string | null>(null);
+  const [deleteConfirmKey, setDeleteConfirmKey] = useState<string | null>(null);
+
+  const handleStartEditShiftCode = (sc: ShiftCode) => {
+    setEditingShiftCodeKey(`${sc.code.toUpperCase()}_${sc.department.toUpperCase()}`);
+    setManualCode(sc.code);
+    setManualName(sc.name);
+    setManualDept(sc.department);
+    setManualStartTime(sc.startTime);
+    setManualEndTime(sc.endTime);
+    setManualBreak(sc.breakMinutes.toString());
+    setManualWorkingHours(sc.workingHours.toString());
+    setManualIsWorkingDay(sc.isWorkingDay);
+    setManualColor(sc.color);
+    setManualDesc(sc.description || '');
+    setStatusMessage(null);
+  };
+
+  const handleCancelEdit = () => {
+    setEditingShiftCodeKey(null);
+    setManualCode('');
+    setManualName('');
+    setManualDept('ALL');
+    setManualStartTime('08:00');
+    setManualEndTime('17:00');
+    setManualBreak('60');
+    setManualWorkingHours('8');
+    setManualIsWorkingDay(true);
+    setManualColor('#008b99');
+    setManualDesc('');
+    setStatusMessage(null);
+  };
+
+  const handleDeleteShiftCode = async (sc: ShiftCode) => {
+    try {
+      const existing = storage.getShiftCodes();
+      const filtered = existing.filter(c => 
+        !(c.code.toUpperCase() === sc.code.toUpperCase() && c.department.toUpperCase() === sc.department.toUpperCase())
+      );
+      storage.setShiftCodes(filtered);
+      // Delete document directly from Firestore too
+      await firestoreSync.deleteShiftCode(sc.code, sc.department, filtered);
+      setStatusMessage({
+        type: 'success',
+        text: `ลบรหัสกะ "${sc.code}" ของแผนก "${sc.department}" เรียบร้อยแล้ว!`,
+      });
+      setDeleteConfirmKey(null);
+      onDataImported();
+    } catch (err: any) {
+      setStatusMessage({
+        type: 'error',
+        text: `ไม่สามารถลบรหัสกะได้: ${err.message}`,
+      });
+    }
+  };
+
+  // Manual Add Shift Code Form state
+  const [manualCode, setManualCode] = useState('');
+  const [manualName, setManualName] = useState('');
+  const [manualDept, setManualDept] = useState('ALL');
+  const [manualStartTime, setManualStartTime] = useState('08:00');
+  const [manualEndTime, setManualEndTime] = useState('17:00');
+  const [manualBreak, setManualBreak] = useState('60');
+  const [manualWorkingHours, setManualWorkingHours] = useState('8');
+  const [manualIsWorkingDay, setManualIsWorkingDay] = useState(true);
+  const [manualColor, setManualColor] = useState('#008b99');
+  const [manualDesc, setManualDesc] = useState('');
+
+  const handleManualAddShiftCode = (e: React.FormEvent) => {
+    e.preventDefault();
+    setStatusMessage(null);
+
+    const code = manualCode.trim().toUpperCase();
+    if (!code) {
+      setStatusMessage({ type: 'error', text: 'กรุณากรอกรหัสกะ (Shift Code)' });
+      return;
+    }
+
+    if (!manualName.trim()) {
+      setStatusMessage({ type: 'error', text: 'กรุณากรอกชื่อกะ (Shift Name)' });
+      return;
+    }
+
+    const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    if (!timeRegex.test(manualStartTime) || !timeRegex.test(manualEndTime)) {
+      setStatusMessage({ type: 'error', text: 'กรุณากรอกรูปแบบเวลาให้ถูกต้อง เช่น 08:00 หรือ 17:00' });
+      return;
+    }
+
+    const breakMin = parseInt(manualBreak) || 0;
+    const workHrs = parseFloat(manualWorkingHours) || 0;
+
+    const newCodeObj: ShiftCode = {
+      code,
+      name: manualName.trim(),
+      department: manualDept,
+      startTime: manualStartTime,
+      endTime: manualEndTime,
+      breakMinutes: breakMin,
+      workingHours: workHrs,
+      isWorkingDay: manualIsWorkingDay,
+      color: manualColor,
+      description: manualDesc.trim() || undefined,
+    };
+
+    try {
+      const existing = storage.getShiftCodes();
+      const codeMap = new Map<string, ShiftCode>();
+      existing.forEach(c => {
+        const key = `${c.code.toUpperCase()}_${c.department.toUpperCase()}`;
+        codeMap.set(key, c);
+      });
+      
+      const newKey = `${code}_${manualDept.toUpperCase()}`;
+      if (editingShiftCodeKey && editingShiftCodeKey !== newKey) {
+        codeMap.delete(editingShiftCodeKey);
+        const [oldCode, oldDept] = editingShiftCodeKey.split('_');
+        if (oldCode && oldDept) {
+          firestoreSync.deleteShiftCode(oldCode, oldDept).catch(console.warn);
+        }
+      }
+      
+      codeMap.set(newKey, newCodeObj);
+
+      const updated = Array.from(codeMap.values());
+      storage.setShiftCodes(updated);
+
+      setStatusMessage({
+        type: 'success',
+        text: editingShiftCodeKey 
+          ? `แก้ไขข้อมูลรหัสกะ "${code}" ของแผนก "${manualDept}" เรียบร้อยแล้ว!` 
+          : `เพิ่ม/อัปเดตรหัสกะ "${code}" เรียบร้อยแล้ว!`,
+      });
+
+      // Reset form fields
+      setEditingShiftCodeKey(null);
+      setManualCode('');
+      setManualName('');
+      setManualDept('ALL');
+      setManualStartTime('08:00');
+      setManualEndTime('17:00');
+      setManualBreak('60');
+      setManualWorkingHours('8');
+      setManualIsWorkingDay(true);
+      setManualColor('#008b99');
+      setManualDesc('');
+
+      onDataImported();
+    } catch (err: any) {
+      setStatusMessage({
+        type: 'error',
+        text: `ไม่สามารถบันทึกรหัสกะได้: ${err.message}`,
+      });
+    }
+  };
 
   // 1. Shift Plan File Handler
   const handleShiftPlanFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -162,11 +327,17 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
         return;
       }
 
-      // Merge with existing codes
+      // Merge with existing codes uniquely by code and department
       const existing = storage.getShiftCodes();
       const codeMap = new Map<string, ShiftCode>();
-      existing.forEach(c => codeMap.set(c.code.toUpperCase(), c));
-      newCodes.forEach(c => codeMap.set(c.code.toUpperCase(), c));
+      existing.forEach(c => {
+        const key = `${c.code.toUpperCase()}_${c.department.toUpperCase()}`;
+        codeMap.set(key, c);
+      });
+      newCodes.forEach(c => {
+        const key = `${c.code.toUpperCase()}_${c.department.toUpperCase()}`;
+        codeMap.set(key, c);
+      });
 
       const merged = Array.from(codeMap.values());
       storage.setShiftCodes(merged);
@@ -459,40 +630,140 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
         </div>
       )}
 
-      {/* Sub-tabs for each Import Type */}
-      <div className={`flex border-b text-xs font-semibold overflow-x-auto ${
-        isDark ? 'border-[#223344]' : 'border-slate-300'
-      }`}>
-        {[
-          { id: 'shift-plan', label: '1. Shift Plan (ตารางกะรายเดือน — แยกตามแผนก)', icon: FileSpreadsheet },
-          { id: 'shift-code', label: '2. Shift Codes (รหัสกะการทำงาน — ใช้ร่วมกันทุกแผนก)', icon: Clock },
-          { id: 'attendance', label: '3. Biometric Attendance (เวลาเข้า-ออก — รวมทุกแผนก)', icon: FileText },
-          { id: 'ot', label: '4. Approved OT (โอทีที่อนุมัติแล้ว — รวมทุกแผนก Power BI)', icon: FileCheck2 },
-          { id: 'allowances', label: '5. Other Allowances (เบี้ยเลี้ยง — รวมทุกแผนก)', icon: DollarSign },
-        ].map(tab => {
-          const isActive = activeImportTab === tab.id;
-          const Icon = tab.icon;
-          return (
-            <button
-              key={tab.id}
-              onClick={() => {
-                setActiveImportTab(tab.id as any);
-                setStatusMessage(null);
-              }}
-              className={`px-4 py-3 flex items-center space-x-2 border-b-2 transition whitespace-nowrap ${
-                isActive
-                  ? 'border-[#00e5e5] text-[#00e5e5] bg-teal-500/10'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/30'
-              }`}
-            >
-              <Icon className="w-4 h-4" />
-              <span>{tab.label}</span>
-            </button>
-          );
-        })}
-      </div>
+      {/* Main Layout: Sub Sidebar (Left) + Import Form & Details (Right) */}
+      <div className="flex flex-col lg:flex-row gap-4 items-start w-full">
+        {/* Sub Sidebar Navigation */}
+        <aside 
+          id="import-center-sub-sidebar"
+          className={`w-full lg:w-72 xl:w-80 shrink-0 rounded border p-3 flex flex-col space-y-2.5 ${
+            isDark ? 'bg-[#131e29] border-[#223344]' : 'bg-white border-slate-200 shadow-sm'
+          }`}
+        >
+          <div className="px-1.5 py-1 flex items-center justify-between border-b border-inherit pb-2">
+            <span className={`text-[11px] font-bold uppercase tracking-wider ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+              Import Modules (เมนูการนำเข้า)
+            </span>
+            <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold ${
+              isDark ? 'bg-[#0e1722] text-teal-400 border border-[#23384c]' : 'bg-slate-100 text-teal-700'
+            }`}>
+              5 หมวดหมู่
+            </span>
+          </div>
 
-      {/* TAB 1: Shift Plan Import (Department-Specific) */}
+          {/* Vertical Menu Buttons */}
+          <nav className="space-y-1.5">
+            {[
+              { 
+                id: 'shift-plan' as const, 
+                title: '1. Shift Plan', 
+                subtitle: 'ตารางกะรายเดือน (แยกแผนก)', 
+                icon: FileSpreadsheet, 
+                badge: `Dept: ${importDept}`, 
+                isDeptSpecific: true 
+              },
+              { 
+                id: 'shift-code' as const, 
+                title: '2. Shift Codes', 
+                subtitle: 'รหัสกะการทำงาน (ใช้ร่วมกัน)', 
+                icon: Clock, 
+                badge: 'All Depts', 
+                isDeptSpecific: false 
+              },
+              { 
+                id: 'attendance' as const, 
+                title: '3. Biometric Attendance', 
+                subtitle: 'เวลาสแกนนิ้วเข้า-ออก (Text/CSV)', 
+                icon: FileText, 
+                badge: 'All Depts', 
+                isDeptSpecific: false 
+              },
+              { 
+                id: 'ot' as const, 
+                title: '4. Approved OT', 
+                subtitle: 'โอทีที่อนุมัติแล้ว (Power BI)', 
+                icon: FileCheck2, 
+                badge: 'All Depts', 
+                isDeptSpecific: false 
+              },
+              { 
+                id: 'allowances' as const, 
+                title: '5. Other Allowances', 
+                subtitle: 'เบี้ยเลี้ยงและรายได้เสริม', 
+                icon: DollarSign, 
+                badge: 'All Depts', 
+                isDeptSpecific: false 
+              },
+            ].map(tab => {
+              const isActive = activeImportTab === tab.id;
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => {
+                    setActiveImportTab(tab.id);
+                    setStatusMessage(null);
+                  }}
+                  className={`w-full p-2.5 rounded text-left transition flex items-start space-x-2.5 cursor-pointer border ${
+                    isActive
+                      ? isDark 
+                        ? 'bg-teal-500/15 border-teal-500/40 text-teal-200 shadow-sm' 
+                        : 'bg-teal-50 border-teal-400 text-teal-900 shadow-xs'
+                      : isDark 
+                        ? 'bg-[#0f1722]/60 border-[#1c2a38] hover:bg-[#182635] hover:border-slate-600 text-slate-300 hover:text-white' 
+                        : 'bg-slate-50/70 border-slate-200 hover:bg-slate-100 text-slate-700'
+                  }`}
+                >
+                  <div className={`p-2 rounded mt-0.5 shrink-0 ${
+                    isActive 
+                      ? isDark ? 'bg-teal-500/20 text-[#00e5e5]' : 'bg-teal-200 text-teal-800'
+                      : isDark ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600'
+                  }`}>
+                    <Icon className="w-4 h-4" />
+                  </div>
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-1">
+                      <span className={`text-xs font-bold truncate ${isActive ? isDark ? 'text-[#00e5e5]' : 'text-teal-800' : ''}`}>
+                        {tab.title}
+                      </span>
+                      <span className={`text-[9px] px-1.5 py-0.2 rounded font-mono shrink-0 font-semibold ${
+                        tab.isDeptSpecific
+                          ? isDark ? 'bg-teal-950 text-teal-300 border border-teal-700/60' : 'bg-teal-100 text-teal-700'
+                          : isDark ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'
+                      }`}>
+                        {tab.badge}
+                      </span>
+                    </div>
+                    <p className={`text-[11px] leading-tight mt-0.5 truncate ${
+                      isActive ? isDark ? 'text-teal-300/80' : 'text-teal-700' : isDark ? 'text-slate-400' : 'text-slate-500'
+                    }`}>
+                      {tab.subtitle}
+                    </p>
+                  </div>
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* Workflow guidance card at bottom of Sub Sidebar */}
+          <div className={`mt-2 p-2.5 rounded border text-[11px] space-y-1.5 ${
+            isDark ? 'bg-[#0a121a] border-[#1e2e3d] text-slate-400' : 'bg-amber-50/60 border-amber-200 text-amber-900'
+          }`}>
+            <div className="font-bold flex items-center gap-1.5 text-amber-400 text-xs">
+              <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+              <span>ขั้นตอนเตรียมข้อมูล:</span>
+            </div>
+            <ol className="list-decimal list-inside space-y-0.5 text-[10.5px] opacity-90">
+              <li>อัปโหลด <strong>Shift Plan</strong> แต่ละแผนก</li>
+              <li>นำเข้า <strong>Biometric</strong> สแกนนิ้วรวม</li>
+              <li>นำเข้า <strong>Approved OT</strong> & <strong>Allowances</strong></li>
+            </ol>
+          </div>
+        </aside>
+
+        {/* Right Area: Selected Import Module Workspace */}
+        <div className="flex-1 min-w-0 w-full space-y-4">
+          {/* TAB 1: Shift Plan Import (Department-Specific) */}
       {activeImportTab === 'shift-plan' && (
         <div className="space-y-4">
           {/* Direct Link to Dedicated Menu */}
@@ -636,76 +907,394 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className={`p-4 rounded border space-y-3 text-xs ${
-              isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
-            }`}>
-              <h2 className="font-bold text-sm text-[#00e5e5] flex items-center gap-2">
-                <Clock className="w-4 h-4" />
-                <span>Upload Shift Codes (อัปโหลดรหัสกะ)</span>
-              </h2>
-              <p className="text-slate-400">
-                Admins can upload or expand shift definitions (e.g. D = 08:00-17:00, N = 20:00-05:00) with break times and working hours.
-              </p>
+            <div className="space-y-4">
+              {/* Card 1: File Upload */}
+              <div className={`p-4 rounded border space-y-3 text-xs ${
+                isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
+              }`}>
+                <h2 className="font-bold text-sm text-[#00e5e5] flex items-center gap-2">
+                  <Clock className="w-4 h-4" />
+                  <span>Upload Shift Codes (อัปโหลดรหัสกะ)</span>
+                </h2>
+                <p className="text-slate-400">
+                  Admins can upload or expand shift definitions (e.g. D = 08:00-17:00, N = 20:00-05:00) with break times and working hours.
+                </p>
 
-              <label className="cursor-pointer block text-center py-2.5 rounded font-bold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition">
-                <span>Select Shift Code File (.xlsx, .csv)</span>
-                <input
-                  type="file"
-                  accept=".xlsx,.xls,.csv"
-                  onChange={handleShiftCodeFile}
-                  className="hidden"
-                />
-              </label>
+                <label className="cursor-pointer block text-center py-2.5 rounded font-bold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition cursor-pointer">
+                  <span>Select Shift Code File (.xlsx, .csv)</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    onChange={handleShiftCodeFile}
+                    className="hidden"
+                  />
+                </label>
 
-              <button
-                onClick={() => {
-                  const { csvContent } = generateShiftCodeTemplate(shiftCodes);
-                  downloadBlob(csvContent, 'Template_ShiftCodes.csv', 'text/csv;charset=utf-8;');
-                }}
-                className="w-full flex items-center justify-center space-x-1.5 py-2 rounded border border-slate-600 text-slate-300 hover:text-white text-xs"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Download Shift Code Template (CSV)</span>
-              </button>
+                <button
+                  onClick={() => {
+                    const { csvContent } = generateShiftCodeTemplate(shiftCodes);
+                    downloadBlob(csvContent, 'Template_ShiftCodes.csv', 'text/csv;charset=utf-8;');
+                  }}
+                  className="w-full flex items-center justify-center space-x-1.5 py-2 rounded border border-slate-600 text-slate-300 hover:text-white text-xs cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Shift Code Template (CSV)</span>
+                </button>
+              </div>
+
+              {/* Card 2: Manual Creator */}
+              <div className={`p-4 rounded border space-y-3 text-xs ${
+                isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
+              }`}>
+                <h2 className="font-bold text-sm text-[#00e5e5] flex items-center gap-2">
+                  {editingShiftCodeKey ? (
+                    <>
+                      <Edit2 className="w-4 h-4 text-amber-400 animate-pulse" />
+                      <span>Edit Shift Code (แก้ไขรหัสกะ)</span>
+                    </>
+                  ) : (
+                    <>
+                      <PlusCircle className="w-4 h-4 text-teal-400" />
+                      <span>Manual Shift Code (เพิ่มรหัสกะด้วยตนเอง)</span>
+                    </>
+                  )}
+                </h2>
+                <p className="text-[11px] text-slate-400">
+                  {editingShiftCodeKey 
+                    ? `กำลังแก้ไขรหัสกะ "${manualCode}" ของแผนก "${manualDept}"`
+                    : 'ระบุรายละเอียดเพื่อเพิ่มหรือแก้ไขรหัสกะรายแผนก หรือใช้งานร่วมกันทั้งหมด (ALL)'
+                  }
+                </p>
+
+                <form onSubmit={handleManualAddShiftCode} className="space-y-3">
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">รหัสกะ (Shift Code) *</label>
+                    <input
+                      type="text"
+                      placeholder="เช่น D, N, RS-D1, SBY"
+                      value={manualCode}
+                      onChange={e => setManualCode(e.target.value)}
+                      className={`w-full p-2 rounded text-xs outline-none font-mono font-bold ${
+                        isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                      }`}
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">ชื่อกะการทำงาน *</label>
+                    <input
+                      type="text"
+                      placeholder="เช่น Day Shift 08:00-17:00"
+                      value={manualName}
+                      onChange={e => setManualName(e.target.value)}
+                      className={`w-full p-2 rounded text-xs outline-none ${
+                        isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                      }`}
+                      required
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">แผนก (Section)</label>
+                      <select
+                        value={manualDept}
+                        onChange={e => setManualDept(e.target.value)}
+                        className={`w-full p-2 rounded text-xs outline-none font-bold ${
+                          isDark ? 'bg-[#0f1722] text-teal-300 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                        }`}
+                      >
+                        <option value="ALL">ALL (ทุกแผนก)</option>
+                        {storage.getDepartments().map(d => (
+                          <option key={d.code} value={d.code}>{d.code}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">เป็นวันทำงาน?</label>
+                      <select
+                        value={manualIsWorkingDay ? 'true' : 'false'}
+                        onChange={e => setManualIsWorkingDay(e.target.value === 'true')}
+                        className={`w-full p-2 rounded text-xs outline-none font-bold ${
+                          isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                        }`}
+                      >
+                        <option value="true">ใช่ (Working)</option>
+                        <option value="false">ไม่ใช่ (OFF / วันลา / วันหยุด)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">เวลาเริ่ม (Start Time) *</label>
+                      <input
+                        type="text"
+                        placeholder="08:00"
+                        value={manualStartTime}
+                        onChange={e => setManualStartTime(e.target.value)}
+                        className={`w-full p-2 rounded text-xs outline-none font-mono ${
+                          isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                        }`}
+                        required
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">เวลาเลิก (End Time) *</label>
+                      <input
+                        type="text"
+                        placeholder="17:00"
+                        value={manualEndTime}
+                        onChange={e => setManualEndTime(e.target.value)}
+                        className={`w-full p-2 rounded text-xs outline-none font-mono ${
+                          isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                        }`}
+                        required
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">เวลาพัก (Break Min)</label>
+                      <input
+                        type="number"
+                        placeholder="60"
+                        value={manualBreak}
+                        onChange={e => setManualBreak(e.target.value)}
+                        className={`w-full p-2 rounded text-xs outline-none font-mono ${
+                          isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                        }`}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">ชม.ทำงาน (Hours)</label>
+                      <input
+                        type="number"
+                        step="0.5"
+                        placeholder="8"
+                        value={manualWorkingHours}
+                        onChange={e => setManualWorkingHours(e.target.value)}
+                        className={`w-full p-2 rounded text-xs outline-none font-mono ${
+                          isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                        }`}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">สีสัญลักษณ์ (Color Tag)</label>
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="color"
+                        value={manualColor}
+                        onChange={e => setManualColor(e.target.value)}
+                        className="w-7 h-7 rounded border-0 cursor-pointer p-0 bg-transparent shrink-0"
+                        title="กำหนดสีเอง"
+                      />
+                      <div className="flex flex-wrap gap-1">
+                        {['#008b99', '#0284c7', '#06b6d4', '#f59e0b', '#6366f1', '#10b981', '#ef4444', '#ec4899', '#475569'].map(c => (
+                          <button
+                            key={c}
+                            type="button"
+                            onClick={() => setManualColor(c)}
+                            className="w-4 h-4 rounded-full border border-slate-700/50 cursor-pointer"
+                            style={{ backgroundColor: c, ring: manualColor === c ? '2px solid white' : 'none' }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">คำอธิบายเพิ่มเติม</label>
+                    <input
+                      type="text"
+                      placeholder="เช่น กะทำงานเช้าปกติโรงรถ"
+                      value={manualDesc}
+                      onChange={e => setManualDesc(e.target.value)}
+                      className={`w-full p-2 rounded text-xs outline-none ${
+                        isDark ? 'bg-[#0f1722] text-slate-100 border border-[#23384c]' : 'bg-slate-50 text-slate-900 border'
+                      }`}
+                    />
+                  </div>
+
+                  {editingShiftCodeKey ? (
+                    <div className="flex gap-2">
+                      <button
+                        type="submit"
+                        className="flex-1 py-2.5 rounded font-bold text-xs bg-amber-500 hover:bg-amber-600 text-[#09151e] shadow transition cursor-pointer flex items-center justify-center gap-1"
+                      >
+                        <Edit2 className="w-4 h-4 animate-pulse" />
+                        <span>อัปเดตข้อมูลกะ (Update Shift Code)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCancelEdit}
+                        className="px-3 py-2.5 rounded font-bold text-xs bg-slate-600 hover:bg-slate-700 text-white shadow transition cursor-pointer flex items-center justify-center gap-1"
+                        title="ยกเลิกการแก้ไข"
+                      >
+                        <X className="w-4 h-4" />
+                        <span>ยกเลิก</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="submit"
+                      className="w-full py-2.5 rounded font-bold text-xs bg-teal-500 hover:bg-teal-600 text-[#09151e] shadow transition cursor-pointer flex items-center justify-center gap-1"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>บันทึกรหัสกะ (Save Shift Code)</span>
+                    </button>
+                  )}
+                </form>
+              </div>
             </div>
 
             {/* Current Registered Shift Codes List */}
             <div className={`md:col-span-2 p-4 rounded border text-xs overflow-hidden ${
               isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
             }`}>
-              <h3 className="font-bold text-sm mb-2 text-slate-200">
-                Registered Shift Codes (รหัสกะในระบบทั้งหมด {shiftCodes.length} รหัส):
-              </h3>
-              <div className="overflow-x-auto max-h-60 scrollbar-thin">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-3">
+                <h3 className="font-bold text-sm text-slate-200">
+                  Registered Shift Codes (รหัสกะในระบบทั้งหมด {shiftCodes.length} รหัส):
+                </h3>
+                
+                {/* Filter Section Dropdown */}
+                <div className="flex items-center space-x-2 shrink-0">
+                  <span className="text-[11px] text-slate-400 font-semibold flex items-center gap-1">
+                    <Building2 className="w-3.5 h-3.5 text-teal-400" />
+                    <span>Filter Section:</span>
+                  </span>
+                  <select
+                    value={shiftCodeDeptFilter}
+                    onChange={e => setShiftCodeDeptFilter(e.target.value)}
+                    className={`p-1.5 rounded font-mono font-bold text-xs outline-none cursor-pointer ${
+                      isDark ? 'bg-[#0f1722] text-teal-300 border border-[#23384c]' : 'bg-slate-100 text-slate-800 border'
+                    }`}
+                  >
+                    <option value="SHOW_ALL">แสดงทั้งหมด (SHOW ALL)</option>
+                    <option value="ALL">ALL (ทุกแผนก)</option>
+                    {storage.getDepartments().map(d => (
+                      <option key={d.code} value={d.code}>{d.code} — {d.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto max-h-[500px] scrollbar-thin">
                 <table className="w-full border-collapse text-left">
                   <thead className={isDark ? 'bg-[#0f1722] text-slate-300' : 'bg-slate-100 text-slate-700'}>
                     <tr>
                       <th className="p-2 border-b">Code (รหัส)</th>
                       <th className="p-2 border-b">Name (ชื่อกะ)</th>
-                      <th className="p-2 border-b">Dept (แผนก)</th>
+                      <th className="p-2 border-b">Section (แผนก)</th>
+                      <th className="p-2 border-b">Type (ประเภท)</th>
                       <th className="p-2 border-b">Time (ช่วงเวลา)</th>
                       <th className="p-2 border-b">Break (พัก)</th>
                       <th className="p-2 border-b">Hours (ชั่วโมง)</th>
+                      {isAdmin && <th className="p-2 border-b text-center">Actions (จัดการ)</th>}
                     </tr>
                   </thead>
                   <tbody>
-                    {shiftCodes.map(sc => (
-                      <tr key={sc.code} className="border-b border-slate-700/30">
-                        <td className="p-2 font-mono font-bold">
-                          <span 
-                            className="px-2 py-0.5 rounded text-white text-[11px]"
-                            style={{ backgroundColor: sc.color }}
-                          >
-                            {sc.code}
-                          </span>
+                    {shiftCodes
+                      .filter(sc => {
+                        if (shiftCodeDeptFilter === 'SHOW_ALL') return true;
+                        return sc.department === shiftCodeDeptFilter;
+                      })
+                      .map(sc => {
+                        const key = `${sc.code.toUpperCase()}_${sc.department.toUpperCase()}`;
+                        const isConfirming = deleteConfirmKey === key;
+                        return (
+                          <tr key={key} className="border-b border-slate-700/30 hover:bg-slate-800/10 transition-colors">
+                            <td className="p-2 font-mono font-bold">
+                              <span 
+                                className="px-2 py-0.5 rounded text-white text-[11px]"
+                                style={{ backgroundColor: sc.color }}
+                              >
+                                {sc.code}
+                              </span>
+                            </td>
+                            <td className="p-2 font-medium">
+                              <div>{sc.name}</div>
+                              {sc.description && <div className="text-[10px] text-slate-400 font-normal">{sc.description}</div>}
+                            </td>
+                            <td className="p-2 font-mono">
+                              <span className={`px-1.5 py-0.5 rounded font-bold text-[10px] ${
+                                sc.department === 'ALL'
+                                  ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20'
+                                  : 'bg-teal-500/10 text-teal-300 border border-teal-500/20'
+                              }`}>
+                                {sc.department}
+                              </span>
+                            </td>
+                            <td className="p-2">
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                sc.isWorkingDay 
+                                  ? 'bg-blue-500/10 text-blue-300' 
+                                  : 'bg-amber-500/10 text-amber-300'
+                              }`}>
+                                {sc.isWorkingDay ? 'Working' : 'OFF/Leave'}
+                              </span>
+                            </td>
+                            <td className="p-2 font-mono">{sc.startTime} - {sc.endTime}</td>
+                            <td className="p-2 font-mono">{sc.breakMinutes} min</td>
+                            <td className="p-2 font-mono">{sc.workingHours} hrs</td>
+                            {isAdmin && (
+                              <td className="p-2 text-center font-mono">
+                                {isConfirming ? (
+                                  <div className="flex items-center justify-center space-x-1">
+                                    <span className="text-[10px] text-red-400 font-bold shrink-0">Confirm?</span>
+                                    <button 
+                                      onClick={() => handleDeleteShiftCode(sc)}
+                                      className="px-1.5 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-bold cursor-pointer"
+                                    >
+                                      Yes
+                                    </button>
+                                    <button 
+                                      onClick={() => setDeleteConfirmKey(null)}
+                                      className="px-1.5 py-0.5 bg-slate-600 hover:bg-slate-700 text-white rounded text-[10px] font-bold cursor-pointer"
+                                    >
+                                      No
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-center space-x-1.5">
+                                    <button
+                                      onClick={() => handleStartEditShiftCode(sc)}
+                                      className="p-1 hover:bg-amber-500/20 text-amber-400 hover:text-amber-300 rounded transition cursor-pointer"
+                                      title="แก้ไขข้อมูลกะ"
+                                    >
+                                      <Edit2 className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      onClick={() => setDeleteConfirmKey(key)}
+                                      className="p-1 hover:bg-red-500/20 text-red-400 hover:text-red-300 rounded transition cursor-pointer"
+                                      title="ลบรหัสกะ"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      })}
+                    {shiftCodes.filter(sc => {
+                      if (shiftCodeDeptFilter === 'SHOW_ALL') return true;
+                      return sc.department === shiftCodeDeptFilter;
+                    }).length === 0 && (
+                      <tr>
+                        <td colSpan={isAdmin ? 8 : 7} className="text-center p-8 text-slate-400">
+                          ไม่พบข้อมูลกะที่ตรงกับแผนกที่ระบุ
                         </td>
-                        <td className="p-2 font-medium">{sc.name}</td>
-                        <td className="p-2 font-mono text-teal-400">{sc.department}</td>
-                        <td className="p-2 font-mono">{sc.startTime} - {sc.endTime}</td>
-                        <td className="p-2 font-mono">{sc.breakMinutes} min</td>
-                        <td className="p-2 font-mono">{sc.workingHours} hrs</td>
                       </tr>
-                    ))}
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -764,7 +1353,8 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
 
               <button
                 onClick={() => {
-                  downloadBlob(INITIAL_RAW_PUNCHES_TEXT, 'Time_Attendance_Sample.txt', 'text/plain;charset=utf-8;');
+                  const sampleText = `0149   I 260505 0530 01\n0149   O 260505 1400 01\n0950   I 260505 0739 01\n0950   O 260505 1729 01\n1442   I 260505 0730 01\n1442   O 260505 1630 01\n0077   I 260505 0732 01\n0077   O 260505 1640 01\n0315   I 260505 0545 01\n0315   O 260505 1415 01`;
+                  downloadBlob(sampleText, 'Time_Attendance_Sample.txt', 'text/plain;charset=utf-8;');
                 }}
                 className="w-full flex items-center justify-center space-x-1.5 py-2 rounded border border-slate-600 text-slate-300 hover:text-white text-xs"
               >
@@ -965,6 +1555,8 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
           </div>
         </div>
       )}
+        </div>
+      </div>
 
       {/* Retroactive OT Admin Verification Modal (Rule 5) */}
       {showRetroModal && (

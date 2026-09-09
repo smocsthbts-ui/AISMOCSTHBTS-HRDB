@@ -140,19 +140,33 @@ export function validateAndParseShiftPlan(
     ).getDate();
 
     let hasDayColumns = false;
+    // Check if wide format day column headers exist in this row
     for (let d = 1; d <= daysInMonth; d++) {
       const colKey1 = String(d);
       const colKey2 = String(d).padStart(2, '0');
       const colKey3 = `D${d}`;
       const colKey4 = `Day${d}`;
-      const val = (row[colKey1] !== undefined && row[colKey1] !== '') ? row[colKey1] :
-                  (row[colKey2] !== undefined && row[colKey2] !== '') ? row[colKey2] :
-                  (row[colKey3] !== undefined && row[colKey3] !== '') ? row[colKey3] :
-                  (row[colKey4] !== undefined && row[colKey4] !== '') ? row[colKey4] : undefined;
-
-      if (val !== undefined) {
+      if (row[colKey1] !== undefined || row[colKey2] !== undefined || row[colKey3] !== undefined || row[colKey4] !== undefined) {
         hasDayColumns = true;
-        const code = String(val).trim().toUpperCase() || 'OFF';
+        break;
+      }
+    }
+
+    if (hasDayColumns) {
+      for (let d = 1; d <= daysInMonth; d++) {
+        const colKey1 = String(d);
+        const colKey2 = String(d).padStart(2, '0');
+        const colKey3 = `D${d}`;
+        const colKey4 = `Day${d}`;
+
+        const rawVal = row[colKey1] !== undefined ? row[colKey1] :
+                       row[colKey2] !== undefined ? row[colKey2] :
+                       row[colKey3] !== undefined ? row[colKey3] :
+                       row[colKey4] !== undefined ? row[colKey4] : '';
+
+        const trimmed = String(rawVal ?? '').trim().toUpperCase();
+        // Rule: Empty or blank cell is treated as OFF (Day Off)
+        const code = trimmed === '' ? 'OFF' : trimmed;
 
         if (!validShiftCodeSet.has(code)) {
           warnings.push(

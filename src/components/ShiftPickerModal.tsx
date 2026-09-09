@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Employee, ShiftCode } from '../types';
+import { getShiftCategoryColor } from '../utils/timeCalc';
 import { 
   Search, 
   X, 
@@ -194,7 +195,7 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                 className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md text-xs font-mono font-bold transition hover:scale-105 active:scale-95 shadow-xs cursor-pointer ${
                   fav.code === currentShiftCode ? 'ring-2 ring-white ring-offset-1 ring-offset-[#14202c]' : ''
                 }`}
-                style={{ backgroundColor: fav.color, color: '#ffffff' }}
+                style={{ backgroundColor: getShiftCategoryColor(fav.code, fav.color), color: '#ffffff' }}
                 title={`${fav.code}: ${fav.name} (${fav.startTime}-${fav.endTime}) คลิกเพื่อเปลี่ยนทันที`}
               >
                 <span>{fav.code}</span>
@@ -331,7 +332,7 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                       {/* Color Tag Badge */}
                       <span
                         className="w-8 h-8 rounded-lg text-xs font-mono font-bold text-white flex items-center justify-center shrink-0 shadow-xs"
-                        style={{ backgroundColor: sc.color }}
+                        style={{ backgroundColor: getShiftCategoryColor(sc.code, sc.color) }}
                       >
                         {sc.code}
                       </span>

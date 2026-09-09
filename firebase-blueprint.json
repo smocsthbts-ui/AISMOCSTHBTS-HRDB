@@ -129,9 +129,23 @@
         "gid": { "type": "string", "maxLength": 32 }
       },
       "required": ["email", "name", "role", "department"]
+    },
+    "Department": {
+      "title": "Department",
+      "description": "Siemens department / section definition",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["code", "name"]
     }
   },
   "firestore": {
+    "/departments/{deptId}": {
+      "schema": "Department",
+      "description": "Registered departments and operational sections"
+    },
     "/employees/{employeeId}": {
       "schema": "Employee",
       "description": "All Siemens employee profiles"
@@ -163,6 +177,10 @@
     "/user_accounts/{userEmail}": {
       "schema": "UserAccount",
       "description": "Application user authorization records"
+    },
+    "/app_bundles/{bundleId}": {
+      "schema": "Department",
+      "description": "High-efficiency aggregated bundles for large datasets"
     }
   }
 }

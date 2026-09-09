@@ -28,6 +28,12 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // Departments Collection
+    match /departments/{deptId} {
+      allow read: if true;
+      allow write: if isSignedIn() || true;
+    }
+
     // Employees Collection
     match /employees/{employeeId} {
       allow read: if true;
@@ -68,6 +74,12 @@ service cloud.firestore {
     match /manual_overrides/{overrideId} {
       allow read: if true;
       allow write: if isSignedIn() || true;
+    }
+
+    // Bundled Collections (High efficiency aggregation)
+    match /app_bundles/{bundleId} {
+      allow read: if true;
+      allow write: if true;
     }
 
     // User Accounts Collection

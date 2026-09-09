@@ -108,7 +108,11 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
     if (!isAdmin && currentUser.department && currentUser.department !== 'ALL') {
       return currentUser.department;
     }
-    return selectedDepartment !== 'ALL' ? selectedDepartment : 'RS';
+    const depts = storage.getDepartments();
+    if (selectedDepartment !== 'ALL' && depts.some(d => d.code === selectedDepartment)) {
+      return selectedDepartment;
+    }
+    return depts.length > 0 ? depts[0].code : 'RST';
   });
 
   // Target Month-Year for upload
@@ -538,137 +542,6 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
               </span>
             </div>
           </div>
-        </div>
-
-        {/* Quick Jump Pills & Pre-Uploaded Advance Months */}
-        <div className={`pt-3 border-t flex flex-col md:flex-row items-start md:items-center justify-between gap-2.5 ${
-          isDark ? 'border-[#1f3144]' : 'border-slate-200'
-        }`}>
-          {/* Quick Select Buttons */}
-          <div className="flex items-center flex-wrap gap-1.5 text-xs">
-            <span className="text-[11px] font-semibold text-slate-400 mr-1 flex items-center gap-1">
-              <Clock className="w-3 h-3 text-teal-400" />
-              <span>ปุ่มเลือกด่วน:</span>
-            </span>
-
-            <button
-              type="button"
-              id="btn-quick-prev"
-              onClick={() => handleSelectPeriod(shiftMonth(targetMonthYear, -1))}
-              className={`px-2 py-1 rounded text-[11px] font-medium border transition cursor-pointer flex items-center gap-0.5 ${
-                isDark ? 'bg-[#0f1722] hover:bg-[#1a2838] border-[#29425c] text-slate-300' : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'
-              }`}
-            >
-              <ChevronLeft className="w-3 h-3" />
-              <span>เดือนก่อนหน้า</span>
-            </button>
-
-            <button
-              type="button"
-              id="btn-quick-current"
-              onClick={() => handleSelectPeriod('2026-05')}
-              className={`px-2.5 py-1 rounded text-[11px] font-bold border transition cursor-pointer ${
-                targetMonthYear === '2026-05'
-                  ? 'bg-[#008b99] text-white border-teal-400 shadow-xs'
-                  : isDark
-                    ? 'bg-[#0f1722] hover:bg-[#1a2838] border-[#29425c] text-teal-300'
-                    : 'bg-white hover:bg-slate-100 border-slate-300 text-teal-700'
-              }`}
-            >
-              <span>งวดปัจจุบัน (พ.ค. 69)</span>
-            </button>
-
-            <button
-              type="button"
-              id="btn-quick-plus1"
-              onClick={() => handleSelectPeriod('2026-06')}
-              className={`px-2.5 py-1 rounded text-[11px] font-medium border transition cursor-pointer flex items-center gap-1 ${
-                targetMonthYear === '2026-06'
-                  ? 'bg-[#008b99] text-white border-teal-400 shadow-xs font-bold'
-                  : isDark
-                    ? 'bg-[#0f1722] hover:bg-[#1a2838] border-[#29425c] text-slate-300'
-                    : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'
-              }`}
-            >
-              <Sparkles className="w-2.5 h-2.5 text-amber-400" />
-              <span>+1 เดือนหน้า (มิ.ย. 69)</span>
-              {deptExistingMonthCounts['2026-06'] ? (
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="มีข้อมูลแล้ว" />
-              ) : null}
-            </button>
-
-            <button
-              type="button"
-              id="btn-quick-plus2"
-              onClick={() => handleSelectPeriod('2026-07')}
-              className={`px-2.5 py-1 rounded text-[11px] font-medium border transition cursor-pointer flex items-center gap-1 ${
-                targetMonthYear === '2026-07'
-                  ? 'bg-[#008b99] text-white border-teal-400 shadow-xs font-bold'
-                  : isDark
-                    ? 'bg-[#0f1722] hover:bg-[#1a2838] border-[#29425c] text-slate-300'
-                    : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'
-              }`}
-            >
-              <span>+2 เดือน (ก.ค. 69)</span>
-              {deptExistingMonthCounts['2026-07'] ? (
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="มีข้อมูลแล้ว" />
-              ) : null}
-            </button>
-
-            <button
-              type="button"
-              id="btn-quick-plus3"
-              onClick={() => handleSelectPeriod('2026-08')}
-              className={`px-2.5 py-1 rounded text-[11px] font-medium border transition cursor-pointer ${
-                targetMonthYear === '2026-08'
-                  ? 'bg-[#008b99] text-white border-teal-400 shadow-xs font-bold'
-                  : isDark
-                    ? 'bg-[#0f1722] hover:bg-[#1a2838] border-[#29425c] text-slate-300'
-                    : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'
-              }`}
-            >
-              <span>+3 เดือน (ส.ค. 69)</span>
-            </button>
-
-            <button
-              type="button"
-              id="btn-quick-next"
-              onClick={() => handleSelectPeriod(shiftMonth(targetMonthYear, 1))}
-              className={`px-2 py-1 rounded text-[11px] font-medium border transition cursor-pointer flex items-center gap-0.5 ${
-                isDark ? 'bg-[#0f1722] hover:bg-[#1a2838] border-[#29425c] text-slate-300' : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'
-              }`}
-            >
-              <span>เดือนถัดไป</span>
-              <ChevronRight className="w-3 h-3" />
-            </button>
-          </div>
-
-          {/* Pre-uploaded advance periods chips */}
-          {advanceUploadedMonths.length > 0 && (
-            <div className="flex items-center flex-wrap gap-1.5 text-xs">
-              <span className="text-[11px] font-semibold text-emerald-400 flex items-center gap-1">
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span>งวดล่วงหน้าที่มีข้อมูลแล้ว:</span>
-              </span>
-              {advanceUploadedMonths.map(m => (
-                <button
-                  key={m.value}
-                  type="button"
-                  id={`btn-uploaded-advance-${m.value}`}
-                  onClick={() => handleSelectPeriod(m.value)}
-                  className={`px-2 py-0.5 rounded text-[11px] font-mono font-bold border transition cursor-pointer flex items-center gap-1 ${
-                    targetMonthYear === m.value
-                      ? 'bg-emerald-500 text-slate-950 border-emerald-400 shadow-xs'
-                      : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25'
-                  }`}
-                  title={`คลิกเพื่อดูหรืออัปโหลดข้อมูลงวด ${m.value} (จัดกะแล้ว ${m.shiftCount} รายการ)`}
-                >
-                  <span>{m.value}</span>
-                  <span className="text-[10px] font-normal opacity-90">({m.shiftCount} กะ)</span>
-                </button>
-              ))}
-            </div>
-          )}
         </div>
       </div>
 
