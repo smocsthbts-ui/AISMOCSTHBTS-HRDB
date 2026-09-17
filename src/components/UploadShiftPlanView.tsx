@@ -250,14 +250,40 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
 
   // Handler to download Excel (.xlsx) Template
   const handleDownloadExcelTemplate = () => {
-    const { workbook } = generateShiftPlanTemplate(targetDept, targetMonthYear, employees);
-    downloadWorkbook(workbook, `ShiftPlan_${targetDept}_${targetMonthYear}.xlsx`);
+    try {
+      const { workbook } = generateShiftPlanTemplate(targetDept, targetMonthYear, employees);
+      const filename = `ShiftPlan_Template_${targetDept}_${targetMonthYear}.xlsx`;
+      downloadWorkbook(workbook, filename);
+      setStatusMessage({
+        type: 'success',
+        text: `ดาวน์โหลดไฟล์เทมเพลต Excel สำเร็จ: ${filename} (แผนก ${targetDept}, งวด ${targetMonthYear})`,
+      });
+    } catch (err: any) {
+      console.error('Error downloading Excel template:', err);
+      setStatusMessage({
+        type: 'error',
+        text: `ไม่สามารถดาวน์โหลดไฟล์ Excel ได้: ${err.message || String(err)}`,
+      });
+    }
   };
 
   // Handler to download CSV Template
   const handleDownloadCsvTemplate = () => {
-    const { csvContent } = generateShiftPlanTemplate(targetDept, targetMonthYear, employees);
-    downloadBlob(csvContent, `ShiftPlan_${targetDept}_${targetMonthYear}.csv`, 'text/csv;charset=utf-8;');
+    try {
+      const { csvContent } = generateShiftPlanTemplate(targetDept, targetMonthYear, employees);
+      const filename = `ShiftPlan_Template_${targetDept}_${targetMonthYear}.csv`;
+      downloadBlob(csvContent, filename, 'text/csv;charset=utf-8;');
+      setStatusMessage({
+        type: 'success',
+        text: `ดาวน์โหลดไฟล์เทมเพลต CSV สำเร็จ: ${filename} (แผนก ${targetDept}, งวด ${targetMonthYear})`,
+      });
+    } catch (err: any) {
+      console.error('Error downloading CSV template:', err);
+      setStatusMessage({
+        type: 'error',
+        text: `ไม่สามารถดาวน์โหลดไฟล์ CSV ได้: ${err.message || String(err)}`,
+      });
+    }
   };
 
   // Process File
@@ -348,7 +374,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
   };
 
   return (
-    <div className="p-4 sm:p-6 space-y-6 max-w-7xl mx-auto">
+    <div className={`p-4 md:p-6 flex flex-col space-y-6 w-full min-h-full ${isDark ? 'text-slate-100' : 'text-slate-800'}`}>
       {/* 1. Header Banner */}
       <div className={`p-4 sm:p-5 rounded-lg border flex flex-col md:flex-row items-start md:items-center justify-between gap-4 ${
         isDark ? 'bg-[#0f1722] border-[#223548]' : 'bg-white border-slate-200 shadow-xs'
@@ -421,7 +447,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
               {isAdmin && <option value="ALL">ALL Departments (ทุกแผนก)</option>}
               {storage.getDepartments().map(d => (
                 <option key={d.code} value={d.code}>
-                  {d.name} ({d.code})
+                  {d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code}
                 </option>
               ))}
             </select>
@@ -562,7 +588,10 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
             </div>
 
             <p className="text-xs text-slate-400 leading-relaxed">
-              Downloads a customized template pre-filled with active employees from <strong>{targetDept}</strong> ({targetEmployees.length} people) for period <strong>{targetMonthYear}</strong>. Includes employee columns (EmpNo, GID, Name) and date columns (01 to {new Date(parseInt(targetMonthYear.split('-')[0]), parseInt(targetMonthYear.split('-')[1]), 0).getDate()}).
+              ดาวน์โหลดเทมเพลตจัดตารางกะล่วงหน้าที่เตรียมรายชื่อพนักงานแผนก <strong>{targetDept}</strong> ({targetEmployees.length} คน) ประจำงวด <strong>{targetMonthYear}</strong> โดยใช้คอลัมน์อ้างอิง <strong>Emp No</strong>, <strong>Name</strong> และ <strong>Department</strong> ตามด้วยวันที่ (01 ถึง {(() => {
+                const parts = (targetMonthYear || '2026-05').split('-');
+                return new Date(parseInt(parts[0], 10) || 2026, parseInt(parts[1], 10) || 5, 0).getDate();
+              })()}) เพื่อความแม่นยำในการอ้างอิงและระบุตัวตนพนักงาน
             </p>
 
             {/* Shift Codes Legend */}
@@ -574,9 +603,9 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 <span>Available Shift Codes for {targetDept} (รหัสกะที่ใช้ได้ในแผนก):</span>
               </div>
               <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto scrollbar-thin pr-1">
-                {applicableShiftCodes.map(sc => (
+                {applicableShiftCodes.map((sc, idx) => (
                   <span
-                    key={sc.code}
+                    key={`${sc.code}_${sc.department}_${idx}`}
                     className="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[11px] font-mono font-medium border"
                     style={{
                       backgroundColor: `${sc.color}15`,
@@ -595,6 +624,25 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[11px] font-mono bg-blue-500/10 text-blue-300 border border-blue-500/30">
                   <strong>H</strong> <span className="text-[10px]">(นักขัตฤกษ์)</span>
                 </span>
+              </div>
+
+              {/* Allowance Suffix Guide (-X and -ET) */}
+              <div className="pt-2 border-t border-slate-700/40 space-y-1">
+                <div className="font-semibold text-[11px] text-amber-400 flex items-center gap-1">
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>เงื่อนไขเบี้ยเลี้ยงอัตโนมัติประจำกะ (Shift Allowance Suffix):</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[10px] text-slate-300">
+                  <div className="p-1.5 rounded bg-amber-500/10 border border-amber-500/30">
+                    <span className="font-mono font-bold text-amber-300">-X</span> : ใส่ <strong>300 บาท</strong> ในคอลัมน์ <em>Stand by Allowance</em> (เช่น <code>AD1-X</code>, <code>D-X</code>, <code>N-X</code>)
+                  </div>
+                  <div className="p-1.5 rounded bg-rose-500/10 border border-rose-500/30">
+                    <span className="font-mono font-bold text-rose-300">-ET</span> : ใส่ <strong>300 บาท</strong> ในคอลัมน์ <em>Emergency Allowance</em> (เช่น <code>E-ET</code>, <code>AD1-ET</code>)
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-400">
+                  * หากมีการแก้ไขหรือนำรหัสต่อท้ายออก ระบบจะนำเบี้ยเลี้ยงออกจาก Time Sheet ของเดือนนั้นๆ ให้อัตโนมัติ
+                </p>
               </div>
             </div>
           </div>

@@ -247,7 +247,7 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
               >
                 {storage.getDepartments().map(d => (
                   <option key={d.code} value={d.code} className={isDark ? 'bg-[#141f2c] text-white' : ''}>
-                    {d.code} - {d.name}
+                    {d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code}
                   </option>
                 ))}
               </select>

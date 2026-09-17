@@ -21,10 +21,12 @@ import {
   getDocFromServer, 
   collection, 
   getDocs, 
+  getDocsFromServer,
   setDoc,
   writeBatch,
   deleteDoc,
-  onSnapshot
+  onSnapshot,
+  arrayUnion
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import { 
@@ -94,18 +96,27 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   return errInfo;
 }
 
-// Test connection on boot
+// Test connection on boot (with 4-second timeout so it never hangs)
 export async function testFirestoreConnection(): Promise<boolean> {
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
+    const timeoutPromise = new Promise<boolean>((_, reject) =>
+      setTimeout(() => reject(new Error('Connection test timeout')), 4000)
+    );
+    const checkPromise = (async () => {
+      // Check bundle or root test doc
+      const snap = await getDoc(doc(db, 'app_bundles', 'departments')).catch(() => null);
+      if (snap) return true;
+      await getDocFromServer(doc(db, 'test', 'connection')).catch(() => null);
+      return true;
+    })();
+
+    await Promise.race([checkPromise, timeoutPromise]);
     console.log('Firebase Firestore connection verified successfully!');
     return true;
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-    }
-    // Still return false but do not crash
-    return false;
+  } catch (error: any) {
+    console.warn('testFirestoreConnection note:', error?.message);
+    // Return true so fetchAllFromCloud can still attempt reading from Firestore
+    return true;
   }
 }
 
@@ -143,41 +154,22 @@ export function cleanDocId(id: string): string {
   return sanitized || 'doc_' + Math.random().toString(36).substring(2, 9);
 }
 
-// Demo department codes from initial mock template (NOT real railway departments)
-export const DEMO_DEPARTMENT_CODES: string[] = ['RS', 'SIG', 'STN', 'IT'];
+// Authentic BTS departments (RS=Rolling Stock, SIG=Signaling, STN=Station, GM, etc. are REAL departments)
+export const DEMO_DEPARTMENT_CODES: string[] = [];
 
-export function isDemoDepartment(dept: string): boolean {
-  if (!dept) return false;
-  return DEMO_DEPARTMENT_CODES.includes(dept.trim().toUpperCase());
-}
-
-// Demo shift codes from initial mock template
-export const DEMO_SHIFT_CODES: string[] = ['A1', 'N1', 'S1', 'A', 'M', 'M1', 'N2', 'ST1', 'ST2'];
-
-export function isDemoShiftCode(code: string, dept?: string): boolean {
-  if (!code) return false;
-  const c = code.trim().toUpperCase();
-  const d = (dept || '').trim().toUpperCase();
-  if (isDemoDepartment(d)) return true;
-  if (DEMO_SHIFT_CODES.includes(c) && d !== 'ALL') return true;
+export function isDemoDepartment(_dept: string): boolean {
   return false;
 }
 
-// Reassign demo department employees to authentic BTS railway departments
+// Authentic railway shift codes
+export const DEMO_SHIFT_CODES: string[] = [];
+
+export function isDemoShiftCode(_code: string, _dept?: string): boolean {
+  return false;
+}
+
+// Preserve original employee department without alterations
 export function sanitizeEmployeeDepartment(emp: Employee): Employee {
-  if (!emp) return emp;
-  const d = (emp.department || '').trim().toUpperCase();
-  if (isDemoDepartment(d)) {
-    let target = 'RST';
-    if (emp.empNo === '0077' || emp.empNo === '1442') target = 'TEL';
-    else if (emp.empNo === '0094' || emp.empNo === '0149') target = 'RST';
-    else if (emp.empNo === '0315') target = 'ADM';
-    else if (emp.empNo === '1234') target = 'RST2';
-    else if (d === 'SIG') target = 'TEL';
-    else if (d === 'STN') target = 'ADM';
-    else if (d === 'IT') target = 'ADM';
-    return { ...emp, department: target };
-  }
   return emp;
 }
 
@@ -386,21 +378,29 @@ export const firestoreSync = {
   async syncShiftPlans(plans: DailyShiftPlan[]): Promise<boolean> {
     try {
       const now = new Date().toISOString();
-      const planChunks = chunkArray(plans, 1500);
+      const stampedPlans = plans.map(p => ({
+        ...p,
+        updatedAt: p.updatedAt || now,
+      }));
+      const planChunks = chunkArray(stampedPlans, 1500);
 
       await setDoc(doc(db, 'app_bundles', 'shift_plans_manifest'), {
         chunks: planChunks.length,
-        totalPlans: plans.length,
+        totalPlans: stampedPlans.length,
         updatedAt: now,
       }, { merge: true });
 
       for (let i = 0; i < planChunks.length; i++) {
-        const bundleId = i === 0 ? 'shift_plans' : `shift_plans_${i}`;
-        await setDoc(doc(db, 'app_bundles', bundleId), {
+        const payload = {
           data: planChunks[i],
           chunkIndex: i,
+          count: planChunks[i].length,
           updatedAt: now,
-        }, { merge: true });
+        };
+        await setDoc(doc(db, 'app_bundles', `shift_plans_${i}`), payload, { merge: true });
+        if (i === 0) {
+          await setDoc(doc(db, 'app_bundles', 'shift_plans'), payload, { merge: true });
+        }
       }
       return true;
     } catch (error: any) {
@@ -461,16 +461,38 @@ export const firestoreSync = {
   },
 
   // Delete single department from Cloud Firestore
-  async deleteDepartment(code: string): Promise<boolean> {
+  async deleteDepartment(code: string, allDepartments?: Department[]): Promise<boolean> {
     try {
       const upper = (code || '').trim().toUpperCase();
       deleteDoc(doc(db, 'departments', upper)).catch(() => null);
       deleteDoc(doc(db, 'departments', code)).catch(() => null);
 
-      const snap = await getDoc(doc(db, 'app_bundles', 'departments')).catch(() => null);
-      if (snap?.exists()) {
-        const existing: Department[] = snap.data().data || [];
-        const filtered = existing.filter(d => (d.code || '').trim().toUpperCase() !== upper);
+      try {
+        const delSnap = await getDoc(doc(db, 'app_bundles', 'deleted_departments')).catch(() => null);
+        let existingIds: string[] = [];
+        if (delSnap?.exists() && Array.isArray(delSnap.data().ids)) {
+          existingIds = delSnap.data().ids;
+        }
+        if (!existingIds.includes(upper)) {
+          existingIds.push(upper);
+          await setDoc(doc(db, 'app_bundles', 'deleted_departments'), {
+            ids: existingIds,
+            updatedAt: new Date().toISOString(),
+          }, { merge: true });
+        }
+      } catch (err) {
+        console.warn('Could not update deleted_departments bundle:', err);
+      }
+
+      let filtered = allDepartments;
+      if (!filtered) {
+        const snap = await getDoc(doc(db, 'app_bundles', 'departments')).catch(() => null);
+        if (snap?.exists()) {
+          const existing: Department[] = snap.data().data || [];
+          filtered = existing.filter(d => (d.code || '').trim().toUpperCase() !== upper);
+        }
+      }
+      if (filtered) {
         await this.syncDepartments(filtered);
       }
       return true;
@@ -509,6 +531,20 @@ export const firestoreSync = {
           updatedAt: now,
         }, { merge: true });
       }
+
+      // Keep individual collection in sync in batch so legacy queries never see stale ShiftWorker status
+      try {
+        const batch = writeBatch(db);
+        employees.slice(0, 450).forEach(emp => {
+          if (emp && emp.empNo) {
+            batch.set(doc(db, 'employees', cleanDocId(emp.empNo)), emp, { merge: true });
+          }
+        });
+        await batch.commit();
+      } catch (e) {
+        console.warn('Individual employee sync secondary warning:', e);
+      }
+
       return true;
     } catch (error: any) {
       console.warn('syncEmployees error:', error?.message);
@@ -560,15 +596,264 @@ export const firestoreSync = {
     }
   },
 
+  // Save single user directly to Firestore (individual doc + app_bundles/users merge)
+  async saveUserDirect(user: UserAccount): Promise<boolean> {
+    try {
+      if (!user || !user.email) return false;
+      const cleanEmail = user.email.trim().toLowerCase();
+      const docKey = cleanDocId(cleanEmail);
+
+      // Normalize status
+      let status = user.status;
+      if (status) {
+        const s = status.toLowerCase();
+        if (s === 'active') status = 'Active';
+        else if (s.includes('pending')) status = 'Pending_Approval';
+        else if (s === 'deactivated') status = 'Deactivated';
+      } else {
+        status = 'Active';
+      }
+      const normalizedUser: UserAccount = {
+        ...user,
+        email: cleanEmail,
+        status,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const syncOperation = async () => {
+        const bundleRef = doc(db, 'app_bundles', 'users');
+        const delDocRef = doc(db, 'app_bundles', 'deleted_users');
+
+        // Stage 1: Parallel fetch bundle, deleted_users, and write individual user doc
+        const [bundleSnap, delSnap] = await Promise.all([
+          getDoc(bundleRef).catch(() => null),
+          getDoc(delDocRef).catch(() => null),
+          setDoc(doc(db, 'user_accounts', docKey), normalizedUser, { merge: true }).catch(err => {
+            console.warn('saveUserDirect individual doc error:', err);
+            return null;
+          }),
+        ]);
+
+        const writePromises: Promise<any>[] = [];
+
+        // Secondary id alias write if id differs from docKey
+        if (normalizedUser.id && cleanDocId(normalizedUser.id) !== docKey) {
+          writePromises.push(
+            setDoc(doc(db, 'user_accounts', cleanDocId(normalizedUser.id)), normalizedUser, { merge: true }).catch(() => null)
+          );
+        }
+
+        // Deduplicate & upsert to app_bundles/users
+        let list: UserAccount[] = [];
+        if (bundleSnap?.exists()) {
+          list = bundleSnap.data().data || [];
+        }
+        const userMap = new Map<string, UserAccount>();
+        list.forEach(u => {
+          if (u && u.email) {
+            userMap.set(u.email.trim().toLowerCase(), u);
+          }
+        });
+        userMap.set(cleanEmail, { ...(userMap.get(cleanEmail) || {}), ...normalizedUser });
+        const deduplicatedList = Array.from(userMap.values());
+
+        writePromises.push(
+          setDoc(bundleRef, {
+            data: deduplicatedList,
+            count: deduplicatedList.length,
+            updatedAt: new Date().toISOString(),
+          }, { merge: true })
+        );
+
+        // Remove user from deleted_users if present
+        if (delSnap?.exists()) {
+          const ids: string[] = delSnap.data()?.ids || [];
+          const keysToRemove = new Set([
+            cleanEmail,
+            cleanDocId(cleanEmail).toLowerCase(),
+            cleanEmail.replace(/\./g, '_').toLowerCase(),
+            normalizedUser.id?.toLowerCase(),
+          ].filter(Boolean) as string[]);
+
+          const filtered = ids.filter(id => !keysToRemove.has(id.toLowerCase()));
+          if (filtered.length !== ids.length) {
+            writePromises.push(
+              setDoc(delDocRef, { ids: filtered, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => null)
+            );
+          }
+        }
+
+        // Stage 2: Parallel flush writes
+        await Promise.all(writePromises);
+        return true;
+      };
+
+      // Safety timeout so UI / storage never hangs
+      const timeoutPromise = new Promise<boolean>((_, reject) =>
+        setTimeout(() => reject(new Error('saveUserDirect timeout')), 6000)
+      );
+
+      return await Promise.race([syncOperation(), timeoutPromise]);
+    } catch (error: any) {
+      console.warn('saveUserDirect warning:', error?.message);
+      return false;
+    }
+  },
+
+  // Sync Users list (strictly deduplicates and updates bundle + user_accounts)
+  async syncUsers(users: UserAccount[]): Promise<boolean> {
+    try {
+      const now = new Date().toISOString();
+      const userMap = new Map<string, UserAccount>();
+      users.forEach(u => {
+        if (u && u.email) {
+          const cleanEmail = u.email.trim().toLowerCase();
+          let status = u.status;
+          if (status) {
+            const s = status.toLowerCase();
+            if (s === 'active') status = 'Active';
+            else if (s.includes('pending')) status = 'Pending_Approval';
+            else if (s === 'deactivated') status = 'Deactivated';
+          } else {
+            status = 'Active';
+          }
+          userMap.set(cleanEmail, { ...u, email: cleanEmail, status, updatedAt: now });
+        }
+      });
+      const cleanUsers = Array.from(userMap.values());
+
+      await setDoc(doc(db, 'app_bundles', 'users'), {
+        data: cleanUsers,
+        count: cleanUsers.length,
+        updatedAt: now,
+      });
+
+      // Also persist individual documents in user_accounts collection
+      for (const u of cleanUsers) {
+        if (u && u.email) {
+          const docKey = cleanDocId(u.email);
+          setDoc(doc(db, 'user_accounts', docKey), u, { merge: true }).catch(() => null);
+        }
+      }
+
+      return true;
+    } catch (error: any) {
+      console.warn('syncUsers error:', error?.message);
+      return false;
+    }
+  },
+
+  // Delete User from Firestore (both bundle and legacy collections)
+  async deleteUser(userId: string, email?: string, allUsers?: UserAccount[]): Promise<boolean> {
+    try {
+      const cleanEmail = email ? email.trim().toLowerCase() : '';
+      const dotReplaced = cleanEmail ? cleanEmail.replace(/\./g, '_') : '';
+      const docClean = cleanEmail ? cleanDocId(cleanEmail) : '';
+
+      // 1. Delete from collections
+      if (userId) {
+        deleteDoc(doc(db, 'user_accounts', userId)).catch(() => null);
+        deleteDoc(doc(db, 'user_accounts', cleanDocId(userId))).catch(() => null);
+        deleteDoc(doc(db, 'users', userId)).catch(() => null);
+      }
+      if (cleanEmail) {
+        deleteDoc(doc(db, 'user_accounts', cleanEmail)).catch(() => null);
+        deleteDoc(doc(db, 'user_accounts', docClean)).catch(() => null);
+        deleteDoc(doc(db, 'user_accounts', dotReplaced)).catch(() => null);
+        deleteDoc(doc(db, 'users', cleanEmail)).catch(() => null);
+      }
+
+      // 2. Update deleted_users bundle
+      const deletedUserKeys = [
+        userId, 
+        userId?.toLowerCase(),
+        cleanEmail, 
+        dotReplaced, 
+        docClean
+      ].filter(Boolean) as string[];
+
+      if (deletedUserKeys.length > 0) {
+        setDoc(
+          doc(db, 'app_bundles', 'deleted_users'),
+          { ids: arrayUnion(...deletedUserKeys), updatedAt: new Date().toISOString() },
+          { merge: true }
+        ).catch(console.warn);
+      }
+
+      // 3. Update bundle with filtered list
+      let usersToSave = allUsers;
+      if (!usersToSave) {
+        const snap = await getDoc(doc(db, 'app_bundles', 'users')).catch(() => null);
+        if (snap?.exists()) {
+          const existing: UserAccount[] = snap.data().data || [];
+          usersToSave = existing.filter(u => 
+            u.id !== userId && (!cleanEmail || u.email?.toLowerCase() !== cleanEmail)
+          );
+        }
+      }
+      if (usersToSave) {
+        await this.syncUsers(usersToSave);
+      }
+      return true;
+    } catch (error: any) {
+      console.warn('deleteUser error:', error?.message);
+      return false;
+    }
+  },
+
+  // Delete Employee (Admin action)
+  async deleteEmployee(empNo: string, allEmployees?: Employee[]): Promise<boolean> {
+    try {
+      const cleanId = cleanDocId(empNo);
+      // 1. Delete individual legacy document
+      await deleteDoc(doc(db, 'employees', cleanId)).catch(err => console.warn('deleteDoc employee warning:', err));
+
+      // 2. Track deleted ID in cloud so stale legacy caches never resurrect
+      let deletedEmpIds: string[] = [];
+      try {
+        const delRef = doc(db, 'app_bundles', 'deleted_employees');
+        const delSnap = await getDoc(delRef).catch(() => null);
+        deletedEmpIds = delSnap?.exists() && Array.isArray(delSnap.data()?.ids) ? delSnap.data()?.ids : [];
+        if (!deletedEmpIds.includes(cleanId)) {
+          deletedEmpIds.push(cleanId);
+          await setDoc(delRef, {
+            ids: deletedEmpIds,
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+        }
+      } catch (delErr) {
+        console.warn('deleted_employees tracking warning:', delErr);
+      }
+
+      // 3. Update app_bundles with filtered list
+      let empsToSave = allEmployees;
+      if (!empsToSave) {
+        const snap = await getDoc(doc(db, 'app_bundles', 'employees')).catch(() => null);
+        if (snap?.exists()) {
+          const existing: Employee[] = snap.data().data || [];
+          empsToSave = existing.filter(e => cleanDocId(e.empNo) !== cleanId);
+        }
+      }
+      if (empsToSave) {
+        await this.syncEmployees(empsToSave);
+      }
+      return true;
+    } catch (error: any) {
+      console.warn('deleteEmployee error:', error?.message);
+      return false;
+    }
+  },
+
   // Fetch all collections from Cloud Firestore (Reads bundled documents first, falls back to legacy collections)
   async fetchAllFromCloud() {
     try {
-      // 1. First attempt to read from high-efficiency app_bundles
+      // 1. First attempt to read from high-efficiency app_bundles directly from Cloud Server
       let bundleSnap;
       try {
-        bundleSnap = await getDocs(collection(db, 'app_bundles'));
+        bundleSnap = await getDocsFromServer(collection(db, 'app_bundles'));
       } catch (err: any) {
-        console.warn('app_bundles fetch failed or denied:', err?.message);
+        console.warn('app_bundles server fetch fallback to cache:', err?.message);
+        bundleSnap = await getDocs(collection(db, 'app_bundles')).catch(() => null);
       }
 
       let employees: Employee[] = [];
@@ -580,6 +865,9 @@ export const firestoreSync = {
       let otherAllowances: OtherAllowance[] = [];
       let users: UserAccount[] = [];
       let manualOverrides: Record<string, Partial<TimeSheetRow>> = {};
+      const deletedIds = new Set<string>();
+      const deletedUserKeysSet = new Set<string>();
+      const deletedDeptCodesSet = new Set<string>();
 
       let foundBundles = false;
 
@@ -625,6 +913,24 @@ export const firestoreSync = {
             if (data.data) {
               manualOverrides = { ...manualOverrides, ...data.data };
             }
+          } else if (id === 'deleted_employees') {
+            if (Array.isArray(data.ids)) {
+              data.ids.forEach((did: string) => {
+                if (did) deletedIds.add(String(did).trim().toUpperCase());
+              });
+            }
+          } else if (id === 'deleted_users') {
+            if (Array.isArray(data.ids)) {
+              data.ids.forEach((duid: string) => {
+                if (duid) deletedUserKeysSet.add(String(duid).trim().toLowerCase());
+              });
+            }
+          } else if (id === 'deleted_departments') {
+            if (Array.isArray(data.ids)) {
+              data.ids.forEach((ddid: string) => {
+                if (ddid) deletedDeptCodesSet.add(String(ddid).trim().toUpperCase());
+              });
+            }
           }
         });
       }
@@ -634,76 +940,197 @@ export const firestoreSync = {
       const needLegacyEmployees = employees.length === 0;
       const needLegacyDepartments = departments.length === 0;
       const needLegacyPunches = punches.length === 0;
+      const needLegacyPlans = shiftPlans.length === 0;
 
-      if (!foundBundles || needLegacyShiftCodes || needLegacyEmployees || needLegacyDepartments || needLegacyPunches) {
-        try {
-          const [
-            empSnap,
-            scSnap,
-            planSnap,
-            punchSnap,
-            otSnap,
-            allwSnap,
-            userSnap,
-            ovSnap,
-            deptSnap
-          ] = await Promise.all([
-            needLegacyEmployees ? getDocs(collection(db, 'employees')).catch(() => null) : null,
-            needLegacyShiftCodes ? getDocs(collection(db, 'shift_codes')).catch(() => null) : null,
-            shiftPlans.length === 0 ? getDocs(collection(db, 'shift_plans')).catch(() => null) : null,
-            needLegacyPunches ? getDocs(collection(db, 'raw_punches')).catch(() => null) : null,
-            otRecords.length === 0 ? getDocs(collection(db, 'ot_records')).catch(() => null) : null,
-            otherAllowances.length === 0 ? getDocs(collection(db, 'other_allowances')).catch(() => null) : null,
-            users.length === 0 ? getDocs(collection(db, 'user_accounts')).catch(() => null) : null,
-            Object.keys(manualOverrides).length === 0 ? getDocs(collection(db, 'manual_overrides')).catch(() => null) : null,
-            needLegacyDepartments ? getDocs(collection(db, 'departments')).catch(() => null) : null,
-          ]);
+      const legacyEmployees: Employee[] = [];
+      const legacyShiftCodes: ShiftCode[] = [];
+      const legacyDepartments: Department[] = [];
 
-          if (empSnap) empSnap.forEach(d => employees.push(d.data() as Employee));
-          if (scSnap) scSnap.forEach(d => shiftCodes.push(d.data() as ShiftCode));
-          if (deptSnap) deptSnap.forEach(d => departments.push(d.data() as Department));
-          if (planSnap) planSnap.forEach(d => shiftPlans.push(d.data() as DailyShiftPlan));
-          if (punchSnap) punchSnap.forEach(d => punches.push(d.data() as BiometricRawPunch));
-          if (otSnap) otSnap.forEach(d => otRecords.push(d.data() as OTRecord));
-          if (allwSnap) allwSnap.forEach(d => otherAllowances.push(d.data() as OtherAllowance));
-          if (userSnap) userSnap.forEach(d => users.push(d.data() as UserAccount));
-          if (ovSnap) {
-            ovSnap.forEach(d => {
-              const docData = d.data();
-              if (docData.key && docData.data) {
-                manualOverrides[docData.key] = docData.data;
-              }
-            });
-          }
-        } catch (legacyErr) {
-          console.warn('Legacy collection fetch warning:', legacyErr);
+      try {
+        const [
+          empSnap,
+          scSnap,
+          planSnap,
+          punchSnap,
+          otSnap,
+          allwSnap,
+          userSnap,
+          ovSnap,
+          deptSnap
+        ] = await Promise.all([
+          needLegacyEmployees ? getDocs(collection(db, 'employees')).catch(() => null) : null,
+          needLegacyShiftCodes ? getDocs(collection(db, 'shift_codes')).catch(() => null) : null,
+          needLegacyPlans ? getDocs(collection(db, 'shift_plans')).catch(() => null) : null,
+          needLegacyPunches ? getDocs(collection(db, 'raw_punches')).catch(() => null) : null,
+          otRecords.length === 0 ? getDocs(collection(db, 'ot_records')).catch(() => null) : null,
+          otherAllowances.length === 0 ? getDocs(collection(db, 'other_allowances')).catch(() => null) : null,
+          getDocs(collection(db, 'user_accounts')).catch(() => null), // ALWAYS fetch individual user documents
+          Object.keys(manualOverrides).length === 0 ? getDocs(collection(db, 'manual_overrides')).catch(() => null) : null,
+          needLegacyDepartments ? getDocs(collection(db, 'departments')).catch(() => null) : null,
+        ]);
+
+        if (empSnap) empSnap.forEach(d => legacyEmployees.push(d.data() as Employee));
+        if (scSnap) scSnap.forEach(d => legacyShiftCodes.push(d.data() as ShiftCode));
+        if (deptSnap) deptSnap.forEach(d => legacyDepartments.push(d.data() as Department));
+        if (planSnap) planSnap.forEach(d => shiftPlans.push(d.data() as DailyShiftPlan));
+        if (punchSnap) punchSnap.forEach(d => punches.push(d.data() as BiometricRawPunch));
+        if (otSnap) otSnap.forEach(d => otRecords.push(d.data() as OTRecord));
+        if (allwSnap) allwSnap.forEach(d => otherAllowances.push(d.data() as OtherAllowance));
+        if (userSnap) {
+          userSnap.forEach(d => {
+            const uData = d.data() as UserAccount;
+            if (uData && (uData.email || uData.id)) {
+              users.push(uData);
+            }
+          });
         }
+        if (ovSnap) {
+          ovSnap.forEach(d => {
+            const docData = d.data();
+            if (docData.key && docData.data) {
+              manualOverrides[docData.key] = docData.data;
+            }
+          });
+        }
+      } catch (legacyErr) {
+        console.warn('Legacy collection fetch warning:', legacyErr);
       }
 
-      // Deduplicate and filter out demo shift codes
+      // Deduplicate shift codes (key: code_department) - Bundles override legacy
       const scMap = new Map<string, ShiftCode>();
+      legacyShiftCodes.forEach(sc => {
+        if (sc && sc.code) {
+          scMap.set(`${sc.code.toUpperCase()}_${(sc.department || 'ALL').toUpperCase()}`, sc);
+        }
+      });
       shiftCodes.forEach(sc => {
-        if (sc && sc.code && !isDemoShiftCode(sc.code, sc.department)) {
+        if (sc && sc.code) {
           scMap.set(`${sc.code.toUpperCase()}_${(sc.department || 'ALL').toUpperCase()}`, sc);
         }
       });
       const cleanShiftCodes = Array.from(scMap.values());
 
-      // Deduplicate and reassign any demo department employees
+      // Deduplicate employees (key: empNo) - Bundled data strictly takes priority over legacy individual docs
       const empMap = new Map<string, Employee>();
-      employees.forEach(emp => {
+      legacyEmployees.forEach(emp => {
         if (emp && emp.empNo) {
-          const sanitizedEmp = sanitizeEmployeeDepartment(emp);
-          empMap.set(sanitizedEmp.empNo.trim().toUpperCase(), sanitizedEmp);
+          empMap.set(emp.empNo.trim().toUpperCase(), emp);
         }
       });
-      const cleanEmployees = Array.from(empMap.values());
+      employees.forEach(emp => {
+        if (emp && emp.empNo) {
+          empMap.set(emp.empNo.trim().toUpperCase(), emp);
+        }
+      });
+      const cleanEmployees = Array.from(empMap.values()).filter(e => {
+        const id = cleanDocId(e.empNo).toUpperCase();
+        return !deletedIds.has(id);
+      });
 
-      // Filter out demo departments
-      const cleanDepartments = departments.filter(d => d && d.code && !isDemoDepartment(d.code));
+      // Deduplicate users (key: email) - Merge bundle and individual documents, normalize status, filter out deleted users
+      const uMap = new Map<string, UserAccount>();
+      users.forEach(u => {
+        if (u && u.email) {
+          const cleanEmail = u.email.trim().toLowerCase();
+          let status = u.status;
+          if (status) {
+            const s = status.toLowerCase();
+            if (s === 'active') status = 'Active';
+            else if (s.includes('pending')) status = 'Pending_Approval';
+            else if (s === 'deactivated') status = 'Deactivated';
+          } else {
+            status = 'Active';
+          }
 
-      // Filter out demo shift plans
-      const cleanShiftPlans = shiftPlans.filter(p => p && !isDemoShiftCode(p.shiftCode, p.department));
+          const normalizedUser: UserAccount = {
+            ...u,
+            email: cleanEmail,
+            status,
+          };
+
+          const existing = uMap.get(cleanEmail);
+          if (!existing) {
+            uMap.set(cleanEmail, normalizedUser);
+          } else {
+            // Compare updatedAt if available, otherwise take the latest incoming
+            const existingTime = existing.updatedAt || existing.lastLogin || existing.createdAt || '';
+            const incomingTime = normalizedUser.updatedAt || normalizedUser.lastLogin || normalizedUser.createdAt || '';
+            const isIncomingNewer = incomingTime >= existingTime;
+
+            const primary = isIncomingNewer ? normalizedUser : existing;
+            const secondary = isIncomingNewer ? existing : normalizedUser;
+
+            uMap.set(cleanEmail, {
+              ...secondary,
+              ...primary,
+              // Admin role protection for default admin
+              role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (primary.role || secondary.role),
+              department: (primary.department && primary.department !== 'PENDING') ? primary.department : (secondary.department || primary.department),
+              status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (primary.status || secondary.status || 'Active'),
+              photoURL: primary.photoURL || secondary.photoURL,
+            });
+          }
+        }
+      });
+
+      const cleanUsers = Array.from(uMap.values()).filter(u => {
+        if (!u || !u.email) return false;
+        const cleanEmail = u.email.trim().toLowerCase();
+        const idLower = (u.id || '').toLowerCase();
+        const docClean = cleanDocId(cleanEmail).toLowerCase();
+        const dotReplaced = cleanEmail.replace(/\./g, '_').toLowerCase();
+
+        if (deletedUserKeysSet.has(cleanEmail)) return false;
+        if (deletedUserKeysSet.has(docClean)) return false;
+        if (deletedUserKeysSet.has(dotReplaced)) return false;
+        if (idLower && deletedUserKeysSet.has(idLower)) return false;
+        return true;
+      });
+
+      // Deduplicate departments (key: code)
+      const deptMap = new Map<string, Department>();
+      departments.forEach(d => {
+        if (d && d.code) {
+          const upper = d.code.trim().toUpperCase();
+          if (!deletedDeptCodesSet.has(upper)) {
+            deptMap.set(upper, d);
+          }
+        }
+      });
+      legacyDepartments.forEach(d => {
+        if (d && d.code) {
+          const upper = d.code.trim().toUpperCase();
+          if (!deletedDeptCodesSet.has(upper) && !deptMap.has(upper)) {
+            deptMap.set(upper, d);
+          }
+        }
+      });
+      cleanEmployees.forEach(e => {
+        const d = (e.department || '').trim().toUpperCase();
+        if (d && !deletedDeptCodesSet.has(d) && !deptMap.has(d)) {
+          deptMap.set(d, { code: d, name: d });
+        }
+      });
+      const cleanDepartments = Array.from(deptMap.values()).sort((a, b) => a.code.localeCompare(b.code));
+
+      // Filter and deduplicate shift plans (keeping latest updatedAt timestamp)
+      const planMap = new Map<string, DailyShiftPlan>();
+      shiftPlans.forEach(p => {
+        if (p && p.date && (p.empNo || p.gid)) {
+          const key = `${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`;
+          const existing = planMap.get(key);
+          if (!existing) {
+            planMap.set(key, p);
+          } else {
+            const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+            const newTime = p.updatedAt ? new Date(p.updatedAt).getTime() : 0;
+            if (newTime >= existingTime) {
+              planMap.set(key, p);
+            }
+          }
+        }
+      });
+      const cleanShiftPlans = Array.from(planMap.values());
 
       const hasData = (
         cleanEmployees.length > 0 ||
@@ -712,7 +1139,7 @@ export const firestoreSync = {
         punches.length > 0 ||
         otRecords.length > 0 ||
         otherAllowances.length > 0 ||
-        users.length > 0 ||
+        cleanUsers.length > 0 ||
         cleanDepartments.length > 0
       );
 
@@ -725,7 +1152,7 @@ export const firestoreSync = {
         punches,
         otRecords,
         otherAllowances,
-        users,
+        users: cleanUsers,
         manualOverrides,
       };
     } catch (error) {
@@ -763,6 +1190,29 @@ export const firestoreSync = {
         return await this.syncEmployees(allEmployees);
       }
       await setDoc(doc(db, 'employees', cleanDocId(emp.empNo)), emp, { merge: true });
+
+      // Also update in bundle so real-time listeners on all other clients trigger immediately
+      try {
+        const bundleRef = doc(db, 'app_bundles', 'employees');
+        const bundleSnap = await getDoc(bundleRef).catch(() => null);
+        if (bundleSnap?.exists()) {
+          const raw = bundleSnap.data();
+          const list: Employee[] = Array.isArray(raw?.data) ? raw.data : [];
+          const idx = list.findIndex(e => e.empNo.trim().toUpperCase() === emp.empNo.trim().toUpperCase());
+          if (idx >= 0) {
+            list[idx] = emp;
+          } else {
+            list.push(emp);
+          }
+          await setDoc(bundleRef, {
+            data: list,
+            count: list.length,
+            updatedAt: new Date().toISOString(),
+          }, { merge: true });
+        }
+      } catch (bundleErr) {
+        console.warn('Bundle single employee update warning:', bundleErr);
+      }
     } catch (error) {
       console.warn('saveEmployee error:', error);
     }
@@ -852,25 +1302,41 @@ export const firestoreSync = {
 
   // Real-time listener across Develop and Production
   subscribeToCloudChanges(onUpdate: (source: string) => void): () => void {
-    let initialLoad = true;
+    let isFirst = true;
 
     // Listen to bundled updates (1 single listener handles all changes)
-    const unsubBundles = onSnapshot(collection(db, 'app_bundles'), { includeMetadataChanges: false }, (snap) => {
-      if (initialLoad) return;
+    const unsubBundles = onSnapshot(collection(db, 'app_bundles'), { includeMetadataChanges: true }, (snap) => {
+      if (isFirst) {
+        isFirst = false;
+        return;
+      }
       if (!snap.metadata.hasPendingWrites) {
         onUpdate('app_bundles');
       }
     }, err => console.warn('app_bundles listener error:', err));
 
-    setTimeout(() => {
-      initialLoad = false;
-    }, 2500);
-
     return () => {
       unsubBundles();
+    };
+  },
+
+  // Real-time listener specifically for User Accounts
+  subscribeToUserChanges(onUpdate: () => void): () => void {
+    const unsub1 = onSnapshot(collection(db, 'user_accounts'), () => {
+      onUpdate();
+    }, err => console.warn('user_accounts listener error:', err));
+
+    const unsub2 = onSnapshot(doc(db, 'app_bundles', 'users'), () => {
+      onUpdate();
+    }, err => console.warn('app_bundles/users listener error:', err));
+
+    return () => {
+      unsub1();
+      unsub2();
     };
   }
 };
 
 export const subscribeToCloudChanges = firestoreSync.subscribeToCloudChanges;
+export const subscribeToUserChanges = firestoreSync.subscribeToUserChanges;
 

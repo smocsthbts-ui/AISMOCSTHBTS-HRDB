@@ -235,7 +235,7 @@ export const ManageMyAccountView: React.FC<ManageMyAccountViewProps> = ({
               >
                 {storage.getDepartments().map(d => (
                   <option key={d.code} value={d.code} className={isDark ? 'bg-[#0f1822] text-white' : 'bg-white text-slate-800'}>
-                    {d.code} — {d.name}
+                    {d.name && d.name !== d.code ? `${d.code} — ${d.name}` : d.code}
                   </option>
                 ))}
               </select>

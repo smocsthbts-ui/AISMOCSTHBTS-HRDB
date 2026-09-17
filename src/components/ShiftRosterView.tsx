@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 import { storage } from '../utils/storage';
 import { generateShiftPlanTemplate, downloadBlob } from '../utils/fileParser';
-import { getShiftCategoryColor } from '../utils/timeCalc';
+import { getShiftCategoryColor, resolveShiftInfo, parseShiftCodeTags } from '../utils/timeCalc';
 import { MonthYearFilter } from './MonthYearFilter';
 import { ShiftPickerModal } from './ShiftPickerModal';
 
@@ -70,6 +70,8 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   // Quick Shift Painter / Stamp Mode
   const [isPainterActive, setIsPainterActive] = useState<boolean>(false);
   const [selectedPainterCode, setSelectedPainterCode] = useState<string>('D');
+  const [painterStandby, setPainterStandby] = useState<boolean>(false);     // -X
+  const [painterEmergency, setPainterEmergency] = useState<boolean>(false); // -ET
 
   // Toast feedback notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -159,6 +161,44 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     return map;
   }, [shiftCodes]);
 
+  // Group filtered employees by department
+  const groupedEmployees = useMemo(() => {
+    const deptList = storage.getDepartments();
+    const deptNameMap = new Map<string, string>();
+    deptList.forEach(d => deptNameMap.set(d.code, d.name));
+
+    // Sort employees by department code, then by employee number
+    const sorted = [...filteredEmployees].sort((a, b) => {
+      const deptA = a.department || '';
+      const deptB = b.department || '';
+      if (deptA !== deptB) {
+        return deptA.localeCompare(deptB);
+      }
+      return a.empNo.localeCompare(b.empNo);
+    });
+
+    const groups: { deptCode: string; deptName: string; employees: Employee[] }[] = [];
+    const groupMap = new Map<string, Employee[]>();
+
+    sorted.forEach(emp => {
+      const dept = emp.department || 'OTHER';
+      if (!groupMap.has(dept)) {
+        groupMap.set(dept, []);
+      }
+      groupMap.get(dept)!.push(emp);
+    });
+
+    groupMap.forEach((empList, deptCode) => {
+      groups.push({
+        deptCode,
+        deptName: deptNameMap.get(deptCode) || deptCode,
+        employees: empList,
+      });
+    });
+
+    return groups;
+  }, [filteredEmployees]);
+
   // Quick check if current user can edit this employee's schedule
   const canEditEmployee = (emp: Employee): boolean => {
     if (currentUser.role === 'Admin') return true;
@@ -168,9 +208,16 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
   // Get shift code for employee on date
   const getShiftForDate = (empNo: string, gid: string, dateStr: string): string => {
-    const plan = shiftPlans.find(
-      p => (p.empNo === empNo || p.gid === gid) && p.date === dateStr
-    );
+    const cleanEmpNo = (empNo || '').trim().toUpperCase();
+    const cleanGid = (gid || '').trim().toUpperCase();
+    const plan = shiftPlans.find(p => {
+      if (p.date !== dateStr) return false;
+      const pEmpNo = (p.empNo || '').trim().toUpperCase();
+      const pGid = (p.gid || '').trim().toUpperCase();
+      if (cleanEmpNo && pEmpNo && cleanEmpNo === pEmpNo) return true;
+      if (cleanGid && pGid && cleanGid === pGid) return true;
+      return false;
+    });
     if (plan) return plan.shiftCode;
     // Fallback: Day shift for weekday, OFF for weekend
     const dow = new Date(dateStr).getDay();
@@ -220,11 +267,18 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     }
 
     const currentPlans = storage.getShiftPlans();
+    const cleanEmpNo = (emp.empNo || '').trim().toUpperCase();
+    const cleanGid = (emp.gid || '').trim().toUpperCase();
 
     targetDates.forEach(dStr => {
-      const existingIndex = currentPlans.findIndex(
-        p => (p.empNo === emp.empNo || p.gid === emp.gid) && p.date === dStr
-      );
+      const existingIndex = currentPlans.findIndex(p => {
+        if (p.date !== dStr) return false;
+        const pEmpNo = (p.empNo || '').trim().toUpperCase();
+        const pGid = (p.gid || '').trim().toUpperCase();
+        if (cleanEmpNo && pEmpNo && cleanEmpNo === pEmpNo) return true;
+        if (cleanGid && pGid && cleanGid === pGid) return true;
+        return false;
+      });
 
       if (existingIndex >= 0) {
         currentPlans[existingIndex].shiftCode = newCode;
@@ -246,9 +300,15 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
     storage.setShiftPlans(currentPlans);
 
-    const shiftInfo = shiftMap.get(newCode);
+    const shiftInfo = shiftMap.get(newCode) || resolveShiftInfo(newCode, shiftMap);
+    const tagInfo = parseShiftCodeTags(newCode);
+    const allowanceDesc = [
+      tagInfo.hasStandbyTag ? 'Standby +300฿' : '',
+      tagInfo.hasEmergencyTag ? 'Emergency +300฿' : ''
+    ].filter(Boolean).join(', ');
+
     const rangeName = rangeType === 'single' ? '1 วัน' : rangeType === 'weekday' ? 'ทั้งสัปดาห์ (จ.-ศ.)' : rangeType === 'next7' ? '7 วัน' : 'ถึงสิ้นเดือน';
-    showToast(`เปลี่ยนกะ ${newCode} (${shiftInfo?.name || ''}) ให้ ${emp.firstName} ${rangeName} เรียบร้อยแล้ว`);
+    showToast(`เปลี่ยนกะ ${newCode} (${shiftInfo?.name || ''}${allowanceDesc ? ` [${allowanceDesc}]` : ''}) ให้ ${emp.firstName} ${rangeName} เรียบร้อยแล้ว`);
 
     // Close modal if open
     setPickerModal({
@@ -264,8 +324,12 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     if (!canEditEmployee(emp)) return;
 
     if (isPainterActive) {
-      // Instant paint
-      handleApplyShift(emp, d.dateStr, selectedPainterCode, 'single');
+      // Build effective code with painter tags
+      let codeToApply = selectedPainterCode.replace(/-X/gi, '').replace(/-ET/gi, '').trim();
+      if (painterStandby) codeToApply += '-X';
+      if (painterEmergency) codeToApply += '-ET';
+
+      handleApplyShift(emp, d.dateStr, codeToApply, 'single');
     } else {
       // Open Smart Picker Modal
       const currentCode = getShiftForDate(emp.empNo, emp.gid, d.dateStr);
@@ -376,71 +440,165 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
       {/* QUICK SHIFT PAINTER TOOLBAR (Visible when Painter mode is active or user wants quick access) */}
       {isPainterActive && (
-        <div className={`p-3 rounded-lg border flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-md animate-in fade-in slide-in-from-top-2 duration-150 ${
+        <div className={`p-3 rounded-lg border flex flex-col gap-2.5 shadow-md animate-in fade-in slide-in-from-top-2 duration-150 ${
           isDark ? 'bg-[#172535] border-amber-500/50' : 'bg-amber-50/80 border-amber-300'
         }`}>
-          <div className="flex items-center space-x-2 flex-wrap gap-y-1.5">
-            <div className="flex items-center space-x-1.5 text-xs font-bold text-amber-400">
-              <Paintbrush className="w-4 h-4 text-amber-400 animate-pulse" />
-              <span>กะที่ต้องการแต้ม:</span>
+          <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+            <div className="flex items-center space-x-2 flex-wrap gap-y-1.5">
+              <div className="flex items-center space-x-1.5 text-xs font-bold text-amber-400">
+                <Paintbrush className="w-4 h-4 text-amber-400 animate-pulse" />
+                <span>กะที่ต้องการแต้ม:</span>
+              </div>
+
+              {/* Quick Shift Chips for Painting (Clean & Compact with Tooltip) */}
+              <div className="flex items-center space-x-1 flex-wrap gap-1">
+                {['D', 'D1', 'E', 'M', 'A', 'N', 'S1', 'T', 'W', 'AL', 'AL2', 'ALU', 'CL', 'SL', 'SL2', 'SLO', 'OFF', 'H'].map(code => {
+                  const sc = shiftMap.get(code);
+                  if (!sc) return null;
+                  const isSelected = selectedPainterCode === code;
+                  const timeDesc = sc.startTime === '00:00' && sc.endTime === '00:00'
+                    ? (sc.isWorkingDay ? 'เต็มวัน' : 'วันหยุด/การลา')
+                    : `${sc.startTime} - ${sc.endTime}`;
+                  return (
+                    <button
+                      key={code}
+                      onClick={() => setSelectedPainterCode(code)}
+                      className={`min-w-[28px] h-7 px-2 flex items-center justify-center rounded text-xs font-mono font-bold transition cursor-pointer shadow-xs ${
+                        isSelected
+                          ? 'ring-2 ring-white ring-offset-1 ring-offset-slate-900 scale-110 z-10 shadow-md font-extrabold'
+                          : 'opacity-85 hover:opacity-100 hover:scale-105'
+                      }`}
+                      style={{ backgroundColor: getShiftCategoryColor(code, sc.color), color: '#ffffff' }}
+                      title={`${sc.code}: ${sc.name} (${timeDesc}) - คลิกเพื่อเลือกแต้มกะ`}
+                    >
+                      <span>{code}</span>
+                    </button>
+                  );
+                })}
+
+                {/* Selector for any other shift code */}
+                <select
+                  aria-label="เลือกกะอื่นเพื่อแต้ม"
+                  value={`${selectedPainterCode}${painterStandby ? '-X' : ''}${painterEmergency ? '-ET' : ''}`}
+                  onChange={e => {
+                    const val = e.target.value;
+                    const hasX = val.includes('-X');
+                    const hasET = val.includes('-ET');
+                    const base = val.replace(/-X/gi, '').replace(/-ET/gi, '').trim();
+                    setSelectedPainterCode(base);
+                    setPainterStandby(hasX);
+                    setPainterEmergency(hasET);
+                  }}
+                  className={`ml-1 px-2 py-1 rounded text-xs border font-mono outline-none cursor-pointer ${
+                    isDark 
+                      ? 'bg-[#0f1722] border-slate-700 text-white' 
+                      : 'bg-white border-slate-300 text-slate-900'
+                  }`}
+                >
+                  <optgroup label="⭐ กะเบี้ยเลี้ยงพิเศษยอดนิยม">
+                    <option value="AD1-X">AD1-X (Stand by +300฿)</option>
+                    <option value="D-X">D-X (Stand by +300฿)</option>
+                    <option value="E-ET">E-ET (Emergency +300฿)</option>
+                    <option value="D-ET">D-ET (Emergency +300฿)</option>
+                    <option value="N-X">N-X (Stand by +300฿)</option>
+                    <option value="N-ET">N-ET (Emergency +300฿)</option>
+                    <option value="E-X">E-X (Stand by +300฿)</option>
+                  </optgroup>
+                  <optgroup label="📋 กะมาตรฐานทั้งหมด">
+                    {shiftCodes.map(sc => (
+                      <option key={`${sc.code}_${sc.department}`} value={sc.code}>
+                        {sc.code} - {sc.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                </select>
+              </div>
             </div>
 
-            {/* Quick Shift Chips for Painting */}
-            <div className="flex items-center space-x-1.5 flex-wrap gap-1">
-              {['D', 'D1', 'M', 'A', 'N', 'S1', 'OFF', 'H'].map(code => {
-                const sc = shiftMap.get(code);
-                if (!sc) return null;
-                const isSelected = selectedPainterCode === code;
-                return (
-                  <button
-                    key={code}
-                    onClick={() => setSelectedPainterCode(code)}
-                    className={`flex items-center space-x-1 px-2.5 py-1 rounded text-xs font-mono font-bold transition cursor-pointer ${
-                      isSelected
-                        ? 'ring-2 ring-white ring-offset-1 ring-offset-slate-900 scale-105 shadow-sm'
-                        : 'opacity-85 hover:opacity-100 hover:scale-102'
-                    }`}
-                    style={{ backgroundColor: getShiftCategoryColor(code, sc.color), color: '#ffffff' }}
-                    title={`${sc.code}: ${sc.name} (${sc.startTime}-${sc.endTime})`}
-                  >
-                    <span>{code}</span>
-                    <span className="text-[10px] font-normal hidden sm:inline opacity-90">
-                      {code === 'OFF' ? 'หยุด' : sc.startTime}
-                    </span>
-                  </button>
-                );
-              })}
-
-              {/* Selector for any other shift code */}
-              <select
-                aria-label="เลือกกะอื่นเพื่อแต้ม"
-                value={selectedPainterCode}
-                onChange={e => setSelectedPainterCode(e.target.value)}
-                className={`ml-1 px-2 py-1 rounded text-xs border font-mono outline-none cursor-pointer ${
-                  isDark 
-                    ? 'bg-[#0f1722] border-slate-700 text-white' 
-                    : 'bg-white border-slate-300 text-slate-900'
-                }`}
+            <div className="flex items-center space-x-2 text-xs text-slate-300 shrink-0">
+              <span className="text-amber-400 font-medium text-[11px] hidden lg:inline">
+                👉 กะที่จะแต้ม: <strong className="text-white font-mono bg-slate-900/80 px-1.5 py-0.5 rounded border border-amber-400/40">{selectedPainterCode}{painterStandby ? '-X' : ''}{painterEmergency ? '-ET' : ''}</strong> (คลิกช่องวันที่เพื่อแต้มทันที)
+              </span>
+              <button
+                onClick={() => setIsPainterActive(false)}
+                className="px-2 py-1 rounded text-[11px] bg-slate-700/60 hover:bg-slate-700 text-slate-200 border border-slate-600 transition cursor-pointer"
               >
-                {shiftCodes.map(sc => (
-                  <option key={sc.code} value={sc.code}>
-                    {sc.code} - {sc.name} ({sc.department})
-                  </option>
-                ))}
-              </select>
+                ปิดโหมดแต้มกะ (ESC)
+              </button>
             </div>
           </div>
 
-          <div className="flex items-center space-x-2 text-xs text-slate-300 shrink-0">
-            <span className="text-amber-400 font-medium text-[11px] hidden lg:inline">
-              👉 เพียงคลิกช่องวันที่ของพนักงานคนใดก็ได้ เพื่อใส่กะ {selectedPainterCode} ทันที
-            </span>
-            <button
-              onClick={() => setIsPainterActive(false)}
-              className="px-2 py-1 rounded text-[11px] bg-slate-700/60 hover:bg-slate-700 text-slate-200 border border-slate-600 transition cursor-pointer"
-            >
-              ปิดโหมดแต้มกะ (ESC)
-            </button>
+          {/* Allowance Suffix Bar for Painter */}
+          <div className="flex items-center justify-between gap-2 flex-wrap pt-2 border-t border-amber-500/20 text-xs">
+            <div className="flex items-center space-x-2 flex-wrap gap-1.5">
+              <span className="font-semibold text-slate-300 text-[11px] flex items-center gap-1">
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                เงื่อนไขเบี้ยเลี้ยงพิเศษประจำกะ:
+              </span>
+
+              <label className="flex items-center space-x-1.5 cursor-pointer select-none bg-amber-500/15 border border-amber-500/40 px-2 py-0.5 rounded text-amber-300 hover:bg-amber-500/25 transition">
+                <input
+                  type="checkbox"
+                  checked={painterStandby}
+                  onChange={e => setPainterStandby(e.target.checked)}
+                  className="rounded border-amber-500 text-amber-500 focus:ring-0 w-3.5 h-3.5"
+                />
+                <span className="font-mono font-bold">-X</span>
+                <span className="text-[10px] opacity-90">(Stand by +300฿)</span>
+              </label>
+
+              <label className="flex items-center space-x-1.5 cursor-pointer select-none bg-rose-500/15 border border-rose-500/40 px-2 py-0.5 rounded text-rose-300 hover:bg-rose-500/25 transition">
+                <input
+                  type="checkbox"
+                  checked={painterEmergency}
+                  onChange={e => setPainterEmergency(e.target.checked)}
+                  className="rounded border-rose-500 text-rose-500 focus:ring-0 w-3.5 h-3.5"
+                />
+                <span className="font-mono font-bold">-ET</span>
+                <span className="text-[10px] opacity-90">(Emergency +300฿)</span>
+              </label>
+            </div>
+
+            {/* Quick Suffix Presets */}
+            <div className="flex items-center space-x-1">
+              <span className="text-[10px] text-slate-400">กะเบี้ยเลี้ยงด่วน:</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedPainterCode('AD1');
+                  setPainterStandby(true);
+                  setPainterEmergency(false);
+                }}
+                className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-200 border border-amber-500/50 hover:scale-105 transition cursor-pointer"
+                title="AD1-X: กะ D1 + Stand by Allowance 300฿"
+              >
+                AD1-X (300฿)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedPainterCode('E');
+                  setPainterStandby(false);
+                  setPainterEmergency(true);
+                }}
+                className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-200 border border-rose-500/50 hover:scale-105 transition cursor-pointer"
+                title="E-ET: กะ E + Emergency Allowance 300฿"
+              >
+                E-ET (300฿)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedPainterCode('D');
+                  setPainterStandby(true);
+                  setPainterEmergency(false);
+                }}
+                className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-teal-500/20 text-teal-200 border border-teal-500/50 hover:scale-105 transition cursor-pointer"
+                title="D-X: กะ D + Stand by Allowance 300฿"
+              >
+                D-X (300฿)
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -485,7 +643,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                 </option>
                 {storage.getDepartments().map(d => (
                   <option key={d.code} value={d.code}>
-                    {d.code} - {d.name} ({departmentCounts[d.code] || 0} คน)
+                    {d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code} ({departmentCounts[d.code] || 0} คน)
                   </option>
                 ))}
               </select>
@@ -584,12 +742,22 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                 {daysArray.map(d => (
                   <th
                     key={d.day}
-                    className={`p-1 text-center border-r border-b border-slate-700/50 min-w-[32px] ${
-                      d.isWeekend ? (isDark ? 'bg-slate-800/60 text-amber-300' : 'bg-slate-200 text-amber-800') : ''
+                    className={`p-1 text-center border-r border-b min-w-[32px] transition-colors ${
+                      d.isWeekend
+                        ? isDark
+                          ? 'bg-red-700 text-white border-red-600/60 shadow-xs'
+                          : 'bg-red-600 text-white border-red-500 shadow-xs'
+                        : isDark
+                          ? 'border-slate-700/50 text-slate-200'
+                          : 'border-slate-300 text-slate-700'
                     }`}
                   >
-                    <div className="font-mono font-bold text-xs">{d.day}</div>
-                    <div className="text-[9px] font-normal opacity-80">{d.dowEn}</div>
+                    <div className={`font-mono font-bold text-xs ${d.isWeekend ? 'text-white' : ''}`}>
+                      {d.day}
+                    </div>
+                    <div className={`text-[9px] ${d.isWeekend ? 'text-red-100 font-bold' : 'font-normal opacity-80'}`}>
+                      {d.dowEn}
+                    </div>
                   </th>
                 ))}
                 <th className="p-2 text-center border-b border-slate-700/50 min-w-[80px] font-semibold">
@@ -607,97 +775,137 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                   </td>
                 </tr>
               ) : (
-                filteredEmployees.map(emp => {
-                  const hasPermission = canEditEmployee(emp);
-                  let workingDaysCount = 0;
-
-                  return (
-                    <tr 
-                      key={emp.empNo} 
-                      className={`border-b transition hover:bg-teal-500/5 ${
-                        isDark ? 'border-slate-800' : 'border-slate-100'
-                      }`}
-                    >
-                      {/* Employee Info Frozen Column */}
-                      <td className={`p-2.5 border-r border-slate-700/40 sticky left-0 z-10 font-medium ${
-                        isDark ? 'bg-[#121c27]' : 'bg-white'
-                      }`}>
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <div className="font-semibold text-slate-100 flex items-center gap-1.5">
-                              {emp.firstName} {emp.familyName}
-                              {!hasPermission && (
-                                <span title="สิทธิ์เฉพาะแผนก (View Only)" className="text-amber-400">
-                                  <Lock className="w-3 h-3 inline" />
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-[10px] font-mono text-slate-400 flex items-center gap-2">
-                              <span>No: {emp.empNo}</span>
-                              <span>GID: {emp.gid}</span>
-                            </div>
-                          </div>
-                          <span className={`text-[10px] px-1.5 py-0.2 rounded font-mono ${
-                            emp.isShiftWorker 
-                              ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' 
-                              : 'bg-slate-700/30 text-slate-400'
+                groupedEmployees.map(group => (
+                  <React.Fragment key={`dept-group-${group.deptCode}`}>
+                    {/* Department Group Header Banner */}
+                    <tr className={`border-y font-semibold ${
+                      isDark 
+                        ? 'bg-[#152332] text-teal-300 border-[#233548]' 
+                        : 'bg-teal-50/90 text-teal-900 border-teal-200'
+                    }`}>
+                      <td colSpan={daysInMonth + 3} className="px-3 py-1.5 sticky left-0 z-10 bg-inherit">
+                        <div className="flex items-center space-x-2">
+                          <Building2 className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                          <span className="font-bold text-xs uppercase tracking-wide">
+                            แผนก {group.deptCode} {group.deptName && group.deptName !== group.deptCode ? `- ${group.deptName}` : ''}
+                          </span>
+                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono font-medium ${
+                            isDark ? 'bg-teal-500/20 text-teal-200 border border-teal-500/30' : 'bg-teal-100 text-teal-800'
                           }`}>
-                            {emp.isShiftWorker ? 'Shift' : 'Office'}
+                            {group.employees.length} คน
                           </span>
                         </div>
                       </td>
-
-                      {/* Department */}
-                      <td className="p-2 text-center border-r border-slate-700/40 font-mono text-xs font-semibold text-[#00e5e5]">
-                        {emp.department}
-                      </td>
-
-                      {/* Day Shift Cells */}
-                      {daysArray.map(d => {
-                        const code = getShiftForDate(emp.empNo, emp.gid, d.dateStr);
-                        const shiftInfo = shiftMap.get(code);
-                        if (shiftInfo?.isWorkingDay) {
-                          workingDaysCount++;
-                        }
-
-                        return (
-                          <td
-                            key={d.day}
-                            onClick={() => handleCellClick(emp, d)}
-                            className={`p-0.5 text-center border-r border-slate-700/30 relative select-none transition-colors ${
-                              d.isWeekend ? (isDark ? 'bg-slate-800/30' : 'bg-slate-50') : ''
-                            } ${
-                              hasPermission 
-                                ? isPainterActive
-                                  ? 'cursor-crosshair hover:ring-2 hover:ring-amber-400 hover:bg-amber-400/20'
-                                  : 'cursor-pointer hover:ring-1 hover:ring-teal-400 hover:bg-teal-500/10' 
-                                : 'cursor-not-allowed opacity-90'
-                            }`}
-                            title={
-                              hasPermission
-                                ? isPainterActive
-                                  ? `คลิกเพื่อแต้มกะ ${selectedPainterCode} ให้กับ ${emp.firstName} (วันที่ ${d.day})`
-                                  : `คลิกเพื่อเลือกหรือค้นหากะ: ${emp.firstName} (${d.dateStr})`
-                                : `ไม่มีสิทธิ์แก้ไข (${emp.department})`
-                            }
-                          >
-                            <span 
-                              className="inline-block w-6 h-6 leading-6 rounded text-[10px] font-mono font-bold text-white shadow-xs transition-transform hover:scale-110 active:scale-95"
-                              style={{ backgroundColor: getShiftCategoryColor(code, shiftInfo?.color) }}
-                            >
-                              {code}
-                            </span>
-                          </td>
-                        );
-                      })}
-
-                      {/* Working Days Total */}
-                      <td className="p-2 text-center font-mono font-bold text-xs text-teal-400">
-                        {workingDaysCount} วัน
-                      </td>
                     </tr>
-                  );
-                })
+
+                    {/* Employee Rows in Group */}
+                    {group.employees.map(emp => {
+                      const hasPermission = canEditEmployee(emp);
+                      let workingDaysCount = 0;
+
+                      return (
+                        <tr 
+                          key={emp.empNo} 
+                          className={`border-b transition hover:bg-teal-500/5 ${
+                            isDark ? 'border-slate-800' : 'border-slate-100'
+                          }`}
+                        >
+                          {/* Employee Info Frozen Column */}
+                          <td className={`p-2.5 border-r border-slate-700/40 sticky left-0 z-10 font-medium ${
+                            isDark ? 'bg-[#121c27]' : 'bg-white'
+                          }`}>
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <div className={`font-semibold flex items-center gap-1.5 ${
+                                  isDark ? 'text-slate-100' : 'text-slate-900'
+                                }`}>
+                                  {emp.firstName} {emp.familyName}
+                                  {!hasPermission && (
+                                    <span title="สิทธิ์เฉพาะแผนก (View Only)" className="text-amber-400">
+                                      <Lock className="w-3 h-3 inline" />
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[10px] font-mono text-slate-400 flex items-center gap-2">
+                                  <span>No: {emp.empNo}</span>
+                                  <span>GID: {emp.gid}</span>
+                                </div>
+                              </div>
+                              <span className={`text-[10px] px-1.5 py-0.2 rounded font-mono ${
+                                emp.isShiftWorker 
+                                  ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' 
+                                  : 'bg-slate-700/30 text-slate-400'
+                              }`}>
+                                {emp.isShiftWorker ? 'Shift' : 'Office'}
+                              </span>
+                            </div>
+                          </td>
+
+                          {/* Department */}
+                          <td className="p-2 text-center border-r border-slate-700/40 font-mono text-xs font-semibold text-[#00e5e5]">
+                            {emp.department}
+                          </td>
+
+                          {/* Day Shift Cells */}
+                          {daysArray.map(d => {
+                            const code = getShiftForDate(emp.empNo, emp.gid, d.dateStr);
+                            const tagInfo = parseShiftCodeTags(code);
+                            const shiftInfo = shiftMap.get(code) || resolveShiftInfo(code, shiftMap);
+                            if (shiftInfo?.isWorkingDay) {
+                              workingDaysCount++;
+                            }
+
+                            const allowanceNotes = [
+                              tagInfo.hasStandbyTag ? 'Stand by Allowance +300฿' : '',
+                              tagInfo.hasEmergencyTag ? 'Emergency Allowance +300฿' : ''
+                            ].filter(Boolean).join(', ');
+
+                            return (
+                              <td
+                                key={d.day}
+                                onClick={() => handleCellClick(emp, d)}
+                                className={`p-0.5 text-center border-r border-slate-700/30 relative select-none transition-colors ${
+                                  d.isWeekend 
+                                    ? isDark 
+                                      ? 'bg-red-950/40 ring-1 ring-inset ring-red-500/20' 
+                                      : 'bg-red-50 ring-1 ring-inset ring-red-200/60' 
+                                    : ''
+                                } ${
+                                  hasPermission 
+                                    ? isPainterActive
+                                      ? 'cursor-crosshair hover:ring-2 hover:ring-amber-400 hover:bg-amber-400/20'
+                                      : 'cursor-pointer hover:ring-1 hover:ring-teal-400 hover:bg-teal-500/10' 
+                                    : 'cursor-not-allowed opacity-90'
+                                }`}
+                                title={
+                                  hasPermission
+                                    ? isPainterActive
+                                      ? `คลิกเพื่อแต้มกะ ${selectedPainterCode}${painterStandby ? '-X' : ''}${painterEmergency ? '-ET' : ''} ให้กับ ${emp.firstName} (วันที่ ${d.day})`
+                                      : `${code}: ${shiftInfo?.name || ''}${allowanceNotes ? ` [${allowanceNotes}]` : ''} - คลิกเพื่อเลือกหรือค้นหากะ: ${emp.firstName} (${d.dateStr})`
+                                    : `ไม่มีสิทธิ์แก้ไข (${emp.department})`
+                                }
+                              >
+                                <span 
+                                  className={`inline-flex items-center justify-center min-w-[24px] px-1 h-6 rounded text-[10px] font-mono font-bold text-white shadow-xs transition-transform hover:scale-110 active:scale-95 ${
+                                    tagInfo.hasStandbyTag || tagInfo.hasEmergencyTag ? 'ring-1 ring-amber-300/80 shadow-sm' : ''
+                                  }`}
+                                  style={{ backgroundColor: getShiftCategoryColor(code, shiftInfo?.color) }}
+                                >
+                                  {code}
+                                </span>
+                              </td>
+                            );
+                          })}
+
+                          {/* Working Days Total */}
+                          <td className="p-2 text-center font-mono font-bold text-xs text-teal-400">
+                            {workingDaysCount} วัน
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </React.Fragment>
+                ))
               )}
             </tbody>
           </table>

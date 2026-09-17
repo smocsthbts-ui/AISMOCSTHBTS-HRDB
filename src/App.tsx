@@ -10,12 +10,14 @@ import {
   Department
 } from './types';
 import { storage } from './utils/storage';
-import { auth, onAuthStateChanged, logOut } from './firebase';
+import { auth, onAuthStateChanged, logOut, firestoreSync, db, cleanDocId, subscribeToUserChanges } from './firebase';
+import { doc, getDoc } from 'firebase/firestore';
 import { SiemensSidebar } from './components/SiemensSidebar';
 import { SiemensHeader } from './components/SiemensHeader';
 import { ShiftRosterView } from './components/ShiftRosterView';
 import { UploadShiftPlanView } from './components/UploadShiftPlanView';
 import { TimeSheetView } from './components/TimeSheetView';
+import { StatisticsView } from './components/StatisticsView';
 import { ImportCenterView } from './components/ImportCenterView';
 import { ExportCenterView } from './components/ExportCenterView';
 import { EmployeeMasterView } from './components/EmployeeMasterView';
@@ -23,6 +25,7 @@ import { UserManagementView } from './components/UserManagementView';
 import { SettingsAndTemplatesView } from './components/SettingsAndTemplatesView';
 import { AuthModal } from './components/AuthModal';
 import { ManageMyAccountView } from './components/ManageMyAccountView';
+import { WaitingVerificationScreen } from './components/WaitingVerificationScreen';
 
 export default function App() {
   // Theme: Dark mode by default as requested by Siemens IX Industrial guidelines
@@ -31,7 +34,7 @@ export default function App() {
   });
 
   // Current User (RBAC: Admin vs User)
-  const [currentUser, setCurrentUser] = useState<UserAccount>(() => {
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
     return storage.getCurrentUser();
   });
 
@@ -91,48 +94,94 @@ export default function App() {
     reloadData();
 
     // Firebase Auth State Listener
-    const unsubscribeAuth = onAuthStateChanged(auth, (firebaseUser) => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser && firebaseUser.email) {
-        // Find user in storage by email
-        const users = storage.getUsers();
-        let targetUser = users.find(u => u.email.toLowerCase() === firebaseUser.email?.toLowerCase());
-        
-        // Auto-create Admin if it's the default admin and doesn't exist
-        const isDefaultAdmin = firebaseUser.email.toLowerCase() === 'smo.cs.th.bts@gmail.com';
-        if (!targetUser && isDefaultAdmin) {
+        const cleanEmail = firebaseUser.email.trim().toLowerCase();
+        const docKey = cleanDocId(cleanEmail);
+        const isDefaultAdmin = cleanEmail === 'smo.cs.th.bts@gmail.com';
+
+        let users = storage.getUsers();
+        let targetUser = users.find(u => u.email.trim().toLowerCase() === cleanEmail);
+
+        // Fetch cloud user doc to ensure authoritative status and avoid stale state
+        try {
+          const userDocSnap = await getDoc(doc(db, 'user_accounts', docKey)).catch(() => null);
+          if (userDocSnap?.exists()) {
+            const cloudUser = userDocSnap.data() as UserAccount;
+            if (cloudUser) {
+              targetUser = targetUser ? { ...targetUser, ...cloudUser } : cloudUser;
+            }
+          }
+        } catch (err) {
+          console.warn('Cloud user direct lookup warning:', err);
+        }
+
+        // If not found in direct doc or local cache, attempt to fetch fresh bundle
+        if (!targetUser) {
+          try {
+            const fresh = await firestoreSync.fetchAllFromCloud();
+            if (fresh && fresh.users && fresh.users.length > 0) {
+              storage.setUsers(fresh.users);
+              users = fresh.users;
+              targetUser = users.find(u => u.email.trim().toLowerCase() === cleanEmail);
+            }
+          } catch (err) {
+            console.warn('Cloud user check failed:', err);
+          }
+        }
+
+        // Auto-provision User profile if authenticated in Firebase Auth but missing in DB
+        if (!targetUser) {
+          const employees = storage.getEmployees();
+          const matchedEmp = employees.find(e => 
+            (e.gid && cleanEmail.includes(e.gid.toLowerCase())) ||
+            (e.empNo && cleanEmail.includes(e.empNo.toLowerCase())) ||
+            (e.firstName && cleanEmail.includes(e.firstName.toLowerCase()))
+          );
+
           targetUser = {
             id: `usr-${firebaseUser.uid}`,
             email: firebaseUser.email,
-            name: firebaseUser.email.split('@')[0],
-            role: 'Admin',
-            department: 'ALL',
-            status: 'Active',
+            name: firebaseUser.displayName || (matchedEmp ? `${matchedEmp.firstName} ${matchedEmp.familyName}`.trim() : firebaseUser.email.split('@')[0]),
+            role: isDefaultAdmin ? 'Admin' : 'User',
+            department: isDefaultAdmin ? 'ALL' : (matchedEmp?.department || 'PENDING'),
+            status: isDefaultAdmin ? 'Active' : 'Pending_Approval',
+            photoURL: firebaseUser.photoURL || undefined,
+            isGoogleAccount: true,
             createdAt: new Date().toISOString(),
             lastLogin: new Date().toISOString(),
           };
-          users.push(targetUser);
-          storage.setUsers(users);
+          await storage.saveUser(targetUser);
+        } else {
+          // Update photoURL or last login without reverting status
+          const updatedUser: UserAccount = {
+            ...targetUser,
+            name: firebaseUser.displayName || targetUser.name,
+            photoURL: firebaseUser.photoURL || targetUser.photoURL,
+            lastLogin: new Date().toISOString(),
+            role: isDefaultAdmin ? 'Admin' : targetUser.role,
+            status: isDefaultAdmin ? 'Active' : targetUser.status,
+          };
+          targetUser = updatedUser;
+          await storage.saveUser(updatedUser);
         }
 
         if (targetUser) {
-          if (targetUser.status === 'Deactivated' || targetUser.status === 'Pending_Approval') {
-            logOut();
-            setCurrentUser(null as any);
+          if (targetUser.status === 'Deactivated') {
+            await logOut();
+            storage.clearCurrentUser();
+            setCurrentUser(null);
             setIsAuthModalOpen(true);
           } else {
             storage.setCurrentUser(targetUser);
             setCurrentUser(targetUser);
             setIsAuthModalOpen(false);
           }
-        } else {
-          // If no local user profile found (maybe deleted by Admin), sign out
-          logOut();
-          setCurrentUser(null as any);
-          setIsAuthModalOpen(true);
         }
       } else {
         // No firebase user
-        setCurrentUser(null as any);
+        storage.clearCurrentUser();
+        setCurrentUser(null);
         setIsAuthModalOpen(true);
       }
     });
@@ -154,14 +203,38 @@ export default function App() {
         setCloudStatus((prev) => ({ ...prev, isSyncing: false }));
       });
 
-    // Listen to cross-component data changes
+    // Real-time listener for user account changes
+    const unsubUsersRealtime = subscribeToUserChanges(() => {
+      const allUsers = storage.getUsers();
+      const currentStored = storage.getCurrentUser();
+      if (currentStored && currentStored.email) {
+        const clean = currentStored.email.trim().toLowerCase();
+        const updated = allUsers.find(u => u.email.trim().toLowerCase() === clean);
+        if (updated && (updated.status !== currentStored.status || updated.department !== currentStored.department || updated.role !== currentStored.role)) {
+          storage.setCurrentUser(updated);
+          setCurrentUser(updated);
+        }
+      }
+    });
+
+    // Listen to cross-component & multi-user real-time cloud data changes
     const handleDataUpdated = () => {
       reloadData();
+      setCloudStatus((prev) => ({
+        ...prev,
+        isConnected: true,
+        lastSync: new Date().toLocaleTimeString('th-TH'),
+      }));
     };
     window.addEventListener('siemens-data-updated', handleDataUpdated);
+    window.addEventListener('storage-changed', handleDataUpdated);
+    window.addEventListener('firestore-sync-completed', handleDataUpdated);
 
     return () => {
       window.removeEventListener('siemens-data-updated', handleDataUpdated);
+      window.removeEventListener('storage-changed', handleDataUpdated);
+      window.removeEventListener('firestore-sync-completed', handleDataUpdated);
+      unsubUsersRealtime();
       unsubscribeAuth();
     };
   }, [reloadData]);
@@ -240,12 +313,34 @@ export default function App() {
       }`}>
         <AuthModal
           currentUser={currentUser}
-          isOpen={isAuthModalOpen || !currentUser}
+          isOpen={true}
+          canClose={false}
           onClose={() => {}}
           onSwitchUser={handleSwitchUser}
           isDark={isDark}
         />
       </div>
+    );
+  }
+
+  // If user is registered via Google / Siemens and waiting for Admin verification and activation
+  if (currentUser.status === 'Pending_Approval') {
+    return (
+      <WaitingVerificationScreen
+        currentUser={currentUser}
+        theme={theme}
+        onUserActivated={(activatedUser) => {
+          setCurrentUser(activatedUser);
+          storage.setCurrentUser(activatedUser);
+          reloadData();
+        }}
+        onSignOut={async () => {
+          await logOut();
+          storage.clearCurrentUser();
+          setCurrentUser(null);
+          setIsAuthModalOpen(true);
+        }}
+      />
     );
   }
 
@@ -342,6 +437,22 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'statistics' && (
+            <StatisticsView
+              currentUser={currentUser}
+              theme={theme}
+              employees={employees}
+              shiftCodes={shiftCodes}
+              shiftPlans={shiftPlans}
+              biometricPunches={biometricPunches}
+              selectedMonthYear={selectedMonthYear}
+              onSelectMonthYear={setSelectedMonthYear}
+              selectedDepartment={selectedDepartment}
+              onSelectDepartment={setSelectedDepartment}
+              onNavigateToUploadShiftPlan={() => setActiveTab('upload-shift-plan')}
+            />
+          )}
+
           {activeTab === 'import' && (
             <ImportCenterView
               currentUser={currentUser}
@@ -415,6 +526,7 @@ export default function App() {
       <AuthModal
         currentUser={currentUser}
         isOpen={isAuthModalOpen}
+        canClose={currentUser?.status === 'Active'}
         onClose={() => setIsAuthModalOpen(false)}
         onSwitchUser={handleSwitchUser}
         isDark={isDark}

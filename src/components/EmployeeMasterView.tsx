@@ -16,7 +16,12 @@ import {
   RotateCcw,
   X,
   Layers,
-  Briefcase
+  Briefcase,
+  ArrowLeftRight,
+  Cloud,
+  Check,
+  Trash2,
+  AlertTriangle
 } from 'lucide-react';
 import { readFileAsArrayBuffer, parseSheetToRows, downloadBlob } from '../utils/fileParser';
 import { isDemoDepartment, firestoreSync } from '../firebase';
@@ -50,8 +55,18 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL');
 
   const [editingEmp, setEditingEmp] = useState<Employee | null>(null);
+  const [employeeToDelete, setEmployeeToDelete] = useState<Employee | null>(null);
   const [isNew, setIsNew] = useState(false);
   const [activeTab, setActiveTab] = useState<'employees' | 'departments'>('employees');
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncToast, setSyncToast] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
+
+  const showToast = (text: string, type: 'info' | 'success' | 'error' = 'success') => {
+    setSyncToast({ text, type });
+    setTimeout(() => {
+      setSyncToast(null);
+    }, 4000);
+  };
 
   // Synchronize when selectedDepartment changes from props
   useEffect(() => {
@@ -206,23 +221,51 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     setEmpForm({ ...emp });
   };
 
-  // Toggle Activate / Deactivate (Rule 2: "สามรถอับเดทแก้ไข Activate หรือ Deactivate ได้ด้วย Admin")
-  const handleToggleActive = (emp: Employee) => {
+  // Toggle Shift Worker (Direct 1-Click Toggle for Admins with instant cloud sync)
+  const handleToggleShiftWorker = async (emp: Employee) => {
     if (!isAdmin) return;
     const list = storage.getEmployees();
     const idx = list.findIndex(e => e.empNo === emp.empNo);
     if (idx >= 0) {
-      list[idx].isActive = !list[idx].isActive;
-      storage.setEmployees(list);
+      const nextVal = !list[idx].isShiftWorker;
+      list[idx].isShiftWorker = nextVal;
+      setIsSyncing(true);
+      showToast(`กำลังบันทึกสถานะ ${nextVal ? 'Shift Worker (เข้ากะ)' : 'Office (ทำงานปกติ)'} ของ ${emp.firstName}...`, 'info');
+      const ok = await storage.setEmployees(list);
+      setIsSyncing(false);
+      if (ok) {
+        showToast(`บันทึกและซิงค์คลาวด์: ${emp.firstName} (${emp.empNo}) เป็น ${nextVal ? 'Shift Worker (เข้ากะ)' : 'Office (ทำงานปกติ)'} เรียบร้อยแล้ว`, 'success');
+      } else {
+        showToast(`บันทึกในเครื่องแล้ว (คลาวด์จะซิงค์ให้อัตโนมัติเมื่อออนไลน์)`, 'info');
+      }
+      onDataChanged();
+    }
+  };
+
+  // Toggle Activate / Deactivate (Rule 2: "สามรถอับเดทแก้ไข Activate หรือ Deactivate ได้ด้วย Admin")
+  const handleToggleActive = async (emp: Employee) => {
+    if (!isAdmin) return;
+    const list = storage.getEmployees();
+    const idx = list.findIndex(e => e.empNo === emp.empNo);
+    if (idx >= 0) {
+      const nextVal = !list[idx].isActive;
+      list[idx].isActive = nextVal;
+      setIsSyncing(true);
+      await storage.setEmployees(list);
+      setIsSyncing(false);
+      showToast(`อัปเดตสถานะ ${nextVal ? 'Active' : 'Deactivated'} ของ ${emp.firstName} เรียบร้อยแล้ว`, 'success');
       onDataChanged();
     }
   };
 
   // Save Employee
-  const handleSaveEmployee = (e: React.FormEvent) => {
+  const handleSaveEmployee = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isAdmin) return;
     if (!empForm.empNo || !empForm.gid || !empForm.firstName) return;
+
+    setIsSyncing(true);
+    showToast(`กำลังบันทึกและซิงค์ข้อมูลพนักงาน ${empForm.firstName} ขึ้นคลาวด์...`, 'info');
 
     const list = storage.getEmployees();
     if (isNew) {
@@ -232,6 +275,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
       );
       if (duplicate) {
         alert('รหัสพนักงาน (EmpNo) หรือ GID นี้มีอยู่ในระบบแล้ว');
+        setIsSyncing(false);
         return;
       }
       list.push({
@@ -253,14 +297,40 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
         list[idx] = {
           ...list[idx],
           ...empForm,
+          isShiftWorker: Boolean(empForm.isShiftWorker),
           empNo: empForm.empNo?.trim() || list[idx].empNo,
           gid: empForm.gid?.trim() || list[idx].gid,
         } as Employee;
       }
     }
 
-    storage.setEmployees(list);
+    const ok = await storage.setEmployees(list);
+    setIsSyncing(false);
     setEditingEmp(null);
+    if (ok) {
+      showToast(`บันทึกข้อมูลพนักงาน ${empForm.firstName} (${Boolean(empForm.isShiftWorker) ? 'Shift Worker' : 'Office'}) ซิงค์ทุกเครื่องเรียบร้อยแล้ว`, 'success');
+    } else {
+      showToast(`บันทึกข้อมูลในเครื่องเรียบร้อยแล้ว`, 'info');
+    }
+    onDataChanged();
+  };
+
+  // Delete Employee (Admin Only)
+  const handleDeleteEmployee = async (emp: Employee) => {
+    if (!isAdmin) return;
+    setIsSyncing(true);
+    showToast(`กำลังลบข้อมูลพนักงาน ${emp.firstName} ${emp.familyName} (${emp.empNo}) ออกจากระบบ...`, 'info');
+    const ok = await storage.deleteEmployee(emp.empNo);
+    setIsSyncing(false);
+    setEmployeeToDelete(null);
+    if (editingEmp?.empNo === emp.empNo) {
+      setEditingEmp(null);
+    }
+    if (ok) {
+      showToast(`ลบพนักงาน ${emp.firstName} ${emp.familyName} (${emp.empNo}) และซิงค์ทุกอุปกรณ์เรียบร้อยแล้ว`, 'success');
+    } else {
+      showToast(`ลบพนักงาน ${emp.firstName} เรียบร้อยแล้ว`, 'info');
+    }
     onDataChanged();
   };
 
@@ -277,25 +347,36 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     setEditingDept(dept);
   };
 
-  const handleSaveDept = (e: React.FormEvent) => {
+  const handleSaveDept = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isAdmin || !deptForm.code || !deptForm.name) return;
 
     const list = [...departments];
+    const deptNameClean = deptForm.name.trim();
+    const deptCodeClean = deptForm.code.trim().toUpperCase();
+
     if (isNewDept) {
-      if (list.some(d => d.code.toLowerCase() === deptForm.code?.toLowerCase())) {
+      if (list.some(d => d.code.toLowerCase() === deptCodeClean.toLowerCase())) {
         alert('รหัสแผนกนี้มีอยู่ในระบบแล้ว');
         return;
       }
-      list.push({ code: deptForm.code.trim().toUpperCase(), name: deptForm.name.trim() });
+      list.push({ code: deptCodeClean, name: deptNameClean });
     } else {
       const idx = list.findIndex(d => d.code === editingDept?.code);
       if (idx >= 0) {
-        list[idx] = { ...list[idx], name: deptForm.name.trim() };
+        list[idx] = { ...list[idx], name: deptNameClean };
       }
     }
-    storage.setDepartments(list);
+    setIsSyncing(true);
+    showToast(`กำลังบันทึกและซิงค์ชื่อแผนก ${deptCodeClean} (${deptNameClean}) ขึ้นคลาวด์...`, 'info');
+    const ok = await storage.setDepartments(list);
+    setIsSyncing(false);
     setEditingDept(null);
+    if (ok) {
+      showToast(`บันทึกชื่อแผนก ${deptCodeClean} (${deptNameClean}) ซิงค์ทุกเครื่องเรียบร้อยแล้ว`, 'success');
+    } else {
+      showToast(`บันทึกแผนกในเครื่องเรียบร้อยแล้ว`, 'info');
+    }
     onDataChanged();
   };
 
@@ -303,23 +384,25 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     if (!isAdmin) return;
     const upper = code.trim().toUpperCase();
     const affectedEmployees = employees.filter(e => (e.department || '').trim().toUpperCase() === upper);
+    const remainingDepts = departments.filter(d => (d.code || '').trim().toUpperCase() !== upper);
+    const fallbackDept = remainingDepts.find(d => d.code === 'RST')?.code || remainingDepts[0]?.code || 'RST';
+
     let promptMsg = `คุณต้องการลบแผนก ${code} หรือไม่?`;
     if (affectedEmployees.length > 0) {
-      promptMsg += `\n(มีพนักงาน ${affectedEmployees.length} คนสังกัดแผนกนี้ ระบบจะย้ายพนักงานไปสังกัดแผนก RST อัตโนมัติ เพื่อไม่ให้ข้อมูลพนักงานสูญหาย)`;
+      promptMsg += `\n(มีพนักงาน ${affectedEmployees.length} คนสังกัดแผนกนี้ ระบบจะช่วยย้ายพนักงานไปสังกัดแผนก ${fallbackDept} อัตโนมัติเพื่อไม่ให้ข้อมูลสูญหาย)`;
     }
     if (confirm(promptMsg)) {
       if (affectedEmployees.length > 0) {
         const updatedEmployees = employees.map(e => 
           (e.department || '').trim().toUpperCase() === upper
-            ? { ...e, department: 'RST' }
+            ? { ...e, department: fallbackDept }
             : e
         );
         await storage.setEmployees(updatedEmployees);
       }
-      const list = departments.filter(d => (d.code || '').trim().toUpperCase() !== upper);
-      await storage.setDepartments(list);
-      await firestoreSync.deleteDepartment(upper);
+      await storage.deleteDepartment(upper);
       onDataChanged();
+      showToast(`ลบแผนก ${code} และซิงค์ฐานข้อมูลคลาวด์เรียบร้อยแล้ว`, 'success');
     }
   };
 
@@ -351,7 +434,8 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
         const division = String(r['Division'] || 'MO CS BTS').trim();
         const func = String(r['Function'] || r['FunctionTitle'] || '').trim();
         const costCenter = String(r['CostCenter'] || r['Cost Center'] || 'C93056').trim();
-        const isShift = String(r['IsShiftWorker'] || r['Shift']).toLowerCase() === 'true' || String(r['IsShiftWorker'] || r['Shift']).toLowerCase() === 'yes';
+        const rawShift = String(r['IsShiftWorker'] ?? r['ShiftWorker'] ?? r['Shift'] ?? r['พนักงานกะ'] ?? r['เข้ากะ'] ?? '').trim().toLowerCase();
+        const isShift = rawShift === 'true' || rawShift === 'yes' || rawShift === '1' || rawShift === 'shift' || rawShift === 'y' || rawShift === 'กะ' || rawShift === 'เข้ากะ';
 
         if (!empNo || !gid || !firstName) return;
 
@@ -385,8 +469,11 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
         }
       });
 
-      storage.setEmployees(Array.from(empMap.values()));
-      alert(`อัปโหลดพนักงานเรียบร้อย! เพิ่มใหม่ ${added} คน, อัปเดตข้อมูล ${updated} คน`);
+      setIsSyncing(true);
+      showToast('กำลังบันทึกและซิงค์รายชื่อพนักงานขึ้นคลาวด์...', 'info');
+      await storage.setEmployees(Array.from(empMap.values()));
+      setIsSyncing(false);
+      showToast(`อัปโหลดพนักงานเรียบร้อย! เพิ่มใหม่ ${added} คน, อัปเดตข้อมูล ${updated} คน (ซิงค์ทุกอุปกรณ์แล้ว)`, 'success');
       onDataChanged();
     } catch (err: any) {
       alert(`ข้อผิดพลาดในการอัปโหลด: ${err.message}`);
@@ -497,6 +584,25 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
           )}
         </div>
       </div>
+
+      {/* Cloud Sync Notification Banner */}
+      {syncToast && (
+        <div className={`px-4 py-2.5 rounded border text-xs font-medium flex items-center justify-between shadow transition ${
+          syncToast.type === 'error'
+            ? 'bg-rose-950/40 text-rose-300 border-rose-800/50'
+            : syncToast.type === 'info'
+            ? 'bg-sky-950/40 text-sky-300 border-sky-800/50'
+            : 'bg-emerald-950/40 text-emerald-300 border-emerald-800/50'
+        }`}>
+          <div className="flex items-center space-x-2">
+            <Cloud className={`w-4 h-4 ${syncToast.type === 'info' ? 'animate-pulse text-sky-400' : 'text-emerald-400'}`} />
+            <span>{syncToast.text}</span>
+          </div>
+          <button onClick={() => setSyncToast(null)} className="text-xs opacity-60 hover:opacity-100 ml-4">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Sub Tabs for Employees vs Departments */}
       <div className="flex items-center space-x-1 border-b border-slate-700 pb-2">
@@ -770,13 +876,19 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                     {emp.costCenter || 'C93056'}
                   </td>
                   <td className="p-2.5 text-center border-r border-slate-700/30">
-                    <span className={`text-[10px] px-2 py-0.5 rounded font-mono ${
-                      emp.isShiftWorker 
-                        ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' 
-                        : 'bg-slate-700/30 text-slate-400'
-                    }`}>
-                      {emp.isShiftWorker ? 'Shift' : 'Office'}
-                    </span>
+                    <button
+                      onClick={() => handleToggleShiftWorker(emp)}
+                      disabled={!isAdmin || isSyncing}
+                      title={isAdmin ? `คลิกเพื่อสลับสถานะ (ปัจจุบัน: ${emp.isShiftWorker ? 'Shift Worker (เข้ากะ)' : 'Office (ทำงานปกติ)'})` : `สถานะ: ${emp.isShiftWorker ? 'Shift Worker (เข้ากะ)' : 'Office (ทำงานปกติ)'}`}
+                      className={`text-[10px] px-2 py-0.5 rounded font-mono font-medium transition cursor-pointer flex items-center justify-center space-x-1 mx-auto ${
+                        emp.isShiftWorker 
+                          ? 'bg-indigo-500/25 text-indigo-200 border border-indigo-500/40 hover:bg-indigo-500/40' 
+                          : 'bg-slate-700/40 text-slate-300 border border-slate-600/30 hover:bg-slate-700/60'
+                      }`}
+                    >
+                      <span>{emp.isShiftWorker ? 'Shift' : 'Office'}</span>
+                      {isAdmin && <ArrowLeftRight className="w-2.5 h-2.5 opacity-60 ml-0.5" />}
+                    </button>
                   </td>
                   <td className="p-2.5 text-center border-r border-slate-700/30">
                     <button
@@ -804,12 +916,22 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                   </td>
                   {isAdmin && (
                     <td className="p-2.5 text-center">
-                      <button
-                        onClick={() => handleOpenEdit(emp)}
-                        className="p-1 rounded text-teal-400 hover:text-white hover:bg-teal-500/20"
-                      >
-                        <Edit2 className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center justify-center space-x-1">
+                        <button
+                          onClick={() => handleOpenEdit(emp)}
+                          title="แก้ไขข้อมูลพนักงาน"
+                          className="p-1 rounded text-teal-400 hover:text-white hover:bg-teal-500/20 transition cursor-pointer"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setEmployeeToDelete(emp)}
+                          title="ลบพนักงานออกจากระบบ"
+                          className="p-1 rounded text-rose-400 hover:text-white hover:bg-rose-500/20 transition cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </td>
                   )}
                 </tr>
@@ -903,7 +1025,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                     }`}
                   >
                     {departments.map(d => (
-                      <option key={d.code} value={d.code}>{d.code} - {d.name}</option>
+                      <option key={d.code} value={d.code}>{d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code}</option>
                     ))}
                   </select>
                 </div>
@@ -968,22 +1090,102 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                 </label>
               </div>
 
-              <div className="flex items-center justify-end space-x-2 pt-4 border-t border-slate-700">
-                <button
-                  type="button"
-                  onClick={() => setEditingEmp(null)}
-                  className="px-3 py-1.5 rounded text-xs text-slate-300 hover:text-white"
-                >
-                  ยกเลิก
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-1.5 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow"
-                >
-                  บันทึกข้อมูล
-                </button>
+              <div className="flex items-center justify-between pt-4 border-t border-slate-700">
+                <div>
+                  {!isNew && editingEmp && (
+                    <button
+                      type="button"
+                      onClick={() => setEmployeeToDelete(editingEmp)}
+                      className="px-3 py-1.5 rounded text-xs font-medium text-rose-400 hover:text-rose-200 hover:bg-rose-500/20 border border-rose-500/30 flex items-center space-x-1.5 transition cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>ลบพนักงาน</span>
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={() => setEditingEmp(null)}
+                    className="px-3 py-1.5 rounded text-xs text-slate-300 hover:text-white"
+                  >
+                    ยกเลิก
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-1.5 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow"
+                  >
+                    บันทึกข้อมูล
+                  </button>
+                </div>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation Dialog Modal for Deleting Employee */}
+      {employeeToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-xs">
+          <div className={`w-full max-w-md rounded-lg border shadow-2xl p-5 ${
+            isDark ? 'bg-[#142230] border-[#294058] text-white' : 'bg-white border-slate-300 text-slate-900'
+          }`}>
+            <div className="flex items-start space-x-3 mb-4">
+              <div className="p-2.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 flex-shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-sm font-bold text-rose-400">ยืนยันการลบพนักงานออกจากระบบ</h3>
+                <p className="text-xs text-slate-300 mt-1">
+                  คุณแน่ใจหรือไม่ว่าต้องการลบข้อมูลพนักงานต่อไปนี้ออกจากระบบฐานข้อมูลและคลาวด์?
+                </p>
+              </div>
+            </div>
+
+            <div className={`p-3 rounded-lg border my-3 text-xs space-y-1.5 ${
+              isDark ? 'bg-[#0f1722] border-[#273a4e]' : 'bg-slate-50 border-slate-200'
+            }`}>
+              <div className="flex justify-between">
+                <span className="text-slate-400">ชื่อ - สกุล:</span>
+                <span className="font-semibold text-slate-100">{employeeToDelete.firstName} {employeeToDelete.familyName}</span>
+              </div>
+              <div className="flex justify-between font-mono">
+                <span className="text-slate-400">Emp No:</span>
+                <span className="font-bold text-teal-400">{employeeToDelete.empNo}</span>
+              </div>
+              <div className="flex justify-between font-mono">
+                <span className="text-slate-400">GID:</span>
+                <span className="text-slate-300">{employeeToDelete.gid}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">แผนก:</span>
+                <span className="font-semibold text-teal-300">{employeeToDelete.department}</span>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-amber-400/90 mb-4">
+              * การดำเนินการนี้จะลบข้อมูลออกจากทุกเครื่องและฐานข้อมูลคลาวด์ทันที
+            </p>
+
+            <div className="flex items-center justify-end space-x-2 pt-3 border-t border-slate-700/60">
+              <button
+                type="button"
+                disabled={isSyncing}
+                onClick={() => setEmployeeToDelete(null)}
+                className="px-3.5 py-1.5 rounded text-xs text-slate-300 hover:text-white transition"
+              >
+                ยกเลิก
+              </button>
+              <button
+                type="button"
+                disabled={isSyncing}
+                onClick={() => handleDeleteEmployee(employeeToDelete)}
+                className="px-4 py-1.5 rounded text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white shadow flex items-center space-x-1.5 transition cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isSyncing ? 'กำลังลบ...' : 'ยืนยันลบพนักงาน'}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1012,17 +1214,27 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                 <tr>
                   <th className="p-2.5 border-b border-r border-slate-700 w-1/4">รหัสแผนก (Code)</th>
                   <th className="p-2.5 border-b border-r border-slate-700 w-2/4">ชื่อแผนก (Name)</th>
-                  <th className="p-2.5 border-b border-slate-700 w-1/4 text-center">จัดการ</th>
+                  <th className="p-2.5 border-b border-r border-slate-700 w-1/6 text-center">จำนวนพนักงาน</th>
+                  <th className="p-2.5 border-b border-slate-700 w-1/6 text-center">จัดการ</th>
                 </tr>
               </thead>
               <tbody>
-                {departments.map((dept, idx) => (
-                  <tr key={dept.code} className={`border-b ${
-                    isDark ? 'border-slate-800 hover:bg-[#1a2838]' : 'border-slate-200 hover:bg-slate-50'
-                  }`}>
-                    <td className="p-2.5 border-r border-slate-700 font-mono font-semibold text-teal-400">{dept.code}</td>
-                    <td className="p-2.5 border-r border-slate-700">{dept.name}</td>
-                    <td className="p-2.5 text-center flex justify-center space-x-2">
+                {departments.map((dept) => {
+                  const empCount = employees.filter(e => (e.department || '').trim().toUpperCase() === (dept.code || '').trim().toUpperCase()).length;
+                  return (
+                    <tr key={dept.code} className={`border-b ${
+                      isDark ? 'border-slate-800 hover:bg-[#1a2838]' : 'border-slate-200 hover:bg-slate-50'
+                    }`}>
+                      <td className="p-2.5 border-r border-slate-700 font-mono font-semibold text-teal-400">{dept.code}</td>
+                      <td className="p-2.5 border-r border-slate-700">{dept.name}</td>
+                      <td className="p-2.5 border-r border-slate-700 text-center font-mono">
+                        <span className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                          empCount > 0 ? 'bg-teal-500/10 text-teal-400 border border-teal-500/30' : 'bg-slate-500/10 text-slate-400'
+                        }`}>
+                          {empCount} คน
+                        </span>
+                      </td>
+                      <td className="p-2.5 text-center flex justify-center space-x-2">
                       <button
                         onClick={() => handleEditDept(dept)}
                         disabled={!isAdmin}
@@ -1049,10 +1261,11 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                       </button>
                     </td>
                   </tr>
-                ))}
-                {departments.length === 0 && (
-                  <tr>
-                    <td colSpan={3} className="p-4 text-center text-slate-400">
+                );
+              })}
+              {departments.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="p-4 text-center text-slate-400">
                       ไม่พบข้อมูลแผนก
                     </td>
                   </tr>

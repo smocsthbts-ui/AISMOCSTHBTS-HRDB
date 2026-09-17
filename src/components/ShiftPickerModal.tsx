@@ -44,6 +44,8 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [activeCategory, setActiveCategory] = useState<string>('dept');
   const [rangeOption, setRangeOption] = useState<'single' | 'weekday' | 'next7' | 'endOfMonth'>('single');
+  const [includeStandby, setIncludeStandby] = useState<boolean>(false);
+  const [includeEmergency, setIncludeEmergency] = useState<boolean>(false);
 
   // Auto-focus search input when opened
   useEffect(() => {
@@ -51,11 +53,15 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
       setSearchTerm('');
       setActiveCategory('dept');
       setRangeOption('single');
+      // Initialize allowance tags from current shift if already present
+      const currUpper = (currentShiftCode || '').toUpperCase();
+      setIncludeStandby(currUpper.includes('-X'));
+      setIncludeEmergency(currUpper.includes('-ET'));
       setTimeout(() => {
         searchInputRef.current?.focus();
       }, 50);
     }
-  }, [isOpen]);
+  }, [isOpen, currentShiftCode]);
 
   // Handle ESC key to close
   useEffect(() => {
@@ -66,9 +72,17 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
+  // Compute final shift code with allowance tags
+  const applyCodeWithTags = (baseCode: string) => {
+    let clean = baseCode.replace(/-X/gi, '').replace(/-ET/gi, '').trim();
+    if (includeStandby) clean += '-X';
+    if (includeEmergency) clean += '-ET';
+    onApplyShift(clean, rangeOption);
+  };
+
   // Top Most-used Favorites
   const quickFavorites = useMemo(() => {
-    const favCodes = ['D', 'M', 'A', 'N', 'OFF', 'H'];
+    const favCodes = ['D', 'D1', 'E', 'M', 'A', 'N', 'T', 'W', 'AL', 'AL2', 'CL', 'SL', 'SL2', 'SLO', 'OFF', 'H'];
     return favCodes
       .map(code => shiftCodes.find(s => s.code === code))
       .filter((s): s is ShiftCode => !!s);
@@ -80,8 +94,11 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
       // Search text filter
       if (searchTerm.trim()) {
         const q = searchTerm.trim().toLowerCase();
-        const matchesCode = sc.code.toLowerCase().includes(q);
-        const matchesName = sc.name.toLowerCase().includes(q);
+        const qClean = q.replace(/-x/gi, '').replace(/-et/gi, '').trim();
+        const baseCodeLower = sc.code.toLowerCase();
+        
+        const matchesCode = baseCodeLower.includes(q) || (qClean && (baseCodeLower.includes(qClean) || qClean.includes(baseCodeLower)));
+        const matchesName = sc.name.toLowerCase().includes(q) || (qClean && sc.name.toLowerCase().includes(qClean));
         const matchesDesc = (sc.description || '').toLowerCase().includes(q);
         const matchesTime = `${sc.startTime} ${sc.endTime}`.includes(q);
         if (!matchesCode && !matchesName && !matchesDesc && !matchesTime) return false;
@@ -178,32 +195,91 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
           </button>
         </div>
 
-        {/* Quick 1-Click Favorites Bar */}
-        <div className={`px-4 py-2.5 border-b flex items-center justify-between gap-2 overflow-x-auto ${
+        {/* Quick 1-Click Favorites Bar & Allowance Tag Modifiers */}
+        <div className={`px-4 py-2.5 border-b space-y-2 ${
           isDark ? 'bg-[#182635] border-[#25394e]' : 'bg-slate-100/70 border-slate-200'
         }`}>
-          <div className="flex items-center space-x-1.5 text-xs text-slate-400 shrink-0">
-            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-            <span className="font-semibold text-slate-300 text-[11px]">กะด่วนยอดนิยม:</span>
+          {/* Allowance Suffix Modifiers */}
+          <div className="flex items-center justify-between gap-2 flex-wrap text-xs">
+            <div className="flex items-center space-x-2">
+              <span className="font-semibold text-slate-300 text-[11px] flex items-center gap-1">
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                เงื่อนไขเบี้ยเลี้ยงพิเศษ:
+              </span>
+              <label className="flex items-center space-x-1.5 cursor-pointer select-none bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded text-amber-300 hover:bg-amber-500/20 transition">
+                <input
+                  type="checkbox"
+                  checked={includeStandby}
+                  onChange={e => setIncludeStandby(e.target.checked)}
+                  className="rounded border-amber-500 text-amber-500 focus:ring-0 w-3.5 h-3.5"
+                />
+                <span className="font-mono font-bold">-X</span>
+                <span className="text-[10px] opacity-90">(Standby +300฿)</span>
+              </label>
+
+              <label className="flex items-center space-x-1.5 cursor-pointer select-none bg-rose-500/10 border border-rose-500/30 px-2 py-0.5 rounded text-rose-300 hover:bg-rose-500/20 transition">
+                <input
+                  type="checkbox"
+                  checked={includeEmergency}
+                  onChange={e => setIncludeEmergency(e.target.checked)}
+                  className="rounded border-rose-500 text-rose-500 focus:ring-0 w-3.5 h-3.5"
+                />
+                <span className="font-mono font-bold">-ET</span>
+                <span className="text-[10px] opacity-90">(Emergency +300฿)</span>
+              </label>
+            </div>
+
+            {/* Quick Suffix Presets */}
+            <div className="flex items-center space-x-1">
+              <span className="text-[10px] text-slate-400">ด่วน:</span>
+              <button
+                type="button"
+                onClick={() => onApplyShift('AD1-X', rangeOption)}
+                className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:scale-105 transition cursor-pointer"
+                title="AD1-X: กะ D1 + Standby Allowance 300฿"
+              >
+                AD1-X
+              </button>
+              <button
+                type="button"
+                onClick={() => onApplyShift('E-ET', rangeOption)}
+                className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-200 border border-rose-500/40 hover:scale-105 transition cursor-pointer"
+                title="E-ET: กะ E + Emergency Allowance 300฿"
+              >
+                E-ET
+              </button>
+              <button
+                type="button"
+                onClick={() => onApplyShift('D-X', rangeOption)}
+                className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-teal-500/20 text-teal-200 border border-teal-500/40 hover:scale-105 transition cursor-pointer"
+                title="D-X: กะ D + Standby Allowance 300฿"
+              >
+                D-X
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center space-x-1.5 flex-wrap gap-y-1">
-            {quickFavorites.map(fav => (
-              <button
-                key={fav.code}
-                onClick={() => onApplyShift(fav.code, rangeOption)}
-                className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md text-xs font-mono font-bold transition hover:scale-105 active:scale-95 shadow-xs cursor-pointer ${
-                  fav.code === currentShiftCode ? 'ring-2 ring-white ring-offset-1 ring-offset-[#14202c]' : ''
-                }`}
-                style={{ backgroundColor: getShiftCategoryColor(fav.code, fav.color), color: '#ffffff' }}
-                title={`${fav.code}: ${fav.name} (${fav.startTime}-${fav.endTime}) คลิกเพื่อเปลี่ยนทันที`}
-              >
-                <span>{fav.code}</span>
-                <span className="text-[10px] font-normal opacity-90 hidden sm:inline">
-                  {fav.code === 'OFF' ? 'หยุด' : fav.startTime}
-                </span>
-              </button>
-            ))}
+          {/* Favorites Shift Row */}
+          <div className="flex items-center space-x-1 flex-wrap gap-1 pt-1 border-t border-slate-700/30">
+            <span className="font-semibold text-slate-400 text-[10px] mr-1">กะหลัก:</span>
+            {quickFavorites.map((fav, idx) => {
+              const timeDesc = fav.startTime === '00:00' && fav.endTime === '00:00'
+                ? (fav.isWorkingDay ? 'เต็มวัน' : 'วันหยุด/การลา')
+                : `${fav.startTime} - ${fav.endTime}`;
+              return (
+                <button
+                  key={`${fav.code}_${fav.department || 'ALL'}_${idx}`}
+                  onClick={() => applyCodeWithTags(fav.code)}
+                  className={`min-w-[28px] h-7 px-2 flex items-center justify-center rounded-md text-xs font-mono font-bold transition hover:scale-105 active:scale-95 shadow-xs cursor-pointer ${
+                    fav.code === currentShiftCode ? 'ring-2 ring-white ring-offset-1 ring-offset-[#14202c] font-extrabold' : ''
+                  }`}
+                  style={{ backgroundColor: getShiftCategoryColor(fav.code, fav.color), color: '#ffffff' }}
+                  title={`${fav.code}: ${fav.name} (${timeDesc}) - คลิกเพื่อเปลี่ยนทันที${includeStandby ? ' (รวม -X +300฿)' : ''}${includeEmergency ? ' (รวม -ET +300฿)' : ''}`}
+                >
+                  <span>{fav.code}{includeStandby ? '-X' : ''}{includeEmergency ? '-ET' : ''}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -215,9 +291,19 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
             <input
               ref={searchInputRef}
               type="text"
-              placeholder="พิมพ์ค้นหา Shift Code เช่น D, N, RS, 07:00 หรือชื่อกะ (เช้า, บ่าย, ดึก)..."
+              placeholder="พิมพ์ค้นหา Shift Code เช่น D, N, RS, 07:00 หรือชื่อกะ (กด Enter เพื่อเลือก)..."
               value={searchTerm}
               onChange={e => setSearchTerm(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  if (filteredShifts.length > 0) {
+                    applyCodeWithTags(filteredShifts[0].code);
+                  } else if (searchTerm.trim()) {
+                    applyCodeWithTags(searchTerm.trim().toUpperCase());
+                  }
+                }
+              }}
               className={`w-full pl-9 pr-8 py-2 rounded-lg border text-xs outline-none transition ${
                 isDark 
                   ? 'bg-[#0f1722] border-[#29425b] text-white placeholder-slate-500 focus:border-[#00e5e5] focus:ring-1 focus:ring-[#00e5e5]' 
@@ -305,20 +391,70 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
 
         {/* Shift Code List Cards Grid */}
         <div className="flex-1 overflow-y-auto px-4 pb-4 max-h-[42vh] scrollbar-thin">
-          {filteredShifts.length === 0 ? (
+          {/* If user typed a search term, show direct typed action card */}
+          {searchTerm.trim() && (
+            <div className={`mb-2.5 p-2.5 rounded-lg border flex items-center justify-between gap-2 shadow-xs ${
+              isDark ? 'bg-[#18293d] border-[#00e5e5]/40 text-slate-100' : 'bg-teal-50 border-teal-300 text-slate-900'
+            }`}>
+              <div className="flex items-center space-x-2 min-w-0">
+                <span className="px-2 py-1 rounded bg-[#008b99] text-white font-mono font-bold text-xs uppercase shrink-0">
+                  {searchTerm.trim().toUpperCase()}
+                </span>
+                <div className="text-xs">
+                  <div className="font-semibold text-teal-300">ใส่รหัสกะตามที่พิมพ์ทันที</div>
+                  <div className="text-[10px] text-slate-400">
+                    {searchTerm.toUpperCase().includes('-X') && <span className="text-amber-300 font-bold mr-1.5">• รวม Stand by 300฿</span>}
+                    {searchTerm.toUpperCase().includes('-ET') && <span className="text-rose-300 font-bold mr-1.5">• รวม Emergency 300฿</span>}
+                    {!searchTerm.toUpperCase().includes('-X') && !searchTerm.toUpperCase().includes('-ET') && <span>กดเลือกเพื่อบันทึกกะนี้</span>}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center space-x-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => onApplyShift(searchTerm.trim().toUpperCase(), rangeOption)}
+                  className="px-2.5 py-1 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-xs transition cursor-pointer"
+                >
+                  เลือกกะนี้
+                </button>
+                {!searchTerm.toUpperCase().includes('-X') && (
+                  <button
+                    type="button"
+                    onClick={() => onApplyShift(`${searchTerm.trim().toUpperCase()}-X`, rangeOption)}
+                    className="px-2 py-1 rounded text-[11px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition cursor-pointer"
+                    title="ใส่กะนี้พร้อม Stand by Allowance 300฿"
+                  >
+                    + Stand by (-X)
+                  </button>
+                )}
+                {!searchTerm.toUpperCase().includes('-ET') && (
+                  <button
+                    type="button"
+                    onClick={() => onApplyShift(`${searchTerm.trim().toUpperCase()}-ET`, rangeOption)}
+                    className="px-2 py-1 rounded text-[11px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 transition cursor-pointer"
+                    title="ใส่กะนี้พร้อม Emergency Allowance 300฿"
+                  >
+                    + Emergency (-ET)
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {filteredShifts.length === 0 && !searchTerm.trim() ? (
             <div className="py-8 text-center text-slate-400 text-xs">
-              ไม่พบ Shift Code ที่ตรงกับ &quot;{searchTerm}&quot;
+              ไม่พบ Shift Code ในหมวดหมู่นี้
             </div>
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {filteredShifts.map(sc => {
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {filteredShifts.map((sc, idx) => {
                 const isSelected = sc.code === currentShiftCode;
 
                 return (
                   <div
-                    key={sc.code}
-                    onClick={() => onApplyShift(sc.code, rangeOption)}
-                    className={`p-2.5 rounded-lg border flex items-start justify-between gap-2.5 transition cursor-pointer ${
+                    key={`${sc.code}_${sc.department}_${idx}`}
+                    className={`p-2.5 rounded-lg border flex flex-col justify-between gap-2 transition ${
                       isSelected
                         ? isDark 
                           ? 'border-[#00e5e5] bg-teal-500/15 shadow-sm' 
@@ -328,45 +464,87 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                           : 'border-slate-200 bg-white hover:border-teal-400 hover:bg-slate-50'
                     }`}
                   >
-                    <div className="flex items-start space-x-2.5 min-w-0">
-                      {/* Color Tag Badge */}
-                      <span
-                        className="w-8 h-8 rounded-lg text-xs font-mono font-bold text-white flex items-center justify-center shrink-0 shadow-xs"
-                        style={{ backgroundColor: getShiftCategoryColor(sc.code, sc.color) }}
-                      >
-                        {sc.code}
-                      </span>
+                    <div 
+                      onClick={() => applyCodeWithTags(sc.code)}
+                      className="flex items-start justify-between gap-2 cursor-pointer"
+                      title={`คลิกเพื่อเลือกกะ ${sc.code}${includeStandby ? '-X (+300฿)' : ''}${includeEmergency ? '-ET (+300฿)' : ''}`}
+                    >
+                      <div className="flex items-start space-x-2.5 min-w-0">
+                        {/* Color Tag Badge */}
+                        <span
+                          className="w-8 h-8 rounded-lg text-xs font-mono font-bold text-white flex items-center justify-center shrink-0 shadow-xs"
+                          style={{ backgroundColor: getShiftCategoryColor(sc.code, sc.color) }}
+                        >
+                          {sc.code}
+                        </span>
 
-                      <div className="min-w-0">
-                        <div className="font-semibold text-xs text-slate-100 truncate flex items-center gap-1.5">
-                          <span>{sc.name}</span>
-                          {isSelected && (
-                            <Check className="w-3.5 h-3.5 text-teal-400 shrink-0" />
-                          )}
-                        </div>
-
-                        <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
-                          <Clock className="w-3 h-3 text-slate-400 shrink-0" />
-                          <span className="font-mono">
-                            {sc.startTime} - {sc.endTime}
-                          </span>
-                          {sc.workingHours > 0 && (
-                            <span className="text-[10px] opacity-75">({sc.workingHours} ชม.)</span>
-                          )}
-                        </div>
-
-                        {sc.description && (
-                          <div className="text-[10px] text-slate-400 line-clamp-1 mt-0.5">
-                            {sc.description}
+                        <div className="min-w-0">
+                          <div className="font-semibold text-xs text-slate-100 truncate flex items-center gap-1.5">
+                            <span>{sc.name}</span>
+                            {isSelected && (
+                              <Check className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                            )}
                           </div>
-                        )}
+
+                          <div className="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
+                            <Clock className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span className="font-mono">
+                              {sc.startTime} - {sc.endTime}
+                            </span>
+                            {sc.workingHours > 0 && (
+                              <span className="text-[10px] opacity-75">({sc.workingHours} ชม.)</span>
+                            )}
+                          </div>
+
+                          {sc.description && (
+                            <div className="text-[10px] text-slate-400 line-clamp-1 mt-0.5">
+                              {sc.description}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="shrink-0 flex flex-col items-end">
+                        <span className="text-[9px] px-1 py-0.2 rounded font-mono font-bold bg-slate-700/40 text-slate-300">
+                          {sc.department}
+                        </span>
                       </div>
                     </div>
 
-                    <div className="shrink-0 flex flex-col items-end">
-                      <span className="text-[9px] px-1 py-0.2 rounded font-mono font-bold bg-slate-700/40 text-slate-300">
-                        {sc.department}
-                      </span>
+                    {/* Direct 1-Click Allowance Action Buttons on Card */}
+                    <div className="pt-2 border-t border-slate-700/30 flex items-center justify-between gap-1 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => onApplyShift(sc.code, rangeOption)}
+                        className={`px-2 py-0.5 rounded text-[10px] font-mono font-medium transition cursor-pointer ${
+                          isDark 
+                            ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700' 
+                            : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300'
+                        }`}
+                        title={`เลือกกะปกติ: ${sc.code}`}
+                      >
+                        ปกติ ({sc.code})
+                      </button>
+
+                      <div className="flex items-center space-x-1">
+                        <button
+                          type="button"
+                          onClick={() => onApplyShift(`${sc.code}-X`, rangeOption)}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition cursor-pointer"
+                          title={`ใส่กะ ${sc.code} พร้อม Stand by Allowance 300฿ (${sc.code}-X)`}
+                        >
+                          + Standby (-X)
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => onApplyShift(`${sc.code}-ET`, rangeOption)}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 transition cursor-pointer"
+                          title={`ใส่กะ ${sc.code} พร้อม Emergency Allowance 300฿ (${sc.code}-ET)`}
+                        >
+                          + Emergency (-ET)
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );

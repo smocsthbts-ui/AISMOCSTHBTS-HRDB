@@ -30,6 +30,7 @@ interface AuthModalProps {
   onClose: () => void;
   onSwitchUser: (user: UserAccount) => void;
   isDark: boolean;
+  canClose?: boolean;
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({
@@ -38,6 +39,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   onClose,
   onSwitchUser,
   isDark,
+  canClose = false,
 }) => {
   const [activeTab, setActiveTab] = useState<'login' | 'register' | 'forgot'>('login');
   
@@ -56,7 +58,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
 
   // Sync users logic
-  const handleFirebaseUserLogin = (userEmail: string | null, uid: string, displayName?: string | null) => {
+  const handleFirebaseUserLogin = async (
+    userEmail: string | null, 
+    uid: string, 
+    displayName?: string | null,
+    photoURL?: string | null
+  ) => {
     if (!userEmail) return;
     const currentUsers = storage.getUsers();
     let targetUser = currentUsers.find(u => u.email.toLowerCase() === userEmail.toLowerCase());
@@ -75,7 +82,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     if (!targetUser) {
       const resolvedName = displayName || (matchedEmp ? `${matchedEmp.firstName} ${matchedEmp.familyName}`.trim() : userEmail.split('@')[0]);
-      const resolvedDept = matchedEmp?.department || (isDefaultAdmin ? 'ALL' : 'RST');
+      const resolvedDept = matchedEmp?.department || (isDefaultAdmin ? 'ALL' : 'PENDING');
 
       targetUser = {
         id: `usr-${uid}`,
@@ -83,24 +90,26 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         name: resolvedName,
         role: isDefaultAdmin ? 'Admin' : 'User',
         department: resolvedDept,
-        status: 'Active',
+        status: isDefaultAdmin ? 'Active' : 'Pending_Approval',
+        photoURL: photoURL || undefined,
+        isGoogleAccount: true,
         createdAt: new Date().toISOString(),
         lastLogin: new Date().toISOString(),
       };
-      currentUsers.push(targetUser);
-      storage.setUsers(currentUsers);
+      await storage.saveUser(targetUser);
     } else {
       if (displayName && (!targetUser.name || targetUser.name === targetUser.email.split('@')[0])) {
         targetUser.name = displayName;
       }
+      if (photoURL && !targetUser.photoURL) {
+        targetUser.photoURL = photoURL;
+      }
       targetUser.lastLogin = new Date().toISOString();
-      const idx = currentUsers.findIndex(u => u.id === targetUser?.id);
-      if (idx >= 0) currentUsers[idx] = targetUser;
-      storage.setUsers(currentUsers);
+      await storage.saveUser(targetUser);
     }
     
-    if (targetUser.status === 'Deactivated' || targetUser.status === 'Pending_Approval') {
-      setMessage({ type: 'error', text: `บัญชีนี้อยู่ในสถานะ ${targetUser.status} กรุณาติดต่อ Admin`});
+    if (targetUser.status === 'Deactivated') {
+      setMessage({ type: 'error', text: `บัญชี ${targetUser.email} ถูกระงับการใช้งาน กรุณาติดต่อ Admin`});
       logOut();
       return;
     }
@@ -143,8 +152,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         createdAt: new Date().toISOString(),
       };
       
-      currentUsers.push(newUser);
-      storage.setUsers(currentUsers);
+      await storage.saveUser(newUser);
       
       setMessage({ type: 'success', text: 'ลงทะเบียนสำเร็จ! กรุณารอ Admin อนุมัติการเข้าใช้งาน' });
       setRegForm({ name: '', email: '', password: '', department: 'GM' });
@@ -181,7 +189,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     try {
       const user = await signInWithGoogle();
       if (user) {
-        handleFirebaseUserLogin(user.email, user.uid);
+        await handleFirebaseUserLogin(user.email, user.uid, user.displayName, user.photoURL);
       }
     } catch (error: any) {
       setMessage({ type: 'error', text: 'เชื่อมต่อ Google ล้มเหลว: ' + error.message });
@@ -193,7 +201,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div 
+      className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && canClose && currentUser && currentUser.status === 'Active') {
+          onClose();
+        }
+      }}
+    >
       <div className={`w-full max-w-md rounded-xl shadow-2xl border overflow-hidden ${
         isDark ? 'bg-[#121c27] border-[#273a4e]' : 'bg-white border-slate-200'
       }`}>
@@ -209,7 +224,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <p className="text-[11px] text-slate-400">ระบบเข้าสู่ระบบเพื่อใช้งาน</p>
             </div>
           </div>
-          {currentUser && (
+          {canClose && currentUser && currentUser.status === 'Active' && (
             <button
               onClick={onClose}
               className="text-slate-400 hover:text-white transition"
@@ -340,7 +355,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   }`}
                 >
                   {storage.getDepartments().map(d => (
-                    <option key={d.code} value={d.code}>{d.code} - {d.name}</option>
+                    <option key={d.code} value={d.code}>{d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code}</option>
                   ))}
                 </select>
               </div>
@@ -392,7 +407,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               type="button"
               onClick={handleGoogleSignIn}
               disabled={isProcessing}
-              className="w-full py-2 px-3 rounded bg-white hover:bg-slate-100 text-slate-800 font-bold flex items-center justify-center space-x-2 shadow-sm border border-slate-300 transition cursor-pointer text-xs disabled:opacity-50"
+              className="w-full py-2.5 px-3 rounded bg-white hover:bg-slate-100 text-slate-800 font-bold flex items-center justify-center space-x-2 shadow-sm border border-slate-300 transition cursor-pointer text-xs disabled:opacity-50"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24">
                 <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
@@ -400,8 +415,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
                 <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
               </svg>
-              <span>เข้าสู่ระบบด้วย Google Account</span>
+              <span>เข้าสู่ระบบด้วย Google Account (@siemens.com)</span>
             </button>
+            <p className="text-[10px] text-center text-slate-400 mt-2 leading-relaxed">
+              พนักงาน Siemens สามารถใช้อีเมลองค์กร (@siemens.com) หรือ Google Account เข้าใช้งานได้
+              <br />
+              <span className="text-teal-400 font-medium">การเข้าระบบครั้งแรก ระบบจะบันทึกบัญชีไว้และรอ Verify จาก Admin เพื่อ Activate กำหนดแผนก</span>
+            </p>
           </div>
         </div>
       </div>

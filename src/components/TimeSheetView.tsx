@@ -586,12 +586,16 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
                     </td>
 
                     {/* Stand by Allowance */}
-                    <td className="p-1 font-mono border-r border-slate-700/40">
+                    <td className={`p-1 font-mono border-r border-slate-700/40 ${
+                      row.standbyAllowance > 0 ? 'text-amber-300 font-bold bg-amber-500/15' : ''
+                    }`}>
                       {row.standbyAllowance > 0 ? row.standbyAllowance : '0'}
                     </td>
 
                     {/* Emergency Allowance */}
-                    <td className="p-1 font-mono border-r border-slate-700/40">
+                    <td className={`p-1 font-mono border-r border-slate-700/40 ${
+                      row.emergencyAllowance > 0 ? 'text-rose-300 font-bold bg-rose-500/15' : ''
+                    }`}>
                       {row.emergencyAllowance > 0 ? row.emergencyAllowance : '0'}
                     </td>
 
@@ -718,20 +722,52 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
             </div>
 
             <div className="my-4 space-y-3 text-xs">
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-slate-400 mb-1">Shift Code</label>
-                  <select
+                  <input
+                    type="text"
                     value={editForm.shiftCode || ''}
-                    onChange={e => setEditForm(prev => ({ ...prev, shiftCode: e.target.value }))}
-                    className={`w-full p-2 rounded border font-mono ${
+                    onChange={e => {
+                      const newCode = e.target.value.toUpperCase();
+                      const hasX = newCode.includes('-X');
+                      const hasET = newCode.includes('-ET');
+                      setEditForm(prev => ({
+                        ...prev,
+                        shiftCode: newCode,
+                        standbyAllowance: hasX ? 300 : (prev.standbyAllowance === 300 ? 0 : prev.standbyAllowance),
+                        emergencyAllowance: hasET ? 300 : (prev.emergencyAllowance === 300 ? 0 : prev.emergencyAllowance),
+                      }));
+                    }}
+                    placeholder="เช่น D, AD1-X, E-ET, N"
+                    className={`w-full p-2 rounded border font-mono uppercase ${
                       isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
                     }`}
-                  >
-                    {shiftCodes.map(sc => (
-                      <option key={sc.code} value={sc.code}>{sc.code} - {sc.name}</option>
-                    ))}
-                  </select>
+                  />
+                  <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        let c = (editForm.shiftCode || 'D').replace(/-X/gi, '').replace(/-ET/gi, '');
+                        c = c + '-X';
+                        setEditForm(prev => ({ ...prev, shiftCode: c, standbyAllowance: 300 }));
+                      }}
+                      className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 cursor-pointer"
+                    >
+                      + Standby (-X) [300฿]
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        let c = (editForm.shiftCode || 'E').replace(/-X/gi, '').replace(/-ET/gi, '');
+                        c = c + '-ET';
+                        setEditForm(prev => ({ ...prev, shiftCode: c, emergencyAllowance: 300 }));
+                      }}
+                      className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 cursor-pointer"
+                    >
+                      + Emergency (-ET) [300฿]
+                    </button>
+                  </div>
                 </div>
 
                 <div>

@@ -10,6 +10,36 @@ import {
 } from '../types';
 
 /**
+ * Match a biometric punch identifier to an employee
+ * Handles exact match, GID match, leading-zero differences ("0451" vs "451", "01503" vs "1503", "0082" vs "82"),
+ * and prefix variations (SM549, etc.)
+ */
+export function isEmployeeMatch(
+  punchIdentifier: string,
+  employee: { empNo?: string; gid?: string }
+): boolean {
+  if (!punchIdentifier || !employee) return false;
+  const p = punchIdentifier.trim().toLowerCase();
+  const eNo = (employee.empNo || '').trim().toLowerCase();
+  const gid = (employee.gid || '').trim().toLowerCase();
+  if (!p) return false;
+
+  // 1. Direct match with empNo or GID
+  if (p === eNo || (gid && p === gid)) return true;
+
+  // 2. Numeric match (handling leading zeros: "0451" vs "451", "01503" vs "1503", "0082" vs "82")
+  const pNum = p.replace(/^0+/, '');
+  const eNum = eNo.replace(/^0+/, '');
+  if (pNum && eNum && pNum === eNum) return true;
+
+  // 3. Substring / Prefix match
+  if (eNo && (p.startsWith(eNo) || eNo.startsWith(p))) return true;
+  if (gid && (p.startsWith(gid) || gid.startsWith(p))) return true;
+
+  return false;
+}
+
+/**
  * Format minutes into "HH:mm"
  */
 export function minutesToHHMM(totalMinutes: number): string {
@@ -20,12 +50,107 @@ export function minutesToHHMM(totalMinutes: number): string {
 }
 
 /**
+ * Shift Tag & Allowance Info
+ * -X  => Standby Allowance (+300 THB)
+ * -ET => Emergency Allowance (+300 THB)
+ */
+export interface ParsedShiftTagInfo {
+  baseCode: string;
+  hasStandbyTag: boolean;      // -X
+  hasEmergencyTag: boolean;    // -ET
+  standbyAllowance: number;    // 300 if hasStandbyTag else 0
+  emergencyAllowance: number;  // 300 if hasEmergencyTag else 0
+  cleanDisplayCode: string;
+}
+
+/**
+ * Parse Shift Code Tags (-X for Standby 300฿, -ET for Emergency 300฿)
+ * e.g. "AD1-X", "E-ET", "D-X", "N-X", "AD1-X-ET"
+ */
+export function parseShiftCodeTags(rawCode: string): ParsedShiftTagInfo {
+  if (!rawCode) {
+    return {
+      baseCode: '',
+      hasStandbyTag: false,
+      hasEmergencyTag: false,
+      standbyAllowance: 0,
+      emergencyAllowance: 0,
+      cleanDisplayCode: '',
+    };
+  }
+
+  const codeUpper = rawCode.trim().toUpperCase();
+
+  // Check for -X (Standby Allowance = 300 THB)
+  const hasStandbyTag = /(?:-X\b|-X$)/i.test(codeUpper) || codeUpper.includes('-X');
+
+  // Check for -ET (Emergency Allowance = 300 THB)
+  const hasEmergencyTag = /(?:-ET\b|-ET$)/i.test(codeUpper) || codeUpper.includes('-ET');
+
+  // Strip -X and -ET to find the base shift code
+  const baseCode = codeUpper
+    .replace(/-X/gi, '')
+    .replace(/-ET/gi, '')
+    .trim();
+
+  return {
+    baseCode,
+    hasStandbyTag,
+    hasEmergencyTag,
+    standbyAllowance: hasStandbyTag ? 300 : 0,
+    emergencyAllowance: hasEmergencyTag ? 300 : 0,
+    cleanDisplayCode: codeUpper,
+  };
+}
+
+/**
+ * Resolve ShiftCode metadata from map even with custom tags or aliases
+ */
+export function resolveShiftInfo(rawCode: string, shiftCodeMap: Map<string, ShiftCode>): ShiftCode | undefined {
+  if (!rawCode) return undefined;
+  const upper = rawCode.trim().toUpperCase();
+
+  // 1. Direct match
+  if (shiftCodeMap.has(upper)) {
+    return shiftCodeMap.get(upper);
+  }
+
+  // 2. Base code (without -X, -ET)
+  const { baseCode } = parseShiftCodeTags(rawCode);
+  if (baseCode && shiftCodeMap.has(baseCode)) {
+    return shiftCodeMap.get(baseCode);
+  }
+
+  // 3. Leading 'A' alias (e.g. AD1 -> D1, AD2 -> D2, AE -> E, AN -> N)
+  if (baseCode.startsWith('A') && baseCode.length > 1) {
+    const strippedA = baseCode.slice(1);
+    if (shiftCodeMap.has(strippedA)) {
+      return shiftCodeMap.get(strippedA);
+    }
+  }
+
+  // 4. Case-insensitive fallback
+  for (const [key, val] of shiftCodeMap.entries()) {
+    if (key.toUpperCase() === upper || key.toUpperCase() === baseCode) {
+      return val;
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Standard Shift Category Color Resolver
  * Group shift codes by family (D, M/E, A, N, ST, OFF, H, SL/AL/TR, SBY)
  */
 export function getShiftCategoryColor(code: string, fallbackColor?: string): string {
   if (!code) return '#6b7280';
-  const c = code.trim().toUpperCase();
+  let c = code.trim().toUpperCase().replace(/-X/gi, '').replace(/-ET/gi, '').trim();
+
+  // Handle 'A' prefix alias (e.g. AD1 -> D1) if it's not the afternoon 'A' shift
+  if (c.startsWith('AD') || c.startsWith('AE') || c.startsWith('AM') || c.startsWith('AN')) {
+    c = c.slice(1);
+  }
 
   // 1. Day Shifts (D, D1, D2, D3, etc.) - Siemens Teal / Cyan family
   if (c === 'D') return '#008b99';       // Primary Siemens Teal
@@ -59,11 +184,18 @@ export function getShiftCategoryColor(code: string, fallbackColor?: string): str
   if (c === 'OFF') return '#475569';     // Slate Dark
   if (c === 'H') return '#ef4444';       // Red
 
-  // 7. Leaves & Training
-  if (c === 'AL') return '#ec4899';      // Pink
-  if (c === 'SL') return '#f43f5e';      // Rose
-  if (c === 'TR') return '#059669';      // Green
-  if (c === 'SBY') return '#8b5cf6';     // Violet
+  // 7. Leaves & Training & Workshops
+  if (c === 'T' || c === 'TR') return '#059669';  // Training Green
+  if (c === 'W') return '#0d9488';                // Workshop Teal
+  if (c === 'AL') return '#ec4899';               // Annual Leave Pink
+  if (c === 'AL2') return '#db2777';              // Annual Leave Half-day
+  if (c === 'ALU') return '#e11d48';              // Annual Leave Emergency
+  if (c === 'AL2U') return '#be123c';             // Annual Leave Emergency Half-day
+  if (c === 'CL') return '#f97316';               // Casual Leave Orange
+  if (c === 'SL') return '#f43f5e';               // Sick Leave Rose
+  if (c === 'SL2') return '#dc2626';              // Sick Leave Half-day
+  if (c === 'SLO' || c === 'SL0') return '#991b1b'; // Sick Leave No Certificate Dark Red
+  if (c === 'SBY') return '#8b5cf6';              // Violet
 
   return fallbackColor || '#4b5563';
 }
@@ -92,98 +224,313 @@ export function calculateTimeDiffMinutes(startTime: string, endTime: string): nu
 }
 
 /**
- * Deduplicate biometric punches for an employee on a given date:
- * Rule 6: "หากมีการบันทึกซ้ำในเวลาใกล้เคียงกันจะใช้เวลาล่าสุด"
+ * Calculate circular minute distance on a 24-hour clock face (0 - 1440 mins).
  */
-export function filterDeduplicatedPunches(punches: BiometricRawPunch[]): {
+export function circularTimeDistance(timeA: string, timeB: string): number {
+  if (!timeA || !timeB) return 9999;
+  const a = hhmmToMinutes(timeA);
+  const b = hhmmToMinutes(timeB);
+  const diff = Math.abs(a - b);
+  return Math.min(diff, 1440 - diff);
+}
+
+export interface PunchResolutionDetails {
   clockIn: string;
   clockOut: string;
   secondIn?: string;
   secondOut?: string;
-} {
+  resolutionType:
+    | 'standard_in_out'         // Normal I & O punches
+    | 'dual_in_resolved'        // Both I & I, flexibly resolved by Shift Code
+    | 'dual_out_resolved'       // Both O & O, flexibly resolved by Shift Code
+    | 'inverted_resolved'       // O morning & I evening, inverted and resolved
+    | 'shift_time_aligned'      // Timestamps aligned based on Shift Code start/end
+    | 'single_in_only'          // Only arrival punch detected
+    | 'single_out_only'         // Only departure punch detected
+    | 'cross_midnight_resolved' // Night shift punch out connected across midnight
+    | 'no_punches';
+  resolutionDescription: string;
+  hasIrregularity: boolean;
+  shiftCodeUsed?: string;
+}
+
+/**
+ * Deduplicate and intelligently resolve biometric punches for an employee on a given date:
+ * - Rule 6: "หากมีการบันทึกซ้ำในเวลาใกล้เคียงกันจะใช้เวลาล่าสุด"
+ * - Flexible Shift Code Learning: Resolves dual 'I' (forgot to press Out), dual 'O' (accidentally pressed Out on arrival),
+ *   inverted buttons, and cross-midnight night shifts using Shift Code start/end as reference,
+ *   while strictly preserving the standard flow when In-Out were correctly pressed.
+ */
+export function filterDeduplicatedPunches(
+  punches: BiometricRawPunch[],
+  shiftInfo?: ShiftCode | null,
+  nextDayPunches?: BiometricRawPunch[]
+): PunchResolutionDetails {
   if (!punches || punches.length === 0) {
-    return { clockIn: '', clockOut: '' };
+    return {
+      clockIn: '',
+      clockOut: '',
+      resolutionType: 'no_punches',
+      resolutionDescription: 'ไม่มีบันทึกการสแกนเวลาในวันนี้',
+      hasIrregularity: false,
+    };
   }
 
-  // Sort chronologically
+  // Sort chronologically by time
   const sorted = [...punches].sort((a, b) => hhmmToMinutes(a.time) - hhmmToMinutes(b.time));
 
-  // Separate explicit In ('I') and Out ('O')
+  // Cluster punches within 30 mins (Rule 6: "หากมีการบันทึกซ้ำในเวลาใกล้เคียงกันจะใช้เวลาล่าสุด")
+  const clusters: BiometricRawPunch[][] = [];
+  let currentCluster: BiometricRawPunch[] = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = currentCluster[currentCluster.length - 1];
+    const diff = hhmmToMinutes(sorted[i].time) - hhmmToMinutes(prev.time);
+    if (diff <= 30) {
+      currentCluster.push(sorted[i]);
+    } else {
+      clusters.push(currentCluster);
+      currentCluster = [sorted[i]];
+    }
+  }
+  clusters.push(currentCluster);
+
+  // Check if shift is cross-midnight night shift (e.g. 20:00 - 05:00)
+  const isNightShift = Boolean(
+    shiftInfo?.isWorkingDay &&
+    shiftInfo?.startTime &&
+    shiftInfo?.endTime &&
+    hhmmToMinutes(shiftInfo.startTime) > hhmmToMinutes(shiftInfo.endTime)
+  );
+
+  // CASE 1: Single Distinct Cluster on this day
+  if (clusters.length === 1) {
+    const singleCluster = clusters[0];
+    const repPunch = singleCluster[singleCluster.length - 1];
+    const repTime = repPunch.time;
+
+    // Check if night shift punch out is in next morning's punches
+    if (isNightShift && nextDayPunches && nextDayPunches.length > 0) {
+      // Find morning punch in next day (e.g. 03:00 - 10:00)
+      const morningPunches = nextDayPunches
+        .filter(p => hhmmToMinutes(p.time) >= 180 && hhmmToMinutes(p.time) <= 600)
+        .sort((a, b) => hhmmToMinutes(a.time) - hhmmToMinutes(b.time));
+
+      if (morningPunches.length > 0) {
+        const nextMorningOut = morningPunches[morningPunches.length - 1].time;
+        return {
+          clockIn: repTime,
+          clockOut: nextMorningOut,
+          resolutionType: 'cross_midnight_resolved',
+          resolutionDescription: `กะดึกข้ามคืน: เชื่อมโยงเวลาออกเช้าวันถัดไป (${nextMorningOut}) ตามกะ ${shiftInfo?.code || ''}`,
+          hasIrregularity: true,
+          shiftCodeUsed: shiftInfo?.code,
+        };
+      }
+    }
+
+    // Determine if this single scan is In or Out using Shift Code
+    if (shiftInfo?.isWorkingDay && shiftInfo?.startTime && shiftInfo?.endTime) {
+      const distToStart = circularTimeDistance(repTime, shiftInfo.startTime);
+      const distToEnd = circularTimeDistance(repTime, shiftInfo.endTime);
+
+      if (distToStart <= distToEnd) {
+        return {
+          clockIn: repTime,
+          clockOut: '',
+          resolutionType: 'single_in_only',
+          resolutionDescription: `พบเฉพาะเวลาเข้างาน (${repTime}) ขาดการสแกนออก อ้างอิงตามกะ ${shiftInfo.code}`,
+          hasIrregularity: true,
+          shiftCodeUsed: shiftInfo.code,
+        };
+      } else {
+        return {
+          clockIn: '',
+          clockOut: repTime,
+          resolutionType: 'single_out_only',
+          resolutionDescription: `พบเฉพาะเวลาออกงาน (${repTime}) ขาดการสแกนเข้า อ้างอิงตามกะ ${shiftInfo.code}`,
+          hasIrregularity: true,
+          shiftCodeUsed: shiftInfo.code,
+        };
+      }
+    }
+
+    // If no shift info, rely on punch type
+    if (repPunch.type === 'O') {
+      return {
+        clockIn: '',
+        clockOut: repTime,
+        resolutionType: 'single_out_only',
+        resolutionDescription: `พบเฉพาะเวลาออกงาน (${repTime} สถานะ O)`,
+        hasIrregularity: true,
+      };
+    } else {
+      return {
+        clockIn: repTime,
+        clockOut: '',
+        resolutionType: 'single_in_only',
+        resolutionDescription: `พบเฉพาะเวลาเข้างาน (${repTime} สถานะ I)`,
+        hasIrregularity: false,
+      };
+    }
+  }
+
+  // CASE 2: Multiple Clusters (>= 2 distinct time windows)
+  const allTypes = sorted.map(p => p.type);
+  const hasOnlyI = allTypes.every(t => t === 'I');
+  const hasOnlyO = allTypes.every(t => t === 'O');
+
+  // SUBCASE 2A: All punches are 'I' (Forgot to press Out at end of day)
+  if (hasOnlyI) {
+    const earliestCluster = clusters[0];
+    const latestCluster = clusters[clusters.length - 1];
+    const clockIn = earliestCluster[earliestCluster.length - 1].time;
+    const clockOut = latestCluster[latestCluster.length - 1].time;
+
+    let secondIn = '';
+    let secondOut = '';
+    if (clusters.length >= 4) {
+      secondIn = clusters[1][clusters[1].length - 1].time;
+      secondOut = clusters[2][clusters[2].length - 1].time;
+    }
+
+    const shiftDesc = shiftInfo?.code 
+      ? `ตามกะ ${shiftInfo.code} (${shiftInfo.startTime}-${shiftInfo.endTime})` 
+      : 'ตามลำดับเวลาเช้า-เย็น';
+
+    return {
+      clockIn,
+      clockOut,
+      secondIn: secondIn || undefined,
+      secondOut: secondOut || undefined,
+      resolutionType: 'dual_in_resolved',
+      resolutionDescription: `ตรวจพบสถานะ In ทั้ง 2 ช่วงเวลา (ไม่ได้กด Out): ระบบเทียบกับ Shift Code กำหนดเวลาแรก (${clockIn}) เป็นเข้างาน และเวลาหลัง (${clockOut}) เป็นเลิกงานอัตโนมัติ ${shiftDesc}`,
+      hasIrregularity: true,
+      shiftCodeUsed: shiftInfo?.code,
+    };
+  }
+
+  // SUBCASE 2B: All punches are 'O' (Mistakenly pressed Out on arrival)
+  if (hasOnlyO) {
+    const earliestCluster = clusters[0];
+    const latestCluster = clusters[clusters.length - 1];
+    const clockIn = earliestCluster[earliestCluster.length - 1].time;
+    const clockOut = latestCluster[latestCluster.length - 1].time;
+
+    let secondIn = '';
+    let secondOut = '';
+    if (clusters.length >= 4) {
+      secondIn = clusters[1][clusters[1].length - 1].time;
+      secondOut = clusters[2][clusters[2].length - 1].time;
+    }
+
+    const shiftDesc = shiftInfo?.code 
+      ? `ตามกะ ${shiftInfo.code} (${shiftInfo.startTime}-${shiftInfo.endTime})` 
+      : 'ตามลำดับเวลาเช้า-เย็น';
+
+    return {
+      clockIn,
+      clockOut,
+      secondIn: secondIn || undefined,
+      secondOut: secondOut || undefined,
+      resolutionType: 'dual_out_resolved',
+      resolutionDescription: `ตรวจพบสถานะ Out ทั้ง 2 ช่วงเวลา (กดผิดเป็น Out ตอนเข้างาน): ระบบเทียบกับ Shift Code กำหนดเวลาแรก (${clockIn}) เป็นเข้างาน และเวลาหลัง (${clockOut}) เป็นเลิกงานอัตโนมัติ ${shiftDesc}`,
+      hasIrregularity: true,
+      shiftCodeUsed: shiftInfo?.code,
+    };
+  }
+
+  // SUBCASE 2C: Both 'I' and 'O' exist in punches
   const inPunches = sorted.filter(p => p.type === 'I');
   const outPunches = sorted.filter(p => p.type === 'O');
 
-  let clockIn = '';
-  let clockOut = '';
-  let secondIn = '';
-  let secondOut = '';
-
-  // If we have explicit 'I' punches:
-  // "หากมีการบันทึกซ้ำในเวลาใกล้เคียงกันจะใช้เวลาล่าสุด"
-  // For punch in: If user swiped at 07:35 and again at 07:41 (repeated within 30 min before shift), take the latest close punch
+  // Cluster 'I' punches
+  const inClusters: BiometricRawPunch[][] = [];
   if (inPunches.length > 0) {
-    // Cluster punches within 30 mins
-    const clusters: BiometricRawPunch[][] = [];
-    let currentCluster: BiometricRawPunch[] = [inPunches[0]];
-
+    let curr: BiometricRawPunch[] = [inPunches[0]];
     for (let i = 1; i < inPunches.length; i++) {
-      const prev = currentCluster[currentCluster.length - 1];
-      const diff = hhmmToMinutes(inPunches[i].time) - hhmmToMinutes(prev.time);
-      if (diff <= 30) {
-        currentCluster.push(inPunches[i]);
+      if (hhmmToMinutes(inPunches[i].time) - hhmmToMinutes(curr[curr.length - 1].time) <= 30) {
+        curr.push(inPunches[i]);
       } else {
-        clusters.push(currentCluster);
-        currentCluster = [inPunches[i]];
+        inClusters.push(curr);
+        curr = [inPunches[i]];
       }
     }
-    clusters.push(currentCluster);
-
-    // First cluster: take latest punch (Rule 6: "หากมีการบันทึกซ้ำในเวลาใกล้เคียงกันจะใช้เวลาล่าสุด")
-    const firstCluster = clusters[0];
-    clockIn = firstCluster[firstCluster.length - 1].time;
-
-    // If there's a second distinct cluster hours later (e.g. split shift or afternoon clock in)
-    if (clusters.length > 1) {
-      const secondCluster = clusters[1];
-      secondIn = secondCluster[secondCluster.length - 1].time;
-    }
+    inClusters.push(curr);
   }
 
-  // For punch out:
+  // Cluster 'O' punches
+  const outClusters: BiometricRawPunch[][] = [];
   if (outPunches.length > 0) {
-    const clusters: BiometricRawPunch[][] = [];
-    let currentCluster: BiometricRawPunch[] = [outPunches[0]];
-
+    let curr: BiometricRawPunch[] = [outPunches[0]];
     for (let i = 1; i < outPunches.length; i++) {
-      const prev = currentCluster[currentCluster.length - 1];
-      const diff = hhmmToMinutes(outPunches[i].time) - hhmmToMinutes(prev.time);
-      if (diff <= 30) {
-        currentCluster.push(outPunches[i]);
+      if (hhmmToMinutes(outPunches[i].time) - hhmmToMinutes(curr[curr.length - 1].time) <= 30) {
+        curr.push(outPunches[i]);
       } else {
-        clusters.push(currentCluster);
-        currentCluster = [outPunches[i]];
+        outClusters.push(curr);
+        curr = [outPunches[i]];
       }
     }
-    clusters.push(currentCluster);
+    outClusters.push(curr);
+  }
 
-    // Latest punch out of first cluster or final departure
-    const lastCluster = clusters[clusters.length - 1];
-    clockOut = lastCluster[lastCluster.length - 1].time;
+  const firstIn = inClusters.length > 0 ? inClusters[0][inClusters[0].length - 1].time : '';
+  const lastOut = outClusters.length > 0 ? outClusters[outClusters.length - 1][outClusters[outClusters.length - 1].length - 1].time : '';
 
-    if (clusters.length > 1) {
+  // Check if In and Out are in normal chronological order
+  if (firstIn && lastOut && hhmmToMinutes(firstIn) <= hhmmToMinutes(lastOut)) {
+    // Normal Standard Case: First In and Last Out
+    let clockIn = firstIn;
+    let clockOut = lastOut;
+    let secondIn = '';
+    let secondOut = '';
+
+    if (inClusters.length > 1) {
+      secondIn = inClusters[1][inClusters[1].length - 1].time;
+    }
+    if (outClusters.length > 1) {
       secondOut = clockOut;
-      clockOut = clusters[0][clusters[0].length - 1].time;
+      clockOut = outClusters[0][outClusters[0].length - 1].time;
     }
+
+    return {
+      clockIn,
+      clockOut,
+      secondIn: secondIn || undefined,
+      secondOut: secondOut || undefined,
+      resolutionType: 'standard_in_out',
+      resolutionDescription: 'บันทึกเวลาเข้า-ออกตามปกติ (In - Out)',
+      hasIrregularity: false,
+      shiftCodeUsed: shiftInfo?.code,
+    };
   }
 
-  // Fallback: If punches didn't have explicit I/O flags or only timestamps were provided
-  if (!clockIn && !clockOut && sorted.length > 0) {
-    clockIn = sorted[0].time;
-    if (sorted.length > 1) {
-      clockOut = sorted[sorted.length - 1].time;
-    }
+  // Check if buttons were inverted (e.g. employee pressed 'O' in morning and 'I' in evening on daytime shift)
+  if (firstIn && lastOut && hhmmToMinutes(firstIn) > hhmmToMinutes(lastOut) && !isNightShift) {
+    const earliestTime = clusters[0][clusters[0].length - 1].time;
+    const latestTime = clusters[clusters.length - 1][clusters.length - 1].time;
+
+    return {
+      clockIn: earliestTime,
+      clockOut: latestTime,
+      resolutionType: 'inverted_resolved',
+      resolutionDescription: `ตรวจพบการกดสลับปุ่ม (Out ตอนเช้า / In ตอนเย็น): ปรับเข้างานเป็น ${earliestTime} และเลิกงานเป็น ${latestTime} โดยเทียบกับ Shift Code ${shiftInfo?.code || ''}`,
+      hasIrregularity: true,
+      shiftCodeUsed: shiftInfo?.code,
+    };
   }
 
-  return { clockIn, clockOut, secondIn, secondOut };
+  // Fallback: Use earliest and latest cluster
+  const clockIn = clusters[0][clusters[0].length - 1].time;
+  const clockOut = clusters[clusters.length - 1][clusters.length - 1].time;
+  return {
+    clockIn,
+    clockOut,
+    resolutionType: 'shift_time_aligned',
+    resolutionDescription: `กำหนดเวลาเข้า (${clockIn}) และเลิกงาน (${clockOut}) ตามลำดับเวลาที่สแกน`,
+    hasIrregularity: true,
+    shiftCodeUsed: shiftInfo?.code,
+  };
 }
 
 /**
@@ -209,13 +556,8 @@ export function buildTimeSheetForEmployee(
   const shiftCodeMap = new Map<string, ShiftCode>();
   shiftCodes.forEach(sc => shiftCodeMap.set(sc.code, sc));
 
-  // Filter biometric punches matching either empNo or gid
-  const empPunches = allPunches.filter(p => {
-    const ident = p.empIdentifier.trim().toLowerCase();
-    const eNo = employee.empNo.toLowerCase();
-    const gid = employee.gid.toLowerCase();
-    return ident === eNo || ident === gid || ident.startsWith(eNo) || ident.startsWith(gid);
-  });
+  // Filter biometric punches matching either empNo or gid (robust tolerance for leading zeros & prefixes)
+  const empPunches = allPunches.filter(p => isEmployeeMatch(p.empIdentifier, employee));
 
   // Filter approved OT for this month or retroactive OT assigned to this month
   const empOT = otRecords.filter(ot => {
@@ -260,14 +602,33 @@ export function buildTimeSheetForEmployee(
       (sp.empNo === employee.empNo || sp.gid === employee.gid) && sp.date === dateStr
     );
     const shiftCodeVal = plan ? plan.shiftCode : (dayOfWeek === 'Sat' || dayOfWeek === 'Sun' ? 'OFF' : 'D');
-    const shiftInfo = shiftCodeMap.get(shiftCodeVal);
+
+    // Check if there are manual overrides saved for this day
+    const overrideKey = `${employee.empNo}_${dateStr}`;
+    const overrides = manualOverrides[overrideKey] || {};
+
+    const effectiveShiftCode = (overrides.shiftCode !== undefined ? overrides.shiftCode : shiftCodeVal) || '';
+
+    // Parse shift code tags (-X for Standby 300฿, -ET for Emergency 300฿)
+    const tagInfo = parseShiftCodeTags(effectiveShiftCode);
+    const shiftInfo = resolveShiftInfo(effectiveShiftCode, shiftCodeMap);
 
     const shiftIn = shiftInfo?.isWorkingDay ? shiftInfo.startTime : '';
     const shiftOut = shiftInfo?.isWorkingDay ? shiftInfo.endTime : '';
 
     // Punches for this day
     const dayPunches = empPunches.filter(p => p.date === dateStr);
-    const { clockIn, clockOut, secondIn, secondOut } = filterDeduplicatedPunches(dayPunches);
+
+    // Look ahead to next day for night shift (cross-midnight) punch out
+    let nextDateStr = '';
+    if (d < totalDays) {
+      const nextDayPadded = String(d + 1).padStart(2, '0');
+      nextDateStr = `${monthYear}-${nextDayPadded}`;
+    }
+    const nextDayPunches = nextDateStr ? empPunches.filter(p => p.date === nextDateStr) : [];
+
+    const punchResolution = filterDeduplicatedPunches(dayPunches, shiftInfo, nextDayPunches);
+    const { clockIn, clockOut, secondIn, secondOut } = punchResolution;
 
     // Calculate Diff. I
     let diff1Minutes = 0;
@@ -323,9 +684,11 @@ export function buildTimeSheetForEmployee(
     // Total is either OT total or working hours approved
     const totalWorkingHoursOnDay = ot1_5 + ot3_0;
 
-    // Allowances on this day if any
-    let standbyAllowance = 0;
-    let emergencyAllowance = 0;
+    // Allowances on this day:
+    // Rule 1: -X tag in shift code => +300 THB Standby Allowance (e.g. AD1-X)
+    // Rule 2: -ET tag in shift code => +300 THB Emergency Allowance (e.g. E-ET)
+    let standbyAllowance = tagInfo.standbyAllowance;
+    let emergencyAllowance = tagInfo.emergencyAllowance;
     let shiftAllowance = 0;
 
     const dayAllowances = empAllowances.filter(a => !a.date || a.date === dateStr);
@@ -340,15 +703,17 @@ export function buildTimeSheetForEmployee(
     let codeLeave = '';
     let remark = otRemarks.join('; ');
 
-    // Check if there are manual overrides saved for this day
-    const overrideKey = `${employee.empNo}_${dateStr}`;
-    const overrides = manualOverrides[overrideKey] || {};
+    const effOT1_5 = overrides.ot1_5 !== undefined ? overrides.ot1_5 : ot1_5;
+    const effOT3_0 = overrides.ot3_0 !== undefined ? overrides.ot3_0 : ot3_0;
+    const effTotalWorkHours = overrides.totalWorkHours !== undefined 
+      ? overrides.totalWorkHours 
+      : (effOT1_5 + effOT3_0);
 
     const row: TimeSheetRow = {
       date: dateStr,
       dayString,
       dayOfWeek,
-      shiftCode: overrides.shiftCode !== undefined ? overrides.shiftCode : shiftCodeVal,
+      shiftCode: effectiveShiftCode,
       shiftIn: overrides.shiftIn !== undefined ? overrides.shiftIn : shiftIn,
       shiftOut: overrides.shiftOut !== undefined ? overrides.shiftOut : shiftOut,
       realTime1In: overrides.realTime1In !== undefined ? overrides.realTime1In : clockIn,
@@ -361,9 +726,9 @@ export function buildTimeSheetForEmployee(
       realTime2Out: overrides.realTime2Out !== undefined ? overrides.realTime2Out : (secondOut || ''),
       diff2: overrides.diff2 !== undefined ? overrides.diff2 : diff2Str,
       diff2Hours: diff2Minutes / 60,
-      totalWorkHours: overrides.totalWorkHours !== undefined ? overrides.totalWorkHours : totalWorkingHoursOnDay,
-      ot1_5: overrides.ot1_5 !== undefined ? overrides.ot1_5 : ot1_5,
-      ot3_0: overrides.ot3_0 !== undefined ? overrides.ot3_0 : ot3_0,
+      totalWorkHours: effTotalWorkHours,
+      ot1_5: effOT1_5,
+      ot3_0: effOT3_0,
       standbyAllowance: overrides.standbyAllowance !== undefined ? overrides.standbyAllowance : standbyAllowance,
       emergencyAllowance: overrides.emergencyAllowance !== undefined ? overrides.emergencyAllowance : emergencyAllowance,
       shiftAllowance: overrides.shiftAllowance !== undefined ? overrides.shiftAllowance : shiftAllowance,

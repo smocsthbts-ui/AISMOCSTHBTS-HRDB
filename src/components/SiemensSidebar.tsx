@@ -2,6 +2,7 @@ import React from 'react';
 import { 
   Calendar, 
   Clock, 
+  BarChart3,
   Upload, 
   Download, 
   Users, 
@@ -74,6 +75,13 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
       label: 'Time Sheet', 
       sublabel: 'บันทึกเวลาทำงานรายบุคคล', 
       icon: Clock,
+      badge: null 
+    },
+    { 
+      id: 'statistics', 
+      label: 'Statistics', 
+      sublabel: 'สถิติการทำงานและการลา (Late/Leaves)', 
+      icon: BarChart3,
       badge: null 
     },
     { 

@@ -222,7 +222,7 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
               </span>
             </div>
             <p className="text-slate-400">
-              ไฟล์เทมเพลตจัดตารางการทำงานของแต่ละแผนก มีรายชื่อพนักงานและ GID ครบถ้วน พร้อมคอลัมน์วันที่ 1-31
+              ไฟล์เทมเพลตจัดตารางการทำงานของแต่ละแผนก อ้างอิงด้วยรหัสพนักงาน (Emp No), ชื่อพนักงาน (Name) และแผนก (Department) พร้อมคอลัมน์วันที่ 1-31
             </p>
             <button
               onClick={() => {
@@ -358,69 +358,6 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
                   className="hidden"
                 />
               </label>
-            </div>
-          </div>
-
-          {/* Section 2: Clean Demo & Transaction Data */}
-          <div className={`p-5 rounded border space-y-4 text-xs ${
-            isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
-          }`}>
-            <h3 className="font-bold text-sm text-amber-400 flex items-center gap-2">
-              <Trash2 className="w-4 h-4 text-amber-400" />
-              ล้างข้อมูล Demo และบันทึกเวลาทำงาน (Clear Operational & Demo Records)
-            </h3>
-
-            <p className="text-slate-400 leading-relaxed">
-              ล้างข้อมูลเวลาสแกนบัตร (Time Punches), ตารางกะ (Shift Plans), รายการ OT, และเบี้ยเลี้ยงทั้งหมด เพื่อเตรียมระบบให้สะอาดและพร้อมสำหรับการเริ่ม Import ข้อมูลจริงประจำงวด (รายชื่อพนักงานและรหัสกะจะไม่ถูกลบ)
-            </p>
-
-            <div className="pt-2">
-              <button
-                disabled={isClearing}
-                onClick={handleClearDemoTransactions}
-                className="px-4 py-2.5 rounded font-semibold bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/40 flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
-              >
-                {isClearing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                <span>ล้างข้อมูล Demo และรายการเวลาทั้งหมด</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Section 3: Full Reset */}
-          <div className={`p-5 rounded border space-y-4 text-xs ${
-            isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
-          }`}>
-            <h3 className="font-bold text-sm text-red-400 flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-red-400" />
-              ล้างข้อมูลระบบทั้งหมด (Clear All Data / Clean Slate)
-            </h3>
-
-            <p className="text-slate-400 leading-relaxed">
-              ล้างข้อมูลทุกอย่างรวมถึงรายชื่อพนักงานในระบบ เพื่อตั้งต้นระบบใหม่ทั้งหมด
-            </p>
-
-            <div className="pt-2 flex flex-wrap items-center gap-3">
-              <button
-                disabled={isClearing}
-                onClick={handleClearEverything}
-                className="px-4 py-2.5 rounded font-semibold bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/40 flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
-              >
-                {isClearing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                <span>ล้างข้อมูลทั้งหมดในระบบ</span>
-              </button>
-
-              <button
-                disabled={isClearing}
-                onClick={() => {
-                  if (confirm('ยืนยันการคืนค่าเริ่มต้นระบบทั้งหมด?')) {
-                    onResetData();
-                  }
-                }}
-                className="px-4 py-2.5 rounded font-semibold bg-slate-700/50 hover:bg-slate-700 text-slate-300 border border-slate-600 flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
-              >
-                <RotateCcw className="w-4 h-4 text-slate-400" />
-                <span>คืนค่าเริ่มต้นระบบ (Reset Defaults)</span>
-              </button>
             </div>
           </div>
         </div>

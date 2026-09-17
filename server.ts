@@ -1,18 +1,19 @@
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
+import fs from 'fs';
 
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
+  const PORT = 3000;
 
-  // API Health check endpoint for Cloud Run health checks
-  app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  // Cloud Run / Health checks
+  app.get(['/api/health', '/healthz', '/_health'], (_req, res) => {
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  // Serve static files in production or use Vite middleware in development
+  // Vite middleware for development vs static files for production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -26,8 +27,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+
+  process.on('SIGTERM', () => {
+    server.close(() => {
+      process.exit(0);
+    });
   });
 }
 

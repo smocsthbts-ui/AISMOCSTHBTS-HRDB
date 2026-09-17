@@ -11,6 +11,11 @@ export interface UserAccount {
   status: UserStatus;
   createdAt: string;
   lastLogin?: string;
+  photoURL?: string;
+  isGoogleAccount?: boolean;
+  assignedBy?: string;
+  activatedAt?: string;
+  updatedAt?: string;
 }
 
 export interface Department {

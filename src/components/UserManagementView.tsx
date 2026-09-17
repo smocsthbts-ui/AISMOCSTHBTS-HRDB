@@ -1,6 +1,7 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { UserAccount } from '../types';
 import { storage } from '../utils/storage';
+import { firestoreSync, subscribeToUserChanges } from '../firebase';
 import { 
   ShieldCheck, 
   UserCheck, 
@@ -17,7 +18,8 @@ import {
   Info,
   UserX,
   Mail,
-  UserCircle2
+  UserCircle2,
+  RefreshCw
 } from 'lucide-react';
 
 interface UserManagementViewProps {
@@ -33,7 +35,81 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 }) => {
   const isDark = theme === 'dark';
   const isAdmin = currentUser.role === 'Admin';
-  const users = storage.getUsers();
+  const [users, setUsers] = useState<UserAccount[]>(() => storage.getUsers());
+  const [isSyncingCloud, setIsSyncingCloud] = useState(false);
+
+  // Real-time synchronization for multi-user account changes
+  const refreshUsers = useCallback(() => {
+    setUsers(storage.getUsers());
+  }, []);
+
+  // Manual cloud refresh handler
+  const handleManualCloudSync = async () => {
+    setIsSyncingCloud(true);
+    try {
+      const fresh = await firestoreSync.fetchAllFromCloud();
+      if (fresh && fresh.users && fresh.users.length > 0) {
+        storage.setUsers(fresh.users);
+        setUsers(fresh.users);
+        const pendingCount = fresh.users.filter(u => u.status === 'Pending_Approval').length;
+        showNotification(
+          'success', 
+          `ดึงข้อมูลผู้ใช้จาก Cloud Firestore สำเร็จ (พบทั้งหมด ${fresh.users.length} บัญชี, รออนุมัติ ${pendingCount} บัญชี)`
+        );
+      } else {
+        refreshUsers();
+        showNotification('success', 'ซิงค์ข้อมูลผู้ใช้จาก Cloud เรียบร้อยแล้ว');
+      }
+      onUserChanged();
+    } catch (err: any) {
+      console.warn('Manual cloud sync error:', err);
+      showNotification('error', `ไม่สามารถดึงข้อมูลจาก Cloud ได้: ${err?.message || 'โปรดลองอีกครั้ง'}`);
+    } finally {
+      setIsSyncingCloud(false);
+    }
+  };
+
+  useEffect(() => {
+    // 1. Initial load from local cache
+    refreshUsers();
+
+    // 2. Fetch directly from Cloud Firestore to pick up newly registered users
+    const syncFromCloud = async () => {
+      try {
+        const fresh = await firestoreSync.fetchAllFromCloud();
+        if (fresh && fresh.users && fresh.users.length > 0) {
+          storage.setUsers(fresh.users);
+          setUsers(fresh.users);
+        }
+      } catch (err) {
+        console.warn('UserManagementView auto sync error:', err);
+      }
+    };
+    syncFromCloud();
+
+    // 3. Realtime listener directly for user changes
+    const unsubUserChanges = subscribeToUserChanges(async () => {
+      try {
+        const fresh = await firestoreSync.fetchAllFromCloud();
+        if (fresh && fresh.users && fresh.users.length > 0) {
+          storage.setUsers(fresh.users);
+          setUsers(fresh.users);
+        } else {
+          refreshUsers();
+        }
+      } catch {
+        refreshUsers();
+      }
+    });
+
+    window.addEventListener('storage-changed', refreshUsers);
+    window.addEventListener('firestore-sync-completed', refreshUsers);
+    return () => {
+      unsubUserChanges();
+      window.removeEventListener('storage-changed', refreshUsers);
+      window.removeEventListener('firestore-sync-completed', refreshUsers);
+    };
+  }, [refreshUsers]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [roleFilter, setRoleFilter] = useState<'ALL' | 'Admin' | 'User'>('ALL');
@@ -41,6 +117,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [userToDelete, setUserToDelete] = useState<UserAccount | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
 
   const [userForm, setUserForm] = useState<Partial<UserAccount>>({
@@ -51,6 +128,76 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     status: 'Active',
   });
 
+  // Activate User State (assign role & department)
+  const [userToActivate, setUserToActivate] = useState<UserAccount | null>(null);
+  const [activateRole, setActivateRole] = useState<'Admin' | 'User'>('User');
+  const [activateDept, setActivateDept] = useState<string>('GM');
+  const [isActivating, setIsActivating] = useState<boolean>(false);
+  const [matchedEmpInfo, setMatchedEmpInfo] = useState<any>(null);
+
+  const pendingUsers = useMemo(() => {
+    return users.filter(u => u.status === 'Pending_Approval');
+  }, [users]);
+
+  const openActivateModal = (targetUser: UserAccount) => {
+    setUserToActivate(targetUser);
+    setActivateRole(targetUser.role || 'User');
+    
+    // Check matching employee in master
+    const employees = storage.getEmployees();
+    const cleanEmail = targetUser.email.toLowerCase();
+    const matchedEmp = employees.find(e => 
+      (e.gid && cleanEmail.includes(e.gid.toLowerCase())) ||
+      (e.empNo && cleanEmail.includes(e.empNo.toLowerCase())) ||
+      (e.firstName && cleanEmail.includes(e.firstName.toLowerCase()))
+    );
+    setMatchedEmpInfo(matchedEmp || null);
+
+    if (targetUser.department && targetUser.department !== 'PENDING') {
+      setActivateDept(targetUser.department);
+    } else if (matchedEmp?.department) {
+      setActivateDept(matchedEmp.department);
+    } else {
+      setActivateDept('GM');
+    }
+  };
+
+  const handleConfirmActivate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!userToActivate || !isAdmin || isActivating) return;
+    setIsActivating(true);
+
+    const targetUser = userToActivate;
+    const activatedUser: UserAccount = {
+      ...targetUser,
+      status: 'Active' as const,
+      role: activateRole,
+      department: activateDept,
+      activatedAt: new Date().toISOString(),
+      assignedBy: currentUser.email,
+    };
+
+    try {
+      // 1. Instant Optimistic UI Update: update list & close modal immediately
+      const updated = users.map(u => 
+        (u.id === activatedUser.id || u.email.toLowerCase() === activatedUser.email.toLowerCase()) 
+          ? activatedUser 
+          : u
+      );
+      setUsers(updated);
+      setUserToActivate(null);
+      showNotification('success', `ทำการ Activate User บัญชี ${targetUser.name} (${targetUser.email}) เรียบร้อยแล้ว (บทบาท: ${activateRole}, แผนก: ${activateDept})`);
+      onUserChanged();
+
+      // 2. Persist to storage & Cloud Firestore in background
+      await storage.saveUser(activatedUser);
+    } catch (err: any) {
+      console.warn('Activate user warning:', err);
+    } finally {
+      setIsActivating(false);
+    }
+  };
+
   const showNotification = (type: 'success' | 'warning' | 'error', message: string) => {
     setNotification({ type, message });
     setTimeout(() => {
@@ -58,31 +205,61 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     }, 4500);
   };
 
-  // Toggle user activation / approval
-  const handleToggleStatus = (targetUser: UserAccount) => {
+  // Change user status (Active, Pending_Approval, Deactivated)
+  const handleChangeStatus = async (targetUser: UserAccount, nextStatus: UserAccount['status']) => {
     if (!isAdmin) return;
-    if (targetUser.id === currentUser.id) {
-      showNotification('warning', 'ไม่สามารถระงับสิทธิ์บัญชีของตนเองได้');
+    if (targetUser.id === currentUser.id || targetUser.email.trim().toLowerCase() === 'smo.cs.th.bts@gmail.com') {
+      showNotification('warning', 'ไม่สามารถปรับสถานะบัญชี Admin หลักได้');
       return;
     }
 
-    const nextStatus: UserAccount['status'] = targetUser.status === 'Active' ? 'Deactivated' : 'Active';
-    const updated = users.map(u => u.id === targetUser.id ? { ...u, status: nextStatus } : u);
-    storage.setUsers(updated);
+    const updatedUser: UserAccount = { 
+      ...targetUser, 
+      status: nextStatus,
+      updatedAt: new Date().toISOString()
+    };
+    
+    // Optimistic UI update
+    const updated = users.map(u => 
+      (u.id === targetUser.id || u.email.toLowerCase() === targetUser.email.toLowerCase()) 
+        ? updatedUser 
+        : u
+    );
+    setUsers(updated);
     onUserChanged();
-    showNotification('success', `เปลี่ยนสถานะบัญชี ${targetUser.email} เป็น ${nextStatus} สำเร็จ`);
+
+    const statusLabels: Record<string, string> = {
+      'Active': 'Active (เปิดใช้งาน)',
+      'Pending_Approval': 'Pending Approval (รอ Admin อนุมัติ)',
+      'Deactivated': 'Deactivated (ระงับสิทธิ์)',
+    };
+    showNotification('success', `ปรับสถานะบัญชี ${targetUser.email} เป็น ${statusLabels[nextStatus || 'Active']} เรียบร้อยแล้ว`);
+
+    try {
+      await storage.saveUser(updatedUser);
+    } catch (err) {
+      console.warn('Status change save error:', err);
+    }
+  };
+
+  // Legacy toggle status wrapper
+  const handleToggleStatus = async (targetUser: UserAccount) => {
+    const nextStatus = targetUser.status === 'Active' ? 'Deactivated' : 'Active';
+    await handleChangeStatus(targetUser, nextStatus);
   };
 
   // Change user role (Admin vs User)
-  const handleChangeRole = (targetUser: UserAccount, newRole: 'Admin' | 'User') => {
+  const handleChangeRole = async (targetUser: UserAccount, newRole: 'Admin' | 'User') => {
     if (!isAdmin) return;
     if (targetUser.id === currentUser.id) {
       showNotification('warning', 'ไม่สามารถเปลี่ยน Role ของตนเองได้');
       return;
     }
 
-    const updated = users.map(u => u.id === targetUser.id ? { ...u, role: newRole } : u);
-    storage.setUsers(updated);
+    const updatedUser = { ...targetUser, role: newRole };
+    await storage.saveUser(updatedUser);
+    const updated = users.map(u => u.id === targetUser.id ? updatedUser : u);
+    setUsers(updated);
     onUserChanged();
     
     if (newRole === 'User') {
@@ -93,17 +270,19 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   };
 
   // Change user department
-  const handleChangeDept = (targetUser: UserAccount, newDept: string) => {
+  const handleChangeDept = async (targetUser: UserAccount, newDept: string) => {
     if (!isAdmin) return;
-    const updated = users.map(u => u.id === targetUser.id ? { ...u, department: newDept } : u);
-    storage.setUsers(updated);
+    const updatedUser = { ...targetUser, department: newDept };
+    await storage.saveUser(updatedUser);
+    const updated = users.map(u => u.id === targetUser.id ? updatedUser : u);
+    setUsers(updated);
     onUserChanged();
     showNotification('success', `เปลี่ยนแผนกของ ${targetUser.name} เป็น ${newDept} สำเร็จ`);
   };
 
-  // Delete User handler
-  const confirmDeleteUser = () => {
-    if (!userToDelete || !isAdmin) return;
+  // Delete User handler (permanently removes from LocalStorage and Cloud Firestore)
+  const confirmDeleteUser = async () => {
+    if (!userToDelete || !isAdmin || isDeleting) return;
 
     // Strict validation
     if (userToDelete.id === currentUser.id) {
@@ -112,19 +291,26 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
-    if (userToDelete.role === 'Admin') {
-      showNotification('error', 'ไม่สามารถลบบัญชีระดับ Admin ได้โดยตรง กรุณาปรับ Role เป็น User ก่อน');
+    if (userToDelete.email?.trim().toLowerCase() === 'smo.cs.th.bts@gmail.com') {
+      showNotification('error', 'ไม่สามารถลบบัญชี Admin หลักของระบบได้');
       setUserToDelete(null);
       return;
     }
 
+    setIsDeleting(true);
     const targetEmail = userToDelete.email;
     const targetName = userToDelete.name;
-    const updated = users.filter(u => u.id !== userToDelete.id);
-    storage.setUsers(updated);
-    onUserChanged();
-    setUserToDelete(null);
-    showNotification('success', `ลบบัญชีผู้ใช้ ${targetName} (${targetEmail}) ออกจากระบบเรียบร้อยแล้ว`);
+
+    try {
+      await storage.deleteUser(userToDelete.id, userToDelete.email);
+      onUserChanged();
+      setUserToDelete(null);
+      showNotification('success', `ลบบัญชีผู้ใช้ ${targetName} (${targetEmail}) ออกจากฐานข้อมูลเรียบร้อยแล้วอย่างถาวร`);
+    } catch (err: any) {
+      showNotification('error', `เกิดข้อผิดพลาดในการลบบัญชี: ${err?.message || 'โปรดลองใหม่อีกครั้ง'}`);
+    } finally {
+      setIsDeleting(false);
+    }
   };
 
   // Add new user
@@ -155,16 +341,39 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     showNotification('success', `สร้างบัญชีผู้ใช้ ${newUser.name} สำเร็จ`);
   };
 
-  // Filtered users list
+  // Filtered users list (strictly deduplicated by email)
   const filteredUsers = useMemo(() => {
-    return users.filter(u => {
+    const uMap = new Map<string, UserAccount>();
+    users.forEach(u => {
+      if (u && u.email) {
+        const cleanEmail = u.email.trim().toLowerCase();
+        const existing = uMap.get(cleanEmail);
+        if (!existing) {
+          uMap.set(cleanEmail, u);
+        } else {
+          // Merge keeping Active status
+          const isActive = u.status?.toLowerCase() === 'active' || existing.status?.toLowerCase() === 'active';
+          uMap.set(cleanEmail, {
+            ...existing,
+            ...u,
+            status: isActive ? 'Active' : (u.status || existing.status),
+          });
+        }
+      }
+    });
+    const uniqueUsers = Array.from(uMap.values());
+
+    return uniqueUsers.filter(u => {
       const matchesSearch = 
         u.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
         u.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
         u.department.toLowerCase().includes(searchQuery.toLowerCase());
       
       const matchesRole = roleFilter === 'ALL' || u.role === roleFilter;
-      const matchesStatus = statusFilter === 'ALL' || u.status === statusFilter;
+      const matchesStatus = statusFilter === 'ALL' || 
+        (statusFilter === 'Active' && u.status?.toLowerCase() === 'active') ||
+        (statusFilter === 'Pending_Approval' && (u.status?.toLowerCase().includes('pending'))) ||
+        (statusFilter === 'Deactivated' && u.status?.toLowerCase() === 'deactivated');
 
       return matchesSearch && matchesRole && matchesStatus;
     });
@@ -192,25 +401,78 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           </div>
         </div>
 
-        {isAdmin && (
+        <div className="flex items-center space-x-2">
           <button
-            onClick={() => {
-              setUserForm({
-                name: '',
-                email: '',
-                department: 'GM',
-                role: 'User',
-                status: 'Active',
-              });
-              setIsAddModalOpen(true);
-            }}
-            className="flex items-center space-x-1.5 px-3.5 py-2 rounded font-semibold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition cursor-pointer"
+            onClick={handleManualCloudSync}
+            disabled={isSyncingCloud}
+            title="ดึงข้อมูลผู้ใช้ล่าสุดทั้งหมดจาก Cloud Firestore"
+            className={`flex items-center space-x-1.5 px-3 py-2 rounded font-medium text-xs border transition cursor-pointer ${
+              isDark 
+                ? 'bg-[#152332] hover:bg-[#1a2c40] text-teal-300 border-teal-500/40' 
+                : 'bg-teal-50 hover:bg-teal-100 text-teal-800 border-teal-300 shadow-xs'
+            }`}
           >
-            <UserPlus className="w-4 h-4" />
-            <span>สร้างบัญชีผู้ใช้ใหม่</span>
+            <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCloud ? 'animate-spin text-teal-400' : ''}`} />
+            <span>{isSyncingCloud ? 'กำลังซิงค์...' : 'รีเฟรชผู้ใช้จาก Cloud'}</span>
           </button>
-        )}
+
+          {isAdmin && (
+            <button
+              onClick={() => {
+                setUserForm({
+                  name: '',
+                  email: '',
+                  department: 'GM',
+                  role: 'User',
+                  status: 'Active',
+                });
+                setIsAddModalOpen(true);
+              }}
+              className="flex items-center space-x-1.5 px-3.5 py-2 rounded font-semibold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition cursor-pointer"
+            >
+              <UserPlus className="w-4 h-4" />
+              <span>สร้างบัญชีผู้ใช้ใหม่</span>
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* Pending Approval Alert Callout Banner for Admin */}
+      {isAdmin && pendingUsers.length > 0 && (
+        <div className={`p-4 rounded-xl border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm ${
+          isDark 
+            ? 'bg-gradient-to-r from-amber-950/40 via-[#192534] to-[#121e2b] border-amber-500/40 text-slate-200' 
+            : 'bg-amber-50 border-amber-300 text-amber-900'
+        }`}>
+          <div className="flex items-start space-x-3">
+            <div className="p-2 rounded-lg bg-amber-500/20 text-amber-400 border border-amber-500/40 shrink-0 mt-0.5">
+              <Clock className="w-5 h-5 animate-pulse" />
+            </div>
+            <div>
+              <div className="font-bold text-sm text-amber-400 flex items-center gap-2">
+                <span>มีบัญชีผู้ใช้ใหม่รอ Verify จาก Admin ({pendingUsers.length} ท่าน)</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                  Google / @siemens.com
+                </span>
+              </div>
+              <p className="text-xs opacity-90 mt-1">
+                มีพนักงานเข้าสู่ระบบครั้งแรกด้วย Google Account หรือ Email @siemens.com ระบบได้บันทึกบัญชีไว้แล้ว รอให้ Admin ทำการ Activate User เพื่อกำหนดบทบาท (Role) และแผนกที่รับผิดชอบ (Department)
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setStatusFilter(statusFilter === 'Pending_Approval' ? 'ALL' : 'Pending_Approval')}
+            className={`shrink-0 px-3.5 py-2 rounded-lg text-xs font-bold border transition cursor-pointer flex items-center gap-1.5 ${
+              statusFilter === 'Pending_Approval'
+                ? 'bg-amber-500 text-slate-950 border-amber-400'
+                : isDark ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border-amber-500/40' : 'bg-amber-100 hover:bg-amber-200 text-amber-800 border-amber-300'
+            }`}
+          >
+            <Filter className="w-3.5 h-3.5" />
+            <span>{statusFilter === 'Pending_Approval' ? 'แสดงผู้ใช้ทั้งหมด' : `กรองเฉพาะรออนุมัติ (${pendingUsers.length})`}</span>
+          </button>
+        </div>
+      )}
 
       {/* Security Policy Information Callout */}
       <div className={`p-3.5 rounded border text-xs flex items-start space-x-3 ${
@@ -398,83 +660,155 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                       {/* Department */}
                       <td className="p-3 border-r border-inherit">
                         {isAdmin && !isMe ? (
-                          <select
-                            value={u.department}
-                            onChange={e => handleChangeDept(u, e.target.value)}
-                            className={`p-1.5 rounded font-mono text-xs border cursor-pointer ${
-                              isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-white border-slate-300 text-slate-800'
-                            }`}
-                          >
-                            <option value="ALL">ALL (ทุกแผนก)</option>
-                            {storage.getDepartments().map(d => (
-                              <option key={d.code} value={d.code}>{d.code} - {d.name}</option>
-                            ))}
-                          </select>
+                          <div className="flex items-center space-x-1.5">
+                            <select
+                              value={u.department}
+                              onChange={e => handleChangeDept(u, e.target.value)}
+                              className={`p-1.5 rounded font-mono text-xs border cursor-pointer ${
+                                u.department === 'PENDING'
+                                  ? isDark ? 'bg-amber-500/15 border-amber-500/40 text-amber-300' : 'bg-amber-50 border-amber-300 text-amber-800'
+                                  : isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-white border-slate-300 text-slate-800'
+                              }`}
+                            >
+                              {u.department === 'PENDING' && (
+                                <option value="PENDING">PENDING (รอ Admin กำหนด)</option>
+                              )}
+                              <option value="ALL">ALL (ทุกแผนก)</option>
+                              {storage.getDepartments().map(d => (
+                                <option key={d.code} value={d.code}>{d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code}</option>
+                              ))}
+                            </select>
+                          </div>
                         ) : (
-                          <span className="font-mono font-semibold text-teal-400">{u.department}</span>
+                          <span className={`font-mono font-semibold ${
+                            u.department === 'PENDING' ? 'text-amber-400 italic' : 'text-teal-400'
+                          }`}>
+                            {u.department === 'PENDING' ? 'รอ Admin กำหนดแผนก' : u.department}
+                          </span>
                         )}
                       </td>
 
                       {/* Status */}
                       <td className="p-3 text-center border-r border-inherit">
-                        <span className={`inline-flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-medium ${
-                          u.status === 'Active'
-                            ? isDark ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                            : u.status === 'Pending_Approval'
-                              ? isDark ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30' : 'bg-amber-50 text-amber-700 border border-amber-200'
+                        {u.status?.toLowerCase().includes('pending') ? (
+                          <span className={`inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold ${
+                            isDark ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' : 'bg-amber-100 text-amber-800 border border-amber-300'
+                          }`}>
+                            <Clock className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+                            <span>รอ Verify from Admin</span>
+                          </span>
+                        ) : (
+                          <span className={`inline-flex items-center space-x-1 px-2.5 py-1 rounded text-[11px] font-medium ${
+                            u.status?.toLowerCase() === 'active'
+                              ? isDark ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                               : isDark ? 'bg-red-500/15 text-red-300 border border-red-500/30' : 'bg-red-50 text-red-700 border border-red-200'
-                        }`}>
-                          {u.status === 'Active' && <CheckCircle2 className="w-3 h-3" />}
-                          {u.status === 'Pending_Approval' && <Clock className="w-3 h-3" />}
-                          {u.status === 'Deactivated' && <XCircle className="w-3 h-3" />}
-                          <span>{u.status === 'Pending_Approval' ? 'รออนุมัติ' : u.status}</span>
-                        </span>
+                          }`}>
+                            {u.status?.toLowerCase() === 'active' ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+                            <span>{u.status?.toLowerCase() === 'active' ? 'Active' : (u.status || 'Deactivated')}</span>
+                          </span>
+                        )}
                       </td>
 
                       {/* Actions Column */}
                       <td className="p-3 text-center">
                         {isAdmin && !isMe ? (
                           <div className="flex items-center justify-center space-x-2">
-                            {/* Toggle Status Button */}
-                            <button
-                              onClick={() => handleToggleStatus(u)}
-                              title={u.status === 'Active' ? 'ระงับสิทธิ์การใช้งาน (Deactivate)' : 'เปิดใช้งาน / อนุมัติสิทธิ์ (Activate/Approve)'}
-                              className={`px-2.5 py-1 rounded text-[11px] font-medium transition cursor-pointer ${
-                                u.status === 'Active'
-                                  ? isDark ? 'bg-slate-700/40 hover:bg-red-500/20 text-slate-300 hover:text-red-300 border border-slate-600/40' : 'bg-slate-100 hover:bg-red-50 text-slate-700 hover:text-red-700 border border-slate-300'
-                                  : isDark ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40' : 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border border-emerald-300'
-                              }`}
-                            >
-                              {u.status === 'Active' ? 'Deactivate' : 'Approve / Activate'}
-                            </button>
+                            {u.status?.toLowerCase().includes('pending') ? (
+                              <>
+                                {/* Direct Activate User & Role Assignment Button */}
+                                <button
+                                  onClick={() => openActivateModal(u)}
+                                  title="Activate User เพื่อกำหนดบทบาทและแผนกที่รับผิดชอบ"
+                                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-md transition flex items-center space-x-1.5 cursor-pointer"
+                                >
+                                  <UserCheck className="w-3.5 h-3.5" />
+                                  <span>Activate User & กำหนดสิทธิ์</span>
+                                </button>
 
-                            {/* Delete Button (User: Active, Admin: Protected/Disabled) */}
-                            {!isTargetAdmin ? (
-                              <button
-                                onClick={() => setUserToDelete(u)}
-                                title="ลบบัญชีผู้ใช้งานนี้อย่างถาวร"
-                                className={`px-2.5 py-1 rounded text-[11px] font-medium transition flex items-center space-x-1 cursor-pointer ${
-                                  isDark 
-                                    ? 'bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 hover:border-red-500/50' 
-                                    : 'bg-red-50 hover:bg-red-100 text-red-700 border border-red-200'
-                                }`}
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                                <span>ลบ</span>
-                              </button>
+                                {(!isMe && u.email?.trim().toLowerCase() !== 'smo.cs.th.bts@gmail.com') && (
+                                  <button
+                                    onClick={() => setUserToDelete(u)}
+                                    title="ปฏิเสธ / ลบบัญชีที่รออนุมัตินี้"
+                                    className={`p-1.5 rounded text-xs transition flex items-center cursor-pointer ${
+                                      isDark 
+                                        ? 'bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30' 
+                                        : 'bg-red-50 hover:bg-red-100 text-red-700 border border-red-200'
+                                    }`}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </>
                             ) : (
-                              <button
-                                disabled
-                                title="บัญชี Admin ไม่สามารถลบได้โดยตรง (ต้องปรับ Role เป็น User ก่อน)"
-                                className={`px-2.5 py-1 rounded text-[11px] font-medium flex items-center space-x-1 opacity-50 cursor-not-allowed ${
-                                  isDark 
-                                    ? 'bg-slate-800 text-slate-500 border border-slate-700' 
-                                    : 'bg-slate-100 text-slate-400 border border-slate-200'
-                                }`}
-                              >
-                                <Lock className="w-3.5 h-3.5" />
-                                <span>ลบ</span>
-                              </button>
+                              <>
+                                {/* Activate / Edit Role & Dept Modal Opener */}
+                                <button
+                                  onClick={() => openActivateModal(u)}
+                                  title="ปรับบทบาทและแผนกที่รับผิดชอบ"
+                                  className={`px-2.5 py-1 rounded text-[11px] font-medium transition cursor-pointer flex items-center space-x-1 ${
+                                    isDark ? 'bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 border border-teal-500/30' : 'bg-teal-50 hover:bg-teal-100 text-teal-700 border border-teal-200'
+                                  }`}
+                                >
+                                  <UserCheck className="w-3 h-3" />
+                                  <span>กำหนดสิทธิ์/แผนก</span>
+                                </button>
+
+                                {/* Toggle / Set Status Buttons */}
+                                {u.status?.toLowerCase() === 'active' ? (
+                                  <button
+                                    onClick={() => handleChangeStatus(u, 'Deactivated')}
+                                    title="ระงับสิทธิ์การใช้งาน (Deactivate)"
+                                    className={`px-2.5 py-1 rounded text-[11px] font-medium transition cursor-pointer ${
+                                      isDark 
+                                        ? 'bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30' 
+                                        : 'bg-red-50 hover:bg-red-100 text-red-700 border border-red-200'
+                                    }`}
+                                  >
+                                    Deactivate
+                                  </button>
+                                ) : (
+                                  <button
+                                    onClick={() => handleChangeStatus(u, 'Active')}
+                                    title="เปิดใช้งานบัญชี (Activate)"
+                                    className={`px-2.5 py-1 rounded text-[11px] font-medium transition cursor-pointer ${
+                                      isDark 
+                                        ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40' 
+                                        : 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border border-emerald-300'
+                                    }`}
+                                  >
+                                    Activate
+                                  </button>
+                                )}
+
+                                {/* Delete Button */}
+                                {(!isMe && u.email?.trim().toLowerCase() !== 'smo.cs.th.bts@gmail.com') ? (
+                                  <button
+                                    onClick={() => setUserToDelete(u)}
+                                    title="ลบบัญชีผู้ใช้งานนี้อย่างถาวร"
+                                    className={`px-2.5 py-1 rounded text-[11px] font-medium transition flex items-center space-x-1 cursor-pointer ${
+                                      isDark 
+                                        ? 'bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 hover:border-red-500/50' 
+                                        : 'bg-red-50 hover:bg-red-100 text-red-700 border border-red-200'
+                                    }`}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                    <span>ลบ</span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    disabled
+                                    title={isMe ? 'ไม่สามารถลบบัญชีของตนเองได้' : 'บัญชี Admin หลักคุ้มครองการลบ'}
+                                    className={`px-2.5 py-1 rounded text-[11px] font-medium flex items-center space-x-1 opacity-50 cursor-not-allowed ${
+                                      isDark 
+                                        ? 'bg-slate-800 text-slate-500 border border-slate-700' 
+                                        : 'bg-slate-100 text-slate-400 border border-slate-200'
+                                    }`}
+                                  >
+                                    <Lock className="w-3.5 h-3.5" />
+                                    <span>ลบ</span>
+                                  </button>
+                                )}
+                              </>
                             )}
                           </div>
                         ) : (
@@ -544,8 +878,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             <div className="flex items-center justify-end space-x-2 pt-3 border-t border-inherit">
               <button
                 type="button"
+                disabled={isDeleting}
                 onClick={() => setUserToDelete(null)}
-                className={`px-3.5 py-1.5 rounded text-xs transition cursor-pointer ${
+                className={`px-3.5 py-1.5 rounded text-xs transition cursor-pointer disabled:opacity-50 ${
                   isDark ? 'bg-slate-700 hover:bg-slate-600 text-slate-200' : 'bg-slate-200 hover:bg-slate-300 text-slate-800'
                 }`}
               >
@@ -553,11 +888,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
               </button>
               <button
                 type="button"
+                disabled={isDeleting}
                 onClick={confirmDeleteUser}
-                className="px-4 py-1.5 rounded text-xs font-bold bg-red-600 hover:bg-red-700 text-white shadow transition flex items-center space-x-1.5 cursor-pointer"
+                className="px-4 py-1.5 rounded text-xs font-bold bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white shadow transition flex items-center space-x-1.5 cursor-pointer"
               >
                 <Trash2 className="w-3.5 h-3.5" />
-                <span>ยืนยันการลบบัญชี</span>
+                <span>{isDeleting ? 'กำลังลบข้อมูลจากฐานข้อมูล...' : 'ยืนยันการลบบัญชี'}</span>
               </button>
             </div>
           </div>
@@ -638,7 +974,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                   >
                     <option value="ALL">ALL (ทุกแผนก)</option>
                     {storage.getDepartments().map(d => (
-                      <option key={d.code} value={d.code}>{d.code} - {d.name}</option>
+                      <option key={d.code} value={d.code}>{d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code}</option>
                     ))}
                   </select>
                 </div>
@@ -659,6 +995,216 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                   className="px-4 py-1.5 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow cursor-pointer transition"
                 >
                   บันทึกผู้ใช้
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Activate User & Assign Role/Department Modal */}
+      {userToActivate && (
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setUserToActivate(null);
+          }}
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 backdrop-blur-xs"
+        >
+          <div className={`w-full max-w-lg rounded-xl border shadow-2xl overflow-hidden ${
+            isDark ? 'bg-[#121d2a] border-[#223548] text-white' : 'bg-white border-slate-300 text-slate-900'
+          }`}>
+            {/* Top Accent Bar */}
+            <div className="h-1 w-full bg-gradient-to-r from-[#00646e] via-[#00a3a6] to-[#00e5e5]" />
+
+            <div className={`p-4 flex items-center justify-between border-b ${
+              isDark ? 'bg-[#152332] border-[#223548]' : 'bg-slate-50 border-slate-200'
+            }`}>
+              <div className="flex items-center space-x-2.5">
+                <div className="p-2 rounded-lg bg-teal-500/15 text-teal-400 border border-teal-500/30">
+                  <UserCheck className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm">
+                    Activate User — กำหนดบทบาทและแผนกที่รับผิดชอบ
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    อนุมัติเปิดใช้งานบัญชีและมอบหมายสิทธิ์การทำงาน
+                  </p>
+                </div>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setUserToActivate(null)} 
+                title="ปิดหน้าต่าง"
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/10 transition cursor-pointer text-base font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmActivate} className="p-5 space-y-4 text-xs">
+              {/* User Identity Box */}
+              <div className={`p-3 rounded-lg border space-y-2 ${
+                isDark ? 'bg-[#0c141d] border-[#1e2f41]' : 'bg-slate-50 border-slate-200'
+              }`}>
+                <div className="flex items-center space-x-3">
+                  {userToActivate.photoURL ? (
+                    <img 
+                      src={userToActivate.photoURL} 
+                      alt={userToActivate.name} 
+                      className="w-10 h-10 rounded-full border border-teal-500/50 object-cover"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <div className="w-10 h-10 rounded-full bg-teal-500/20 text-teal-300 border border-teal-500/30 flex items-center justify-center font-bold text-sm">
+                      {userToActivate.name ? userToActivate.name.charAt(0).toUpperCase() : 'U'}
+                    </div>
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-bold text-sm truncate flex items-center gap-1.5">
+                      <span>{userToActivate.name}</span>
+                      {userToActivate.email.toLowerCase().endsWith('@siemens.com') && (
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#00646e]/30 text-[#00e5e5] border border-[#00a3a6]/40 font-mono">
+                          @siemens.com
+                        </span>
+                      )}
+                    </div>
+                    <div className="font-mono text-slate-400 text-xs truncate">
+                      {userToActivate.email}
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 font-semibold inline-flex items-center gap-1">
+                      <Clock className="w-3 h-3" /> รออนุมัติ
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Matched Employee Master Suggestion */}
+              {matchedEmpInfo && (
+                <div className={`p-3 rounded-lg border flex items-start justify-between gap-2 text-xs ${
+                  isDark ? 'bg-teal-950/20 border-teal-500/30 text-teal-200' : 'bg-teal-50 border-teal-200 text-teal-900'
+                }`}>
+                  <div className="space-y-0.5">
+                    <div className="font-bold flex items-center gap-1 text-teal-400">
+                      <span>💡 ตรวจพบในฐานข้อมูล Employee Master:</span>
+                    </div>
+                    <div className="text-[11px] opacity-90">
+                      รหัส: <strong>{matchedEmpInfo.empNo || matchedEmpInfo.gid}</strong> • ชื่อ: {matchedEmpInfo.firstName} {matchedEmpInfo.familyName} • แผนก: <strong className="text-teal-400">{matchedEmpInfo.department}</strong>
+                    </div>
+                  </div>
+                  {activateDept !== matchedEmpInfo.department && (
+                    <button
+                      type="button"
+                      onClick={() => setActivateDept(matchedEmpInfo.department)}
+                      className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-xs cursor-pointer"
+                    >
+                      ใช้แผนก {matchedEmpInfo.department}
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Role Selection */}
+              <div>
+                <label className="block text-slate-300 font-bold mb-1.5">
+                  1. กำหนดระดับบทบาท (Assign Role) *
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <div 
+                    onClick={() => setActivateRole('User')}
+                    className={`p-3 rounded-lg border cursor-pointer transition ${
+                      activateRole === 'User'
+                        ? isDark 
+                          ? 'bg-teal-500/15 border-teal-500 text-white ring-1 ring-teal-500' 
+                          : 'bg-teal-50 border-teal-500 text-teal-900 ring-1 ring-teal-500'
+                        : isDark ? 'bg-[#0f1722] border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    <div className="font-bold text-xs flex items-center gap-1.5">
+                      <UserCircle2 className="w-4 h-4 text-teal-400" />
+                      <span>User (ผู้ใช้งานทั่วไป)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1 leading-normal">
+                      เข้าถึง ดู และจัดการตารางกะ บันทึกเวลา และทำโอทีเฉพาะในแผนกที่รับผิดชอบ
+                    </p>
+                  </div>
+
+                  <div 
+                    onClick={() => setActivateRole('Admin')}
+                    className={`p-3 rounded-lg border cursor-pointer transition ${
+                      activateRole === 'Admin'
+                        ? isDark 
+                          ? 'bg-red-500/15 border-red-500 text-white ring-1 ring-red-500' 
+                          : 'bg-red-50 border-red-500 text-red-900 ring-1 ring-red-500'
+                        : isDark ? 'bg-[#0f1722] border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    <div className="font-bold text-xs flex items-center gap-1.5">
+                      <ShieldCheck className="w-4 h-4 text-red-400" />
+                      <span>Admin (ผู้ดูแลระบบ)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1 leading-normal">
+                      สิทธิ์เต็มรูปแบบ จัดการได้ทุกแผนก อนุมัติ Activate ผู้ใช้ และนำเข้าข้อมูล OT
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Department Responsibility */}
+              <div>
+                <label className="block text-slate-300 font-bold mb-1.5">
+                  2. กำหนดแผนกที่รับผิดชอบ (Department Responsibility) *
+                </label>
+                <select
+                  required
+                  value={activateDept}
+                  onChange={e => setActivateDept(e.target.value)}
+                  className={`w-full p-2.5 rounded-lg border font-mono text-xs cursor-pointer ${
+                    isDark ? 'bg-[#0f1722] border-[#294058] text-white' : 'bg-slate-50 border-slate-300 text-slate-800'
+                  }`}
+                >
+                  <option value="ALL">ALL — ทุกแผนก (All Departments)</option>
+                  {storage.getDepartments().map(d => (
+                    <option key={d.code} value={d.code}>
+                      {d.code} — {d.name && d.name !== d.code ? d.name : d.code}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  💡 หากเลือก User ผู้ใช้จะเห็นเฉพาะพนักงานและตารางกะของแผนก <strong className="text-teal-400">{activateDept}</strong> เท่านั้น
+                </p>
+              </div>
+
+              {/* Activation Status Preview */}
+              <div className={`p-3 rounded-lg border flex items-center space-x-2.5 ${
+                isDark ? 'bg-emerald-950/20 border-emerald-500/30 text-emerald-200' : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+              }`}>
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <div className="text-xs">
+                  สถานะหลังการบันทึก: <strong className="text-emerald-400">Active (เปิดใช้งานทันที)</strong> ผู้ใช้จะสามารถเข้าสู่ระบบและเริ่มใช้งานได้ทันที
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-end space-x-2.5 pt-4 border-t border-inherit">
+                <button
+                  type="button"
+                  onClick={() => setUserToActivate(null)}
+                  className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    isDark ? 'text-slate-300 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  ยกเลิก
+                </button>
+                <button
+                  type="submit"
+                  disabled={isActivating}
+                  className="px-4 py-2 rounded-lg text-xs font-bold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-md cursor-pointer transition flex items-center space-x-1.5 disabled:opacity-50"
+                >
+                  <UserCheck className="w-4 h-4" />
+                  <span>{isActivating ? 'กำลังบันทึกและเปิดใช้งาน...' : 'ยืนยันและเปิดใช้งาน (Activate User)'}</span>
                 </button>
               </div>
             </form>

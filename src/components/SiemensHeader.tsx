@@ -43,6 +43,7 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
     roster: 'Shift Roster — Monthly Schedule (ตารางกะทำงานรายเดือน)',
     'upload-shift-plan': 'Upload Shift Plan — Department Schedule (อัปโหลดตารางกะรายแผนก)',
     timesheet: 'Time Sheet — Standard Attendance Form (บันทึกเวลาทำงานรายบุคคล)',
+    statistics: 'Statistics & Analytics — Work, Leaves & Attendance (สถิติการทำงาน การลา และการมาสาย)',
     import: 'Data Import Center — Integration Hub (ศูนย์นำเข้าข้อมูลระบบ)',
     export: 'Reports & Export — PDF & Payroll (ศูนย์ส่งออกรายงาน)',
     employees: 'Employee Master — Personnel Directory (ฐานข้อมูลพนักงาน)',
@@ -112,11 +113,16 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
             ) : (
               <CloudOff className="w-3.5 h-3.5 text-amber-400" />
             )}
-            <span className="font-mono text-[11px] hidden sm:inline">
+            <span className="font-mono text-[11px] hidden sm:inline flex items-center gap-1">
               {cloudStatus?.isSyncing ? 'Syncing...' : cloudStatus?.isConnected ? 'Cloud Online' : 'Offline'}
+              {cloudStatus?.isConnected && cloudStatus.lastSync && (
+                <span className="text-[10px] opacity-80 font-normal hidden lg:inline ml-0.5">
+                  ({cloudStatus.lastSync})
+                </span>
+              )}
             </span>
             {cloudStatus?.isConnected && !cloudStatus.isSyncing && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
             )}
           </button>
 
@@ -141,18 +147,6 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
               {currentUser.role}
             </span>
             <ChevronDown className="w-3 h-3 text-slate-400" />
-          </button>
-
-          {/* Quick Reset Button */}
-          <button
-            id="btn-header-reset"
-            onClick={onResetData}
-            title="Reset Initial Sample Data (คืนค่าข้อมูลตัวอย่างเริ่มต้น)"
-            className={`p-1.5 rounded transition cursor-pointer ${
-              isDark ? 'hover:bg-[#1a2838] text-slate-400 hover:text-slate-200' : 'hover:bg-white/20 text-white/80'
-            }`}
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
