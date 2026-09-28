@@ -13,7 +13,7 @@ import {
   FileSpreadsheet,
   Check
 } from 'lucide-react';
-import { OTMergeResult, OTMergeDetail } from '../utils/otManager';
+import { OTMergeResult, OTMergeDetail, formatTimeSlot } from '../utils/otManager';
 
 interface OTDeduplicationModalProps {
   isOpen: boolean;
@@ -35,9 +35,8 @@ export const OTDeduplicationModal: React.FC<OTDeduplicationModalProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'PREVENTED_DUPLICATE' | 'NEW_ADDED' | 'UPDATED_HOURS'>('ALL');
 
-  if (!isOpen || !result) return null;
-
   const filteredDetails = useMemo(() => {
+    if (!result || !result.details) return [];
     return result.details.filter(d => {
       // Status filter
       if (statusFilter !== 'ALL' && d.status !== statusFilter) return false;
@@ -45,12 +44,12 @@ export const OTDeduplicationModal: React.FC<OTDeduplicationModalProps> = ({
       // Search query
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim();
-        const matchEmpNo = d.empNo.toLowerCase().includes(q);
-        const matchGid = d.gid.toLowerCase().includes(q);
-        const matchName = d.empName.toLowerCase().includes(q);
-        const matchDept = d.department.toLowerCase().includes(q);
-        const matchDate = d.date.toLowerCase().includes(q);
-        const matchReason = d.reason.toLowerCase().includes(q);
+        const matchEmpNo = (d.empNo || '').toLowerCase().includes(q);
+        const matchGid = (d.gid || '').toLowerCase().includes(q);
+        const matchName = (d.empName || '').toLowerCase().includes(q);
+        const matchDept = (d.department || '').toLowerCase().includes(q);
+        const matchDate = (d.date || '').toLowerCase().includes(q);
+        const matchReason = (d.reason || '').toLowerCase().includes(q);
         if (!matchEmpNo && !matchGid && !matchName && !matchDept && !matchDate && !matchReason) {
           return false;
         }
@@ -58,7 +57,9 @@ export const OTDeduplicationModal: React.FC<OTDeduplicationModalProps> = ({
 
       return true;
     });
-  }, [result.details, statusFilter, searchQuery]);
+  }, [result, statusFilter, searchQuery]);
+
+  if (!isOpen || !result) return null;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-3 sm:p-4 backdrop-blur-xs overflow-y-auto">
@@ -369,8 +370,8 @@ export const OTDeduplicationModal: React.FC<OTDeduplicationModalProps> = ({
                         </td>
 
                         {/* Time slot */}
-                        <td className="py-2 px-3 whitespace-nowrap font-mono text-[11px] text-slate-400">
-                          {item.timeSlot && item.timeSlot !== '-' ? item.timeSlot : '17:30-20:30'}
+                        <td className="py-2 px-3 whitespace-nowrap font-mono text-[11px] text-slate-300">
+                          {formatTimeSlot(item.timeSlot)}
                         </td>
 
                         {/* Reason */}

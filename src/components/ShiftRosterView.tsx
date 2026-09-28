@@ -95,6 +95,18 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isPainterActive]);
 
+  // Data version listener for instantaneous reactive updates
+  const [, setDataVersion] = useState(0);
+  useEffect(() => {
+    const handleUpdate = () => setDataVersion(v => v + 1);
+    window.addEventListener('siemens-data-updated', handleUpdate);
+    window.addEventListener('storage-changed', handleUpdate);
+    return () => {
+      window.removeEventListener('siemens-data-updated', handleUpdate);
+      window.removeEventListener('storage-changed', handleUpdate);
+    };
+  }, []);
+
   const [yearStr, monthStr] = selectedMonthYear.split('-');
   const year = parseInt(yearStr, 10);
   const month = parseInt(monthStr, 10);
@@ -202,30 +214,51 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   // Quick check if current user can edit this employee's schedule
   const canEditEmployee = (emp: Employee): boolean => {
     if (currentUser.role === 'Admin') return true;
-    if (currentUser.department === 'ALL') return true;
+    // Role User can ONLY edit employees belonging to their own assigned department
+    if (!currentUser.department || currentUser.department === 'ALL') return false;
     return currentUser.department === emp.department;
   };
 
-  // Get shift code for employee on date
+  // Fast O(1) indexed lookup map for shift plans
+  const shiftPlanLookupMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of shiftPlans) {
+      if (!p || !p.date || !p.shiftCode) continue;
+      const code = p.shiftCode;
+      if (p.empNo) {
+        const cleanEmp = p.empNo.trim().toUpperCase();
+        map.set(`${cleanEmp}_${p.date}`, code);
+        map.set(`${cleanEmp.replace(/^0+/, '')}_${p.date}`, code);
+        map.set(`${cleanEmp.padStart(4, '0')}_${p.date}`, code);
+      }
+      if (p.gid) {
+        map.set(`${p.gid.trim().toUpperCase()}_${p.date}`, code);
+      }
+    }
+    return map;
+  }, [shiftPlans]);
+
+  // Get shift code for employee on date (instant O(1))
   const getShiftForDate = (empNo: string, gid: string, dateStr: string): string => {
     const cleanEmpNo = (empNo || '').trim().toUpperCase();
     const cleanGid = (gid || '').trim().toUpperCase();
-    const plan = shiftPlans.find(p => {
-      if (p.date !== dateStr) return false;
-      const pEmpNo = (p.empNo || '').trim().toUpperCase();
-      const pGid = (p.gid || '').trim().toUpperCase();
-      if (cleanEmpNo && pEmpNo && cleanEmpNo === pEmpNo) return true;
-      if (cleanGid && pGid && cleanGid === pGid) return true;
-      return false;
-    });
-    if (plan) return plan.shiftCode;
+    
+    let code: string | undefined;
+    if (cleanEmpNo) {
+      code = shiftPlanLookupMap.get(`${cleanEmpNo}_${dateStr}`);
+    }
+    if (!code && cleanGid) {
+      code = shiftPlanLookupMap.get(`${cleanGid}_${dateStr}`);
+    }
+    if (code) return code;
+
     // Fallback: Day shift for weekday, OFF for weekend
     const dow = new Date(dateStr).getDay();
     return dow === 0 || dow === 6 ? 'OFF' : 'D';
   };
 
-  // Batch or single shift apply logic
-  const handleApplyShift = (
+  // Batch or single shift apply logic with immediate cloud sync
+  const handleApplyShift = async (
     emp: Employee,
     startDateStr: string,
     newCode: string,
@@ -266,41 +299,50 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
       }
     }
 
+    // Immediately close modal synchronously so UI does not wait or freeze
+    setPickerModal({
+      isOpen: false,
+      employee: null,
+      dateStr: '',
+      currentShiftCode: '',
+    });
+
     const currentPlans = storage.getShiftPlans();
     const cleanEmpNo = (emp.empNo || '').trim().toUpperCase();
     const cleanGid = (emp.gid || '').trim().toUpperCase();
+    const cleanDigits = cleanEmpNo.replace(/\D/g, '').replace(/^0+/, '');
+    const nowIso = new Date().toISOString();
 
-    targetDates.forEach(dStr => {
-      const existingIndex = currentPlans.findIndex(p => {
-        if (p.date !== dStr) return false;
-        const pEmpNo = (p.empNo || '').trim().toUpperCase();
-        const pGid = (p.gid || '').trim().toUpperCase();
-        if (cleanEmpNo && pEmpNo && cleanEmpNo === pEmpNo) return true;
-        if (cleanGid && pGid && cleanGid === pGid) return true;
-        return false;
-      });
-
-      if (existingIndex >= 0) {
-        currentPlans[existingIndex].shiftCode = newCode;
-        currentPlans[existingIndex].updatedBy = currentUser.email;
-        currentPlans[existingIndex].updatedAt = new Date().toISOString();
-      } else {
-        currentPlans.push({
-          id: `plan-${emp.empNo}-${dStr}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-          empNo: emp.empNo,
-          gid: emp.gid,
-          date: dStr,
-          shiftCode: newCode,
-          department: emp.department,
-          updatedBy: currentUser.email,
-          updatedAt: new Date().toISOString(),
-        });
-      }
+    // 1. Remove all existing/conflicting entries for this employee on target dates
+    const targetDateSet = new Set(targetDates);
+    const updatedPlans = currentPlans.filter(p => {
+      if (!targetDateSet.has(p.date)) return true;
+      const pEmpNo = (p.empNo || '').trim().toUpperCase();
+      const pGid = (p.gid || '').trim().toUpperCase();
+      const pDigits = pEmpNo.replace(/\D/g, '').replace(/^0+/, '');
+      const isMatch = (
+        (cleanEmpNo && pEmpNo && cleanEmpNo === pEmpNo) ||
+        (cleanGid && pGid && cleanGid === pGid) ||
+        (cleanDigits && pDigits && cleanDigits === pDigits)
+      );
+      return !isMatch;
     });
 
-    storage.setShiftPlans(currentPlans);
+    // 2. Add freshly updated plans with authoritative timestamp
+    targetDates.forEach(dStr => {
+      updatedPlans.push({
+        id: `plan-${emp.empNo}-${dStr}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        empNo: emp.empNo,
+        gid: emp.gid,
+        date: dStr,
+        shiftCode: newCode,
+        department: emp.department,
+        updatedBy: currentUser.email,
+        updatedAt: nowIso,
+      });
+    });
 
-    const shiftInfo = shiftMap.get(newCode) || resolveShiftInfo(newCode, shiftMap);
+    const shiftInfo = resolveShiftInfo(newCode, shiftCodes, emp);
     const tagInfo = parseShiftCodeTags(newCode);
     const allowanceDesc = [
       tagInfo.hasStandbyTag ? 'Standby +300฿' : '',
@@ -310,18 +352,20 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     const rangeName = rangeType === 'single' ? '1 วัน' : rangeType === 'weekday' ? 'ทั้งสัปดาห์ (จ.-ศ.)' : rangeType === 'next7' ? '7 วัน' : 'ถึงสิ้นเดือน';
     showToast(`เปลี่ยนกะ ${newCode} (${shiftInfo?.name || ''}${allowanceDesc ? ` [${allowanceDesc}]` : ''}) ให้ ${emp.firstName} ${rangeName} เรียบร้อยแล้ว`);
 
-    // Close modal if open
-    setPickerModal({
-      isOpen: false,
-      employee: null,
-      dateStr: '',
-      currentShiftCode: '',
-    });
+    // 3. Save to local storage and sync to Firebase Cloud in background
+    try {
+      await storage.setShiftPlans(updatedPlans);
+    } catch (err) {
+      console.warn('Shift plan sync warning:', err);
+    }
   };
 
   // Handle cell click: painter vs modal
   const handleCellClick = (emp: Employee, d: { dateStr: string; day: number }) => {
-    if (!canEditEmployee(emp)) return;
+    if (!canEditEmployee(emp)) {
+      showToast(`สิทธิ์แก้ไขเฉพาะแผนก ${currentUser.department} เท่านั้น (พนักงานสังกัด ${emp.department} - View Only)`);
+      return;
+    }
 
     if (isPainterActive) {
       // Build effective code with painter tags
@@ -850,7 +894,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                           {daysArray.map(d => {
                             const code = getShiftForDate(emp.empNo, emp.gid, d.dateStr);
                             const tagInfo = parseShiftCodeTags(code);
-                            const shiftInfo = shiftMap.get(code) || resolveShiftInfo(code, shiftMap);
+                            const shiftInfo = resolveShiftInfo(code, shiftCodes, emp);
                             if (shiftInfo?.isWorkingDay) {
                               workingDaysCount++;
                             }
@@ -915,15 +959,18 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
       {/* Smart Shift Picker Modal with Instant Search, Favorites, Categories & Batch Range */}
       <ShiftPickerModal
         isOpen={pickerModal.isOpen}
-        onClose={() => setPickerModal(prev => ({ ...prev, isOpen: false }))}
+        onClose={() => setPickerModal({ isOpen: false, employee: null, dateStr: '', currentShiftCode: '' })}
         employee={pickerModal.employee}
         dateStr={pickerModal.dateStr}
         currentShiftCode={pickerModal.currentShiftCode}
         shiftCodes={shiftCodes}
         theme={theme}
         onApplyShift={(newCode, rangeType) => {
-          if (pickerModal.employee) {
-            handleApplyShift(pickerModal.employee, pickerModal.dateStr, newCode, rangeType);
+          const emp = pickerModal.employee;
+          const dStr = pickerModal.dateStr;
+          setPickerModal({ isOpen: false, employee: null, dateStr: '', currentShiftCode: '' });
+          if (emp) {
+            handleApplyShift(emp, dStr, newCode, rangeType);
           }
         }}
       />

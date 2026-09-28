@@ -218,20 +218,28 @@ export const ManageMyAccountView: React.FC<ManageMyAccountViewProps> = ({
             </div>
 
             <div>
-              <label className={`block text-xs font-semibold mb-1.5 flex items-center gap-1.5 ${
-                isDark ? 'text-slate-300' : 'text-slate-600'
-              }`}>
-                <Building2 className="w-3.5 h-3.5 text-teal-400" />
-                <span>แผนกที่สังกัด (Department) *</span>
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className={`text-xs font-semibold flex items-center gap-1.5 ${
+                  isDark ? 'text-slate-300' : 'text-slate-600'
+                }`}>
+                  <Building2 className="w-3.5 h-3.5 text-teal-400" />
+                  <span>แผนกที่สังกัด (Department) *</span>
+                </label>
+                {currentUser.role !== 'Admin' && (
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                    กำหนดโดย Admin
+                  </span>
+                )}
+              </div>
               <select
                 value={department}
                 onChange={e => setDepartment(e.target.value)}
+                disabled={currentUser.role !== 'Admin'}
                 className={`w-full p-2.5 rounded border text-xs font-medium font-mono transition ${
                   isDark 
                     ? 'bg-[#0b1219] border-[#243648] text-slate-100 focus:border-[#00e5e5] focus:outline-none' 
                     : 'bg-slate-50 border-slate-300 text-slate-800 focus:border-teal-500 focus:outline-none'
-                }`}
+                } ${currentUser.role !== 'Admin' ? 'opacity-80 cursor-not-allowed' : ''}`}
               >
                 {storage.getDepartments().map(d => (
                   <option key={d.code} value={d.code} className={isDark ? 'bg-[#0f1822] text-white' : 'bg-white text-slate-800'}>
@@ -246,7 +254,9 @@ export const ManageMyAccountView: React.FC<ManageMyAccountViewProps> = ({
             }`}>
               <Info className="w-4 h-4 text-teal-400 shrink-0 mt-0.5" />
               <span>
-                การเปลี่ยนแผนกจะมีผลต่อตัวกรองข้อมูลและสิทธิ์การเข้าถึงข้อมูลรายงานตารางกะรายแผนกของคุณ
+                {currentUser.role === 'Admin'
+                  ? 'Admin: สามารถปรับเปลี่ยนสังกัดแผนกของตนเองหรือสลับดูข้อมูลได้'
+                  : 'Role User: สังกัดแผนกถูกกำหนดโดย Admin เพื่อความถูกต้องของสิทธิ์การจัดตารางกะ (หากต้องการปรับปรุงสังกัดแผนก กรุณาติดต่อ Admin)'}
               </span>
             </div>
 

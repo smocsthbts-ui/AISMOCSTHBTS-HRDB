@@ -10,7 +10,8 @@ import {
   UserAccount 
 } from '../types';
 import { 
-  buildTimeSheetForEmployee 
+  buildTimeSheetForEmployee,
+  cleanIdentifier
 } from '../utils/timeCalc';
 import { 
   storage 
@@ -30,7 +31,9 @@ import {
   Building2,
   Users,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Clock,
+  ShieldCheck
 } from 'lucide-react';
 import { MonthYearFilter } from './MonthYearFilter';
 
@@ -66,7 +69,13 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
   const isDark = theme === 'dark';
 
   // Section / Department filter state
-  const [activeDepartment, setActiveDepartment] = useState<string>(selectedDepartment || 'ALL');
+  const [activeDepartment, setActiveDepartment] = useState<string>(() => {
+    if (currentUser.role === 'User' && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
+      return currentUser.department;
+    }
+    if (selectedDepartment && selectedDepartment !== 'ALL') return selectedDepartment;
+    return selectedDepartment || 'ALL';
+  });
 
   // Synchronize when parent's selectedDepartment changes
   React.useEffect(() => {
@@ -74,6 +83,14 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
       setActiveDepartment(selectedDepartment);
     }
   }, [selectedDepartment]);
+
+  // Synchronize with currentUser department if User role
+  React.useEffect(() => {
+    if (currentUser.role === 'User' && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
+      setActiveDepartment(currentUser.department);
+      onSelectDepartment?.(currentUser.department);
+    }
+  }, [currentUser]);
 
   // Department options with employee counts
   const departmentOptions = useMemo(() => {
@@ -91,17 +108,6 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
         name: d.name,
         count: counts[d.code] || 0,
       });
-    });
-
-    // Any departments in employees not already in predefined list
-    Object.keys(counts).forEach(code => {
-      if (!list.some(d => d.code === code)) {
-        list.push({
-          code,
-          name: `${code} Department`,
-          count: counts[code] || 0,
-        });
-      }
     });
 
     return {
@@ -170,14 +176,30 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
     setSelectedEmpNo(selectableEmployees[nextIndex].empNo);
   };
 
-  // Check editing permission
+  // Check editing permission: Strictly restricted to Admin role
   const canEdit = useMemo(() => {
-    if (currentUser.role === 'Admin') return true;
-    return currentUser.department === activeEmployee?.department;
-  }, [currentUser, activeEmployee]);
+    return currentUser.role === 'Admin';
+  }, [currentUser]);
+
+  // State to force re-render on storage or cloud sync updates
+  const [dataVersion, setDataVersion] = useState(0);
+
+  React.useEffect(() => {
+    const handleSync = () => setDataVersion(v => v + 1);
+    window.addEventListener('siemens-data-updated', handleSync);
+    window.addEventListener('storage-changed', handleSync);
+    window.addEventListener('firestore-sync-completed', handleSync);
+    return () => {
+      window.removeEventListener('siemens-data-updated', handleSync);
+      window.removeEventListener('storage-changed', handleSync);
+      window.removeEventListener('firestore-sync-completed', handleSync);
+    };
+  }, []);
 
   // Load manual overrides
-  const manualOverrides = storage.getManualOverrides();
+  const manualOverrides = useMemo(() => {
+    return storage.getManualOverrides();
+  }, [dataVersion]);
 
   // Compute timesheet summary and rows for active employee
   const timesheetSummary = useMemo(() => {
@@ -192,11 +214,22 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
       otherAllowances,
       manualOverrides
     );
-  }, [activeEmployee, selectedMonthYear, shiftCodes, shiftPlans, biometricPunches, otRecords, otherAllowances, manualOverrides]);
+  }, [activeEmployee, selectedMonthYear, shiftCodes, shiftPlans, biometricPunches, otRecords, otherAllowances, manualOverrides, dataVersion]);
 
   // Modal state for editing a specific row
   const [editingRow, setEditingRow] = useState<TimeSheetRow | null>(null);
   const [editForm, setEditForm] = useState<Partial<TimeSheetRow>>({});
+
+  // Escape key handler to close modal
+  React.useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && editingRow) {
+        setEditingRow(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [editingRow]);
 
   const handleOpenEdit = (row: TimeSheetRow) => {
     if (!canEdit) return;
@@ -216,13 +249,16 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
   };
 
   const handleSaveEdit = () => {
-    if (!editingRow || !activeEmployee) return;
+    if (!canEdit || !editingRow || !activeEmployee) return;
 
-    const key = `${activeEmployee.empNo}_${editingRow.date}`;
-    const overrides = { ...manualOverrides };
+    const cleanEmp = cleanIdentifier(activeEmployee.empNo);
+    const cleanGid = cleanIdentifier(activeEmployee.gid);
+    const empKey = `${cleanEmp}_${editingRow.date}`;
+    const gidKey = cleanGid ? `${cleanGid}_${editingRow.date}` : null;
+    const overrides = storage.getManualOverrides();
 
     // Calculate diff if in and out provided
-    let customDiff = editingRow.diff1;
+    let customDiff = editForm.diff1 !== undefined ? editForm.diff1 : editingRow.diff1;
     if (editForm.realTime1In && editForm.realTime1Out) {
       const [h1, m1] = editForm.realTime1In.split(':').map(Number);
       const [h2, m2] = editForm.realTime1Out.split(':').map(Number);
@@ -233,24 +269,40 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
         const mm = String(diffMin % 60).padStart(2, '0');
         customDiff = `${hh}:${mm}`;
       }
+    } else if (editForm.realTime1In === '' && editForm.realTime1Out === '') {
+      customDiff = '';
     }
 
-    overrides[key] = {
-      ...overrides[key],
+    const updatedOverride = {
+      ...(overrides[empKey] || {}),
       ...editForm,
       diff1: customDiff,
     };
 
+    overrides[empKey] = updatedOverride;
+    if (gidKey) {
+      overrides[gidKey] = updatedOverride;
+    }
+
     storage.setManualOverrides(overrides);
+    setDataVersion(v => v + 1);
     setEditingRow(null);
   };
 
   const handleResetRow = (dateStr: string) => {
-    if (!activeEmployee) return;
-    const key = `${activeEmployee.empNo}_${dateStr}`;
-    const overrides = { ...manualOverrides };
-    delete overrides[key];
+    if (!canEdit || !activeEmployee) return;
+    const cleanEmp = cleanIdentifier(activeEmployee.empNo);
+    const cleanGid = cleanIdentifier(activeEmployee.gid);
+    const empKey = `${cleanEmp}_${dateStr}`;
+    const gidKey = cleanGid ? `${cleanGid}_${dateStr}` : null;
+
+    const overrides = storage.getManualOverrides();
+    delete overrides[empKey];
+    if (gidKey) {
+      delete overrides[gidKey];
+    }
     storage.setManualOverrides(overrides);
+    setDataVersion(v => v + 1);
     setEditingRow(null);
   };
 
@@ -377,12 +429,12 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
             {canEdit ? (
               <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1 whitespace-nowrap font-medium">
                 <Edit3 className="w-3 h-3 text-emerald-400" />
-                <span className="hidden 2xl:inline">พร้อมแก้ไข</span>
+                <span className="hidden xl:inline">Admin: สิทธิ์แก้ไข</span>
               </span>
             ) : (
-              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 whitespace-nowrap font-medium">
-                <Lock className="w-3 h-3" />
-                <span className="hidden 2xl:inline">View Only</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 whitespace-nowrap font-medium" title="Role User: สิทธิ์เรียกดู (View), กรอง (Filter) และส่งออกเอกสาร (Export) เท่านั้น">
+                <Lock className="w-3 h-3 text-amber-400" />
+                <span className="hidden xl:inline">Role User: View & Export Only</span>
               </span>
             )}
           </div>
@@ -466,6 +518,45 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
             <span className="font-mono font-semibold">{activeEmployee.costCenter || 'C93056'}</span>
           </div>
         </div>
+        
+        {/* Quick Month Summary Banner for Multi-User Verification prior to Print */}
+        <div className={`my-2 px-3 py-2 rounded border flex flex-wrap items-center justify-between gap-2 text-xs ${
+          isDark ? 'bg-[#0e1722] border-[#1e3042]' : 'bg-teal-50/70 border-teal-200'
+        }`}>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-bold flex items-center gap-1.5 text-teal-400">
+              <Clock className="w-3.5 h-3.5 text-[#00e5e5]" />
+              ตรวจสอบ OT ประจำงวด {selectedMonthYear}:
+            </span>
+            <span className={`px-2 py-0.5 rounded font-mono font-semibold ${
+              timesheetSummary.totalOT1_5 > 0 
+                ? 'bg-teal-500/20 text-[#00e5e5] border border-teal-500/40' 
+                : 'bg-slate-700/30 text-slate-400'
+            }`}>
+              OT 1.5: {timesheetSummary.totalOT1_5} ชม.
+            </span>
+            <span className={`px-2 py-0.5 rounded font-mono font-semibold ${
+              timesheetSummary.totalOT3_0 > 0 
+                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' 
+                : 'bg-slate-700/30 text-slate-400'
+            }`}>
+              OT 3.0: {timesheetSummary.totalOT3_0} ชม.
+            </span>
+            <span className="text-slate-400 text-[11px]">
+              (รวม OT ทั้งหมด: <strong className="text-white font-mono">{Number((timesheetSummary.totalOT1_5 + timesheetSummary.totalOT3_0).toFixed(1))}</strong> ชม.)
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3 text-[11px] text-slate-400">
+            <span className="flex items-center gap-1 text-emerald-400 font-medium">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              Cloud Synced
+            </span>
+            <span>Standby: <strong className="text-amber-300 font-mono">{timesheetSummary.totalStandby}</strong> บ.</span>
+            <span>Emergency: <strong className="text-rose-300 font-mono">{timesheetSummary.totalEmergency}</strong> บ.</span>
+            <span>วันทำงาน: <strong className="text-emerald-300 font-mono">{timesheetSummary.totalWorkDays}</strong> วัน</span>
+          </div>
+        </div>
 
         {/* 3. Main Data Table (Faithful column headers) */}
         <div className="overflow-x-auto border border-slate-700/60 rounded">
@@ -547,12 +638,12 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
                     {/* Diff I */}
                     <td className="p-1 font-mono font-semibold text-teal-400 border-r border-slate-700/40">
-                      {row.diff1}
+                      {(row.realTime1In || row.realTime1Out) ? row.diff1 : ''}
                     </td>
 
                     {/* Late */}
                     <td className={`p-1 font-mono border-r border-slate-700/40 ${isLate ? 'text-red-400 font-bold bg-red-500/10' : ''}`}>
-                      {row.late !== '00:00' ? row.late : ''}
+                      {(row.realTime1In || row.realTime1Out) && row.late !== '00:00' ? row.late : ''}
                     </td>
 
                     {/* Real Time II - In */}
@@ -567,7 +658,7 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
                     {/* Diff II */}
                     <td className="p-1 font-mono border-r border-slate-700/40">
-                      {row.diff2}
+                      {(row.realTime2In || row.realTime2Out) ? row.diff2 : ''}
                     </td>
 
                     {/* Working Hours Total */}
@@ -704,7 +795,12 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
       {/* Manual Edit Modal */}
       {editingRow && (
-        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 backdrop-blur-xs">
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setEditingRow(null);
+          }}
+          className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in duration-150"
+        >
           <div className={`w-full max-w-lg rounded-lg border shadow-2xl p-5 ${
             isDark ? 'bg-[#152230] border-[#294058] text-white' : 'bg-white border-slate-300 text-slate-900'
           }`}>

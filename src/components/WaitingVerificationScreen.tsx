@@ -100,17 +100,17 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
     };
 
     // 1. Direct listener on individual user_accounts doc
-    const unsubUserDoc = onSnapshot(doc(db, 'user_accounts', docKey), (snap) => {
+    const unsubUserDoc = !firestoreSync.isQuotaExceeded() ? onSnapshot(doc(db, 'user_accounts', docKey), (snap) => {
       if (snap.exists()) {
         const data = snap.data() as UserAccount;
         if (data && data.status === 'Active') {
           handleActivated({ ...currentUser, ...data, status: 'Active' });
         }
       }
-    }, err => console.warn('user_accounts snapshot error:', err));
+    }, err => console.warn('user_accounts snapshot error:', err)) : () => {};
 
     // 2. Direct listener on app_bundles/users doc
-    const unsubBundle = onSnapshot(doc(db, 'app_bundles', 'users'), (snap) => {
+    const unsubBundle = !firestoreSync.isQuotaExceeded() ? onSnapshot(doc(db, 'app_bundles', 'users'), (snap) => {
       if (snap.exists()) {
         const list: UserAccount[] = snap.data()?.data || [];
         const found = list.find(u => u && (u.email?.trim().toLowerCase() === cleanEmail || u.id === currentUser.id));
@@ -118,7 +118,7 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
           handleActivated({ ...currentUser, ...found, status: 'Active' });
         }
       }
-    }, err => console.warn('app_bundles/users snapshot error:', err));
+    }, err => console.warn('app_bundles/users snapshot error:', err)) : () => {};
 
     // 3. Fast fallback interval (every 3s)
     const interval = setInterval(() => {

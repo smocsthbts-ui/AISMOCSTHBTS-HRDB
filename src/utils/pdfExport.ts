@@ -2,14 +2,26 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { TimeSheetSummary } from '../types';
 
+export interface PDFExportProgress {
+  current: number;
+  total: number;
+  percent: number;
+  currentEmpName: string;
+  department: string;
+  status: 'processing' | 'saving' | 'completed' | 'cancelled' | 'error';
+}
+
 /**
- * Generate official Siemens-standard TimeSheet PDF
+ * Generate official Siemens-standard TimeSheet PDF with async chunking & progress tracking.
+ * Yields back to the browser event loop between pages to prevent UI freezing / "Page unresponsive" dialogs.
  */
-export function exportTimeSheetsToPDF(
+export async function exportTimeSheetsToPDF(
   summaries: TimeSheetSummary[],
-  titlePrefix = 'Siemens_TimeSheet'
-) {
-  if (!summaries || summaries.length === 0) return;
+  titlePrefix = 'Siemens_TimeSheet',
+  onProgress?: (progress: PDFExportProgress) => void,
+  shouldCancel?: () => boolean
+): Promise<boolean> {
+  if (!summaries || summaries.length === 0) return false;
 
   // Create landscape A4 document
   const doc = new jsPDF({
@@ -18,12 +30,44 @@ export function exportTimeSheetsToPDF(
     format: 'a4',
   });
 
-  summaries.forEach((summary, pageIndex) => {
+  const total = summaries.length;
+
+  for (let pageIndex = 0; pageIndex < total; pageIndex++) {
+    // Check for cancellation request
+    if (shouldCancel && shouldCancel()) {
+      onProgress?.({
+        current: pageIndex,
+        total,
+        percent: Math.round((pageIndex / total) * 100),
+        currentEmpName: '',
+        department: '',
+        status: 'cancelled',
+      });
+      return false;
+    }
+
+    const summary = summaries[pageIndex];
+    const { employee, monthYear, rows } = summary;
+
+    const empFullName = `${employee.firstName || ''} ${employee.familyName || ''}`.trim() || employee.empNo || 'พนักงาน';
+    const empDisplay = `${empFullName} (${employee.empNo || employee.gid})`;
+
+    // Notify progress update
+    onProgress?.({
+      current: pageIndex + 1,
+      total,
+      percent: Math.round(((pageIndex + 1) / total) * 100),
+      currentEmpName: empDisplay,
+      department: employee.department || '',
+      status: 'processing',
+    });
+
+    // Yield control to the browser so UI updates, progress bar animates, and no unresponsive freeze occurs
+    await new Promise(resolve => setTimeout(resolve, 8));
+
     if (pageIndex > 0) {
       doc.addPage('a4', 'landscape');
     }
-
-    const { employee, monthYear, rows } = summary;
 
     // Header Colors
     const siemensTeal = '#00646e';
@@ -113,26 +157,37 @@ export function exportTimeSheetsToPDF(
       ]
     ];
 
+    const formatHours = (h: number | undefined | null): string => {
+      if (!h || h === 0) return '0';
+      return Number.isInteger(h) ? String(h) : h.toFixed(1);
+    };
+
+    const formatRemark = (remark: string | undefined | null): string => {
+      if (!remark) return '';
+      const clean = remark.replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+      // Prevent long remarks from distorting A4 layout by cleanly capping length with ellipsis
+      return clean.length > 50 ? clean.substring(0, 47) + '...' : clean;
+    };
+
     const body = rows.map(r => {
-      const isWeekendOrHoliday = r.dayOfWeek === 'Sat' || r.dayOfWeek === 'Sun' || r.shiftCode === 'H' || r.shiftCode === 'OFF';
       return [
         r.dayString,
         r.shiftCode || '',
         r.shiftIn || '',
         r.realTime1In || '',
         r.realTime1Out || '',
-        r.diff1 || '',
-        r.late !== '00:00' ? r.late : '',
+        (r.realTime1In || r.realTime1Out) ? (r.diff1 || '') : '',
+        (r.realTime1In || r.realTime1Out) && r.late !== '00:00' ? r.late : '',
         r.realTime2In || '',
         r.realTime2Out || '',
-        r.diff2 || '',
-        r.totalWorkHours ? r.totalWorkHours.toFixed(0) : '0',
-        r.ot1_5 ? r.ot1_5.toFixed(0) : '0',
-        r.ot3_0 ? r.ot3_0.toFixed(0) : '0',
+        (r.realTime2In || r.realTime2Out) ? (r.diff2 || '') : '',
+        formatHours(r.totalWorkHours),
+        formatHours(r.ot1_5),
+        formatHours(r.ot3_0),
         r.standbyAllowance ? String(r.standbyAllowance) : '0',
         r.emergencyAllowance ? String(r.emergencyAllowance) : '0',
         r.codeLeave || '',
-        r.remark || ''
+        formatRemark(r.remark)
       ];
     });
 
@@ -149,9 +204,9 @@ export function exportTimeSheetsToPDF(
         '',
         '',
         '',
-        summary.totalWorkHours.toFixed(0),
-        summary.totalOT1_5.toFixed(0),
-        summary.totalOT3_0.toFixed(0),
+        formatHours(summary.totalWorkHours),
+        formatHours(summary.totalOT1_5),
+        formatHours(summary.totalOT3_0),
         summary.totalStandby ? String(summary.totalStandby) : '0',
         summary.totalEmergency ? String(summary.totalEmergency) : '0',
         summary.totalLeaveDays ? String(summary.totalLeaveDays) : '0',
@@ -165,10 +220,11 @@ export function exportTimeSheetsToPDF(
       foot,
       startY: 28,
       margin: { left: 14, right: 14 },
+      tableWidth: 269,
       theme: 'grid',
       styles: {
         fontSize: 6.5,
-        cellPadding: 0.9,
+        cellPadding: 0.8,
         lineColor: [40, 50, 60],
         lineWidth: 0.15,
         textColor: [20, 20, 20],
@@ -186,23 +242,23 @@ export function exportTimeSheetsToPDF(
         lineWidth: 0.25,
       },
       columnStyles: {
-        0: { cellWidth: 24, fontStyle: 'bold' }, // Date
+        0: { cellWidth: 22, fontStyle: 'bold' }, // Date
         1: { cellWidth: 10, halign: 'center' },  // Shift Code
         2: { cellWidth: 12, halign: 'center' },  // Shift In
         3: { cellWidth: 12, halign: 'center' },  // Real Time I In
         4: { cellWidth: 12, halign: 'center' },  // Real Time I Out
-        5: { cellWidth: 14, halign: 'center' },  // Diff I
-        6: { cellWidth: 12, halign: 'center' },  // Late
+        5: { cellWidth: 13, halign: 'center' },  // Diff I
+        6: { cellWidth: 11, halign: 'center' },  // Late
         7: { cellWidth: 12, halign: 'center' },  // Real Time II In
         8: { cellWidth: 12, halign: 'center' },  // Real Time II Out
-        9: { cellWidth: 14, halign: 'center' },  // Diff II
-        10: { cellWidth: 12, halign: 'center' }, // Total
-        11: { cellWidth: 12, halign: 'center' }, // OT 1.5
-        12: { cellWidth: 12, halign: 'center' }, // OT 3.0
+        9: { cellWidth: 13, halign: 'center' },  // Diff II
+        10: { cellWidth: 11, halign: 'center' }, // Total
+        11: { cellWidth: 11, halign: 'center' }, // OT 1.5
+        12: { cellWidth: 11, halign: 'center' }, // OT 3.0
         13: { cellWidth: 16, halign: 'center' }, // Standby
         14: { cellWidth: 16, halign: 'center' }, // Emergency
-        15: { cellWidth: 12, halign: 'center' }, // Leave
-        16: { cellWidth: 'auto', halign: 'left' } // Remark
+        15: { cellWidth: 11, halign: 'center' }, // Leave
+        16: { cellWidth: 64, halign: 'left', overflow: 'ellipsize' } // Remark (single line truncated with ... to guarantee perfect A4 layout)
       },
       didParseCell: function(data) {
         // Shading for weekends/holidays
@@ -217,22 +273,25 @@ export function exportTimeSheetsToPDF(
 
     // 4. Footer Note and Signatures
     // @ts-ignore
-    const finalY = (doc as any).lastAutoTable?.finalY || 178;
+    const finalY = (doc as any).lastAutoTable?.finalY || 172;
 
     // Remark Legend box
-    doc.setFontSize(6.5);
+    const legendY = Math.min(finalY + 1.5, 180);
+    const legendHeight = 7;
+
+    doc.setFontSize(6.2);
     doc.setDrawColor(60, 70, 80);
     doc.setLineWidth(0.2);
-    doc.rect(14, finalY + 2, 269, 8);
+    doc.rect(14, legendY, 269, legendHeight);
 
     doc.text(
       'Remark : A-Annual Leave, C-Casual Leave, S-Sick Leave, O-Other Leave / X-Forgot to use the Card, Y-Forgot to bring the Card, O-Others',
       16,
-      finalY + 7
+      legendY + 4.5
     );
 
     // Signatures
-    const sigY = finalY + 18;
+    const sigY = Math.min(legendY + legendHeight + 8, 196);
     doc.setFontSize(8);
     doc.setFont('helvetica', 'normal');
 
@@ -243,9 +302,32 @@ export function exportTimeSheetsToPDF(
     // Approver signature line
     doc.line(220, sigY, 280, sigY);
     doc.text('Approval Signature/Date', 250, sigY + 4, { align: 'center' });
+  }
+
+  // Notify saving status
+  onProgress?.({
+    current: total,
+    total,
+    percent: 100,
+    currentEmpName: 'กำลังจัดเตรียมไฟล์และเริ่มดาวน์โหลด...',
+    department: '',
+    status: 'saving',
   });
+
+  await new Promise(resolve => setTimeout(resolve, 50));
 
   // Save the PDF
   const filename = `${titlePrefix}_${summaries.length === 1 ? summaries[0].empNo : 'Batch'}_${Date.now()}.pdf`;
   doc.save(filename);
+
+  onProgress?.({
+    current: total,
+    total,
+    percent: 100,
+    currentEmpName: 'ดาวน์โหลดไฟล์เรียบร้อยแล้ว',
+    department: '',
+    status: 'completed',
+  });
+
+  return true;
 }

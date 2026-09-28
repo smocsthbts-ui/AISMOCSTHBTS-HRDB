@@ -5,7 +5,8 @@ import {
   downloadBlob, 
   generateShiftCodeTemplate, 
   generateOTApprovedTemplate, 
-  generateShiftPlanTemplate 
+  generateShiftPlanTemplate,
+  generateEmployeeMasterTemplate 
 } from '../utils/fileParser';
 import { 
   Settings, 
@@ -13,17 +14,15 @@ import {
   Database, 
   Cloud, 
   FileText, 
-  RotateCcw,
-  Trash2,
+  Users,
   AlertTriangle,
-  CheckCircle2,
-  Loader2
+  CheckCircle2
 } from 'lucide-react';
 
 interface SettingsAndTemplatesViewProps {
   currentUser: UserAccount;
   theme: 'dark' | 'light';
-  onResetData: () => void;
+  onResetData?: () => void;
   onClearDemoData?: () => Promise<void>;
   onClearAllData?: () => Promise<void>;
 }
@@ -31,13 +30,10 @@ interface SettingsAndTemplatesViewProps {
 export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> = ({
   currentUser,
   theme,
-  onResetData,
-  onClearDemoData,
-  onClearAllData,
 }) => {
   const isDark = theme === 'dark';
+  const isAdmin = currentUser.role === 'Admin';
   const [activeSubTab, setActiveSubTab] = useState<'templates' | 'backup'>('templates');
-  const [isClearing, setIsClearing] = useState(false);
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Sample Biometric Attendance .txt for download template
@@ -49,8 +45,8 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
 1442   O 260505 1630 01
 0077   I 260505 0732 01
 0077   O 260505 1640 01
-0315   I 260505 0545 01
-0315   O 260505 1415 01`;
+0094   I 260505 0545 01
+0094   O 260505 1415 01`;
 
   // Backup state to JSON
   const handleExportBackup = () => {
@@ -75,6 +71,10 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
 
   // Restore backup from JSON
   const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!isAdmin) {
+      setActionMessage({ type: 'error', text: 'สิทธิ์ไม่เพียงพอ: การกู้คืนข้อมูลสำรองสงวนไว้สำหรับ Role Admin เท่านั้น' });
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
@@ -99,48 +99,6 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
     e.target.value = '';
   };
 
-  // Clear demo transactions
-  const handleClearDemoTransactions = async () => {
-    if (!confirm('ยืนยันการล้างข้อมูล Demo (รายการสแกนบัตร, ตารางกะ, OT, และเบี้ยเลี้ยงทั้งหมด)? \nรายชื่อพนักงานและรหัสกะจะยังคงอยู่')) {
-      return;
-    }
-    setIsClearing(true);
-    setActionMessage(null);
-    try {
-      if (onClearDemoData) {
-        await onClearDemoData();
-      } else {
-        await storage.clearAllDemoData();
-      }
-      setActionMessage({ type: 'success', text: 'ล้างข้อมูล Demo และรายการเวลาทั้งหมดเรียบร้อยแล้ว!' });
-    } catch (err: any) {
-      setActionMessage({ type: 'error', text: 'เกิดข้อผิดพลาดในการล้างข้อมูล: ' + err.message });
-    } finally {
-      setIsClearing(false);
-    }
-  };
-
-  // Clear all data including employees
-  const handleClearEverything = async () => {
-    if (!confirm('คำเตือน: ยืนยันการล้างข้อมูลทั้งหมดรวมถึงรายชื่อพนักงานในระบบ? \nระบบจะกลับสู่สถานะว่างเปล่าพร้อมสำหรับการ Import ข้อมูลจริง')) {
-      return;
-    }
-    setIsClearing(true);
-    setActionMessage(null);
-    try {
-      if (onClearAllData) {
-        await onClearAllData();
-      } else {
-        await storage.clearAllData();
-      }
-      setActionMessage({ type: 'success', text: 'ล้างข้อมูลทั้งหมดในระบบเรียบร้อยแล้ว!' });
-    } catch (err: any) {
-      setActionMessage({ type: 'error', text: 'เกิดข้อผิดพลาดในการล้างข้อมูล: ' + err.message });
-    } finally {
-      setIsClearing(false);
-    }
-  };
-
   return (
     <div className={`p-4 flex flex-col space-y-4 ${isDark ? 'text-slate-200' : 'text-slate-800'}`}>
       {/* Header Banner */}
@@ -156,7 +114,9 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
               ตั้งค่าระบบ & เทมเพลตมาตรฐาน (Settings & Templates)
             </h1>
             <p className="text-xs text-slate-400">
-              ดาวน์โหลดแบบฟอร์มเทมเพลตมาตรฐาน และการสำรอง/กู้คืน/ล้างข้อมูลระบบ
+              {isAdmin 
+                ? 'ดาวน์โหลดแบบฟอร์มเทมเพลตมาตรฐาน และการสำรอง/กู้คืนฐานข้อมูล' 
+                : `Role User (${currentUser.name}): สิทธิ์ดาวน์โหลดเทมเพลต และส่งออกไฟล์สำรองข้อมูล (View & Export Only) • สิทธิ์การกู้คืนข้อมูลสงวนไว้สำหรับ Role Admin`}
             </p>
           </div>
         </div>
@@ -184,7 +144,7 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
       }`}>
         {[
           { id: 'templates', label: 'ศูนย์ดาวน์โหลดเทมเพลต (Templates Center)', icon: Download },
-          { id: 'backup', label: 'สำรองและกู้คืน / ล้างข้อมูล (Backup, Restore & Clean)', icon: Database },
+          { id: 'backup', label: 'การสำรองและกู้คืนข้อมูล (Backup & Restore)', icon: Database },
         ].map(tab => {
           const isActive = activeSubTab === tab.id;
           const Icon = tab.icon;
@@ -320,6 +280,49 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
               <span>ดาวน์โหลด Approved OT Template</span>
             </button>
           </div>
+
+          {/* Template 5: Employee Master Database with EmpCode (8 digits) */}
+          <div className={`p-4 rounded border space-y-2.5 ${
+            isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
+          }`}>
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-sm text-[#00e5e5] flex items-center gap-1.5">
+                <Users className="w-4 h-4" />
+                5. เทมเพลต Employee Master Database (EmpCode 8 หลัก)
+              </h3>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono font-bold">
+                Payroll Ready
+              </span>
+            </div>
+            <p className="text-slate-400">
+              ไฟล์เทมเพลตนำเข้า/ส่งออกข้อมูลพนักงาน พร้อมคอลัมน์ <span className="text-amber-300 font-mono font-semibold">EmpCode (ตัวเลข 8 หลัก)</span> สำหรับใช้อ้างอิงส่งฝ่าย Payroll พร้อม GID, EmpNo, แผนก, ตำแหน่ง และสถานะเข้ากะ
+            </p>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                onClick={() => {
+                  const { csvContent } = generateEmployeeMasterTemplate();
+                  downloadBlob(csvContent, 'Template_Employee_Master_Import.csv', 'text/csv;charset=utf-8;');
+                }}
+                className="py-2 px-2 rounded bg-teal-600 hover:bg-teal-500 text-white font-medium flex items-center justify-center space-x-1 cursor-pointer"
+                title="ดาวน์โหลดไฟล์ Template เปล่าพร้อมตัวอย่างสำหรับนำเข้าข้อมูลพนักงาน"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>ดาวน์โหลด Template นำเข้า</span>
+              </button>
+              <button
+                onClick={() => {
+                  const employees = storage.getEmployees();
+                  const { csvContent } = generateEmployeeMasterTemplate(employees);
+                  downloadBlob(csvContent, 'Siemens_Employee_Master_Current.csv', 'text/csv;charset=utf-8;');
+                }}
+                className="py-2 px-2 rounded bg-slate-700 hover:bg-slate-600 text-white font-medium flex items-center justify-center space-x-1 cursor-pointer"
+                title="ส่งออกข้อมูลพนักงานปัจจุบันทั้งหมดพร้อมคอลัมน์ EmpCode"
+              >
+                <Download className="w-3.5 h-3.5 text-teal-400" />
+                <span>Export พนักงานปัจจุบัน</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -348,16 +351,25 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
                 <span>ดาวน์โหลดไฟล์สำรองข้อมูล (.json)</span>
               </button>
 
-              <label className="w-full sm:w-auto cursor-pointer px-4 py-2.5 rounded font-semibold bg-slate-700 hover:bg-slate-600 text-white flex items-center justify-center space-x-1.5">
-                <Cloud className="w-4 h-4 text-teal-400" />
-                <span>กู้คืนข้อมูลจากไฟล์ (.json)</span>
-                <input
-                  type="file"
-                  accept=".json"
-                  onChange={handleImportBackup}
-                  className="hidden"
-                />
-              </label>
+              {isAdmin ? (
+                <label className="w-full sm:w-auto cursor-pointer px-4 py-2.5 rounded font-semibold bg-slate-700 hover:bg-slate-600 text-white flex items-center justify-center space-x-1.5">
+                  <Cloud className="w-4 h-4 text-teal-400" />
+                  <span>กู้คืนข้อมูลจากไฟล์ (.json)</span>
+                  <input
+                    type="file"
+                    accept=".json"
+                    onChange={handleImportBackup}
+                    className="hidden"
+                  />
+                </label>
+              ) : (
+                <div className={`text-[11px] px-3 py-2 rounded border flex items-center gap-1.5 ${
+                  isDark ? 'bg-[#0e1722] border-[#203040] text-slate-400' : 'bg-slate-100 border-slate-200 text-slate-600'
+                }`}>
+                  <AlertTriangle className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                  <span>Role User: สิทธิ์ดาวน์โหลดข้อมูลสำรอง (Export) • การกู้คืนข้อมูลสงวนไว้สำหรับ Admin</span>
+                </div>
+              )}
             </div>
           </div>
         </div>

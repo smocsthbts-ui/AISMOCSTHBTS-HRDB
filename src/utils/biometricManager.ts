@@ -1,5 +1,5 @@
 import { BiometricRawPunch, Employee, ShiftCode, DailyShiftPlan } from '../types';
-import { isEmployeeMatch, hhmmToMinutes, minutesToHHMM, resolveShiftInfo, filterDeduplicatedPunches } from './timeCalc';
+import { isEmployeeMatch, hhmmToMinutes, minutesToHHMM, resolveShiftInfo, filterDeduplicatedPunches, getPunchKey } from './timeCalc';
 
 /**
  * Normalizes an employee identifier for deduplication key
@@ -272,47 +272,43 @@ export function mergeAndDeduplicatePunches(
   incomingPunches: BiometricRawPunch[],
   mode: 'smart-merge' | 'replace-month' = 'smart-merge'
 ): PunchMergeResult {
-  const existingMap = new Map<string, BiometricRawPunch>();
-  existingPunches.forEach(p => {
-    const key = `${canonicalEmpIdentifier(p.empIdentifier)}_${p.date}_${p.time}_${p.type}`;
-    existingMap.set(key, p);
-  });
-
-  // Detect months affected by incoming punches (e.g. ['2026-08', '2026-09'])
+  // 1. Detect months affected by incoming punches (e.g. ['2026-08', '2026-09'])
   const incomingMonthsSet = new Set<string>();
   const empSet = new Set<string>();
   let earliestDate = '';
   let latestDate = '';
 
-  incomingPunches.forEach(p => {
-    if (p.date) {
-      const ym = p.date.substring(0, 7);
-      incomingMonthsSet.add(ym);
-      if (!earliestDate || p.date < earliestDate) earliestDate = p.date;
-      if (!latestDate || p.date > latestDate) latestDate = p.date;
-    }
+  (incomingPunches || []).forEach(p => {
+    if (!p || !p.empIdentifier || !p.date || typeof p.time !== 'string' || !p.time.trim()) return;
+    const ym = p.date.substring(0, 7);
+    incomingMonthsSet.add(ym);
+    if (!earliestDate || p.date < earliestDate) earliestDate = p.date;
+    if (!latestDate || p.date > latestDate) latestDate = p.date;
     empSet.add(canonicalEmpIdentifier(p.empIdentifier));
   });
 
   const detectedMonths = Array.from(incomingMonthsSet).sort();
 
-  // If mode is 'replace-month', drop all existing punches that fall into the detected months
-  if (mode === 'replace-month') {
-    for (const [key, p] of existingMap.entries()) {
-      const ym = p.date.substring(0, 7);
-      if (incomingMonthsSet.has(ym)) {
-        existingMap.delete(key);
-      }
+  // 2. Build existing map (if replace-month, immediately skip existing records belonging to incoming months in 1 pass)
+  const existingMap = new Map<string, BiometricRawPunch>();
+  (existingPunches || []).forEach(p => {
+    if (!p || !p.empIdentifier || !p.date || typeof p.time !== 'string' || !p.time.trim()) return;
+    const ym = p.date.substring(0, 7);
+    if (mode === 'replace-month' && incomingMonthsSet.has(ym)) {
+      return; // Skip existing punch belonging to replaced month
     }
-  }
+    const key = `${canonicalEmpIdentifier(p.empIdentifier)}_${p.date}_${p.time}_${p.type || 'I'}`;
+    existingMap.set(key, p);
+  });
 
   let newAddedCount = 0;
   let updatedCount = 0;
   let duplicateSkippedCount = 0;
 
-  // Process incoming punches
-  incomingPunches.forEach(p => {
-    const key = `${canonicalEmpIdentifier(p.empIdentifier)}_${p.date}_${p.time}_${p.type}`;
+  // 3. Process incoming punches
+  (incomingPunches || []).forEach(p => {
+    if (!p || !p.empIdentifier || !p.date || typeof p.time !== 'string' || !p.time.trim()) return;
+    const key = `${canonicalEmpIdentifier(p.empIdentifier)}_${p.date}_${p.time}_${p.type || 'I'}`;
     if (existingMap.has(key)) {
       // Duplicate entry found -> overwrite with the latest incoming punch
       existingMap.set(key, { ...p, id: existingMap.get(key)!.id });
@@ -324,9 +320,9 @@ export function mergeAndDeduplicatePunches(
   });
 
   const merged = Array.from(existingMap.values()).sort((a, b) => {
-    const dComp = a.date.localeCompare(b.date);
+    const dComp = (a.date || '').localeCompare(b.date || '');
     if (dComp !== 0) return dComp;
-    return a.time.localeCompare(b.time);
+    return (a.time || '').localeCompare(b.time || '');
   });
 
   return {
@@ -476,149 +472,268 @@ export function compareAttendanceVsShiftCodes(
   const shiftCodeMap = new Map<string, ShiftCode>();
   shiftCodes.forEach(sc => shiftCodeMap.set(sc.code, sc));
 
-  // Determine unique dates from punches
-  let relevantPunches = punches;
-  if (targetDateOrMonth) {
-    relevantPunches = punches.filter(p => p.date.startsWith(targetDateOrMonth));
+  // 1. Fast O(1) Employee lookup index
+  const empByIdMap = new Map<string, Employee>();
+  employees.forEach(e => {
+    if (e.empNo) {
+      empByIdMap.set(e.empNo.trim().toUpperCase(), e);
+      empByIdMap.set(canonicalEmpIdentifier(e.empNo).toUpperCase(), e);
+    }
+    if (e.gid) {
+      empByIdMap.set(e.gid.trim().toUpperCase(), e);
+      empByIdMap.set(canonicalEmpIdentifier(e.gid).toUpperCase(), e);
+    }
+  });
+
+  const getMatchedEmp = (id: string): Employee | undefined => {
+    if (!id) return undefined;
+    const clean = id.trim().toUpperCase();
+    const canon = canonicalEmpIdentifier(id).toUpperCase();
+    return empByIdMap.get(clean) || empByIdMap.get(canon);
+  };
+
+  // 2. Pre-index Shift Plans by (canonEmpKey, date) in O(1)
+  const plansByEmpAndDate = new Map<string, Map<string, DailyShiftPlan>>();
+  const allPlanDatesByEmp = new Map<string, Set<string>>();
+
+  shiftPlans.forEach(sp => {
+    if (!sp || !sp.date) return;
+    const ids = [sp.empNo, sp.gid].filter(Boolean) as string[];
+    ids.forEach(rawId => {
+      const canon = canonicalEmpIdentifier(rawId).toUpperCase();
+      if (!plansByEmpAndDate.has(canon)) {
+        plansByEmpAndDate.set(canon, new Map());
+        allPlanDatesByEmp.set(canon, new Set());
+      }
+      plansByEmpAndDate.get(canon)!.set(sp.date, sp);
+      allPlanDatesByEmp.get(canon)!.add(sp.date);
+    });
+  });
+
+  // 3. Determine relevant punches
+  let relevantPunches = (punches || []).filter(p => p && p.date && typeof p.time === 'string' && p.time.trim());
+  if (targetDateOrMonth && targetDateOrMonth.length === 7) {
+    const [yStr, mStr] = targetDateOrMonth.split('-');
+    const y = parseInt(yStr, 10);
+    const m = parseInt(mStr, 10);
+    const nextMonthObj = new Date(y, m, 1);
+    const nextMStr = `${nextMonthObj.getFullYear()}-${String(nextMonthObj.getMonth() + 1).padStart(2, '0')}`;
+    const prevMonthObj = new Date(y, m - 2, 1);
+    const prevMStr = `${prevMonthObj.getFullYear()}-${String(prevMonthObj.getMonth() + 1).padStart(2, '0')}`;
+
+    relevantPunches = relevantPunches.filter(p => 
+      p.date.startsWith(targetDateOrMonth) ||
+      (p.date.startsWith(nextMStr) && p.date <= `${nextMStr}-02`) ||
+      (p.date.startsWith(prevMStr) && p.date >= `${prevMStr}-28`)
+    );
+  } else if (targetDateOrMonth) {
+    relevantPunches = relevantPunches.filter(p => p.date === targetDateOrMonth);
   }
 
-  // Group punches by date and canonical employee
-  const punchDateEmpMap = new Map<string, BiometricRawPunch[]>();
+  // 4. Pre-index punches by (canonEmpKey, date) in O(1)
+  const punchesByEmpAndDate = new Map<string, Map<string, BiometricRawPunch[]>>();
+  const allPunchDatesByEmp = new Map<string, Set<string>>();
+  const allEmpPunchesMap = new Map<string, BiometricRawPunch[]>();
+
   relevantPunches.forEach(p => {
-    const key = `${p.date}_${canonicalEmpIdentifier(p.empIdentifier)}`;
-    if (!punchDateEmpMap.has(key)) {
-      punchDateEmpMap.set(key, []);
+    if (!p || !p.empIdentifier || !p.date) return;
+    const canon = canonicalEmpIdentifier(p.empIdentifier).toUpperCase();
+    if (!punchesByEmpAndDate.has(canon)) {
+      punchesByEmpAndDate.set(canon, new Map());
+      allPunchDatesByEmp.set(canon, new Set());
+      allEmpPunchesMap.set(canon, []);
     }
-    punchDateEmpMap.get(key)!.push(p);
+    const empDateMap = punchesByEmpAndDate.get(canon)!;
+    if (!empDateMap.has(p.date)) {
+      empDateMap.set(p.date, []);
+    }
+    empDateMap.get(p.date)!.push(p);
+    allPunchDatesByEmp.get(canon)!.add(p.date);
+    allEmpPunchesMap.get(canon)!.push(p);
   });
 
   const results: AttendanceVsShiftComparison[] = [];
 
-  // Iterate over each date & employee found in punches
-  for (const [dateEmpKey, dayPunches] of punchDateEmpMap.entries()) {
-    const [date, canonEmp] = dateEmpKey.split('_');
+  // 5. Iterate over unique employees with punches
+  for (const [canonEmp, empPunchList] of allEmpPunchesMap.entries()) {
+    const matchedEmployee = getMatchedEmp(canonEmp) || (empPunchList[0] ? getMatchedEmp(empPunchList[0].empIdentifier) : undefined);
 
-    // Find employee from Master
-    const matchedEmployee = employees.find(e => 
-      isEmployeeMatch(canonEmp, e) ||
-      isEmployeeMatch(dayPunches[0]?.empIdentifier || '', e)
-    );
-
-    const empNo = matchedEmployee?.empNo || dayPunches[0]?.empIdentifier || 'Unknown';
+    const empNo = matchedEmployee?.empNo || empPunchList[0]?.empIdentifier || canonEmp;
     const empName = matchedEmployee 
       ? `${matchedEmployee.firstName} ${matchedEmployee.familyName}`
-      : `ID: ${dayPunches[0]?.empIdentifier || canonEmp}`;
+      : `ID: ${empPunchList[0]?.empIdentifier || canonEmp}`;
     const dept = matchedEmployee?.department || 'N/A';
 
-    // Find scheduled Shift Plan for this date
-    const plan = shiftPlans.find(sp => 
-      sp.date === date && 
-      (matchedEmployee ? (sp.empNo === matchedEmployee.empNo || sp.gid === matchedEmployee.gid) : isEmployeeMatch(sp.empNo, { empNo }))
-    );
+    const empPlanDateMap = plansByEmpAndDate.get(canonEmp) 
+      || (matchedEmployee?.empNo ? plansByEmpAndDate.get(canonicalEmpIdentifier(matchedEmployee.empNo).toUpperCase()) : undefined)
+      || (matchedEmployee?.gid ? plansByEmpAndDate.get(canonicalEmpIdentifier(matchedEmployee.gid).toUpperCase()) : undefined)
+      || new Map<string, DailyShiftPlan>();
 
-    const rawShiftCode = (plan?.shiftCode || '').trim();
-    const shiftInfo = rawShiftCode ? resolveShiftInfo(rawShiftCode, shiftCodeMap) : null;
+    const empPunchDateMap = punchesByEmpAndDate.get(canonEmp) || new Map<string, BiometricRawPunch[]>();
 
-    // Sort day punches
-    const sortedPunches = [...dayPunches].sort((a, b) => a.time.localeCompare(b.time));
+    // Get all unique dates from both punches and shift plans sorted ascending
+    const empDatesSet = new Set<string>();
+    allPunchDatesByEmp.get(canonEmp)?.forEach(d => empDatesSet.add(d));
+    if (matchedEmployee?.empNo) {
+      allPlanDatesByEmp.get(canonicalEmpIdentifier(matchedEmployee.empNo).toUpperCase())?.forEach(d => empDatesSet.add(d));
+    }
+    if (matchedEmployee?.gid) {
+      allPlanDatesByEmp.get(canonicalEmpIdentifier(matchedEmployee.gid).toUpperCase())?.forEach(d => empDatesSet.add(d));
+    }
+    allPlanDatesByEmp.get(canonEmp)?.forEach(d => empDatesSet.add(d));
 
-    // Look up next day punches for night shifts / cross-midnight
-    const curDateObj = new Date(date);
-    const nextDateObj = new Date(curDateObj);
-    nextDateObj.setDate(curDateObj.getDate() + 1);
-    const nextDateStr = nextDateObj.toISOString().split('T')[0];
-    const nextDayKey = `${nextDateStr}_${canonEmp}`;
-    const nextDayPunches = punchDateEmpMap.get(nextDayKey) || [];
+    const uniqueDates = Array.from(empDatesSet).sort();
+    const consumedPunchKeys = new Set<string>();
 
-    // Intelligently resolve punches with Shift Code guidance
-    const punchRes = filterDeduplicatedPunches(dayPunches, shiftInfo, nextDayPunches);
-    const clockIn = punchRes.clockIn;
-    const clockOut = punchRes.clockOut;
-    const secondIn = punchRes.secondIn;
-    const secondOut = punchRes.secondOut;
+    for (const date of uniqueDates) {
+      // Find scheduled Shift Plan for this date in O(1)
+      const plan = empPlanDateMap.get(date);
 
-    let status: AttendanceVsShiftComparison['status'] = 'unknown';
-    let statusLabel = 'ตรวจพบเวลาสแกน';
-    let lateMinutes = 0;
+      const rawShiftCode = (plan?.shiftCode || '').trim();
+      const shiftInfo = rawShiftCode ? resolveShiftInfo(rawShiftCode, shiftCodes, matchedEmployee || plan?.department) : null;
 
-    const shiftHours = shiftInfo?.isWorkingDay 
-      ? `${shiftInfo.startTime} - ${shiftInfo.endTime}`
-      : (shiftInfo ? (shiftInfo.name || shiftInfo.description || 'วันหยุด') : 'ไม่ได้กำหนดกะ');
+      const isConsumed = (p: BiometricRawPunch) => consumedPunchKeys.has(getPunchKey(p)) || (Boolean(p.id) && consumedPunchKeys.has(p.id));
 
-    if (shiftInfo) {
-      if (!shiftInfo.isWorkingDay) {
-        // Scheduled as Day OFF / Holiday / Leave
-        const codeUpper = rawShiftCode.toUpperCase();
-        if (codeUpper.startsWith('SL')) {
-          status = 'leave';
-          statusLabel = '🩺 ลาป่วย (Sick Leave)';
-        } else if (codeUpper.startsWith('AL')) {
-          status = 'leave';
-          statusLabel = '🏖️ ลาพักร้อน (Annual Leave)';
-        } else if (codeUpper === 'OFF' || codeUpper === 'H') {
-          if (clockIn || clockOut) {
-            status = 'worked_on_off';
-            statusLabel = '💼 มีสแกนในวันหยุด (Worked on OFF/Holiday)';
-          } else {
-            status = 'off_day';
-            statusLabel = '🏝️ วันหยุด (Day OFF / Holiday)';
+      // Available punches for this day in O(1)
+      const rawDayPunches = empPunchDateMap.get(date) || [];
+      const dayPunches = rawDayPunches.filter(p => !isConsumed(p));
+      const sortedPunches = [...dayPunches].sort((a, b) => (a?.time || '').localeCompare(b?.time || ''));
+
+      // Look up next day punches for night shifts in O(1)
+      const [curY, curM, curD] = date.split('-').map(Number);
+      const nextDateObj = new Date(curY, curM - 1, curD + 1);
+      const nextDateStr = `${nextDateObj.getFullYear()}-${String(nextDateObj.getMonth() + 1).padStart(2, '0')}-${String(nextDateObj.getDate()).padStart(2, '0')}`;
+
+      const rawNextDayPunches = empPunchDateMap.get(nextDateStr) || [];
+      const nextDayPunches = rawNextDayPunches.filter(p => !isConsumed(p));
+
+      // Special protection for Day OFF following night shift:
+      if (!shiftInfo?.isWorkingDay && dayPunches.length === 1) {
+        const singlePunch = dayPunches[0];
+        const isSingleMorningOut = hhmmToMinutes(singlePunch.time) <= 600 && (singlePunch.type === 'O' || !singlePunch.type);
+        if (isSingleMorningOut) {
+          const prevDateObj = new Date(curY, curM - 1, curD - 1);
+          const prevDateStr = `${prevDateObj.getFullYear()}-${String(prevDateObj.getMonth() + 1).padStart(2, '0')}-${String(prevDateObj.getDate()).padStart(2, '0')}`;
+          const prevPlan = empPlanDateMap.get(prevDateStr);
+          const prevCode = (prevPlan?.shiftCode || '').trim().toUpperCase();
+          if (/^(N|AN)/i.test(prevCode) || /NIGHT/i.test(prevCode) || /ดึก/i.test(prevCode)) {
+            consumedPunchKeys.add(getPunchKey(singlePunch));
+            if (singlePunch.id) consumedPunchKeys.add(singlePunch.id);
+            continue;
           }
-        } else {
-          status = 'leave';
-          statusLabel = `📋 วันลา/อื่นๆ (${rawShiftCode})`;
-        }
-      } else {
-        // Working Day
-        if (!clockIn && !clockOut) {
-          status = 'no_stamp';
-          statusLabel = '🔴 ไม่มีการสแกน (No Stamp)';
-        } else if (shiftInfo.startTime && clockIn) {
-          const inMin = hhmmToMinutes(clockIn);
-          const shiftInMin = hhmmToMinutes(shiftInfo.startTime);
-          if (inMin > shiftInMin) {
-            lateMinutes = inMin - shiftInMin;
-            status = 'late';
-            statusLabel = punchRes.hasIrregularity 
-              ? `⚠️ มาสาย (${lateMinutes} นาที) [ปรับตามกะ]` 
-              : `⚠️ มาสาย (${lateMinutes} นาที)`;
-          } else {
-            status = 'on_time';
-            statusLabel = punchRes.hasIrregularity 
-              ? `✅ เข้างานตรงเวลา [ปรับตามกะ]` 
-              : `✅ เข้างานตรงเวลา (On Time)`;
-          }
-        } else {
-          status = 'on_time';
-          statusLabel = punchRes.hasIrregularity ? 'สแกนเข้างานแล้ว [ปรับตามกะ]' : 'สแกนเข้างานแล้ว';
         }
       }
-    } else {
-      status = 'unknown';
-      statusLabel = `สแกน ${dayPunches.length} ครั้ง (ไม่มี Shift Plan)`;
-    }
 
-    results.push({
-      date,
-      empNo,
-      empName,
-      department: dept,
-      scheduledShiftCode: rawShiftCode || 'N/A',
-      shiftDescription: (shiftInfo ? (shiftInfo.name || shiftInfo.description) : null) || (rawShiftCode ? `รหัส ${rawShiftCode}` : 'ไม่มีข้อมูลกะ'),
-      shiftHours,
-      isWorkingDay: shiftInfo?.isWorkingDay || false,
-      clockIn,
-      clockOut,
-      secondIn,
-      secondOut,
-      allPunchesCount: dayPunches.length,
-      punchRecords: sortedPunches,
-      status,
-      statusLabel,
-      lateMinutes,
-      resolutionType: punchRes.resolutionType,
-      resolutionDescription: punchRes.resolutionDescription,
-      hasIrregularity: punchRes.hasIrregularity,
-    });
+      // Intelligently resolve punches with Shift Code guidance
+      const punchRes = filterDeduplicatedPunches(dayPunches, shiftInfo, nextDayPunches);
+      const clockIn = punchRes.clockIn;
+      const clockOut = punchRes.clockOut;
+      const secondIn = punchRes.secondIn;
+      const secondOut = punchRes.secondOut;
+
+      // Mark used punches as consumed
+      punchRes.usedTodayPunches?.forEach(p => {
+        consumedPunchKeys.add(getPunchKey(p));
+        if (p.id) consumedPunchKeys.add(p.id);
+      });
+      punchRes.usedNextDayPunches?.forEach(p => {
+        consumedPunchKeys.add(getPunchKey(p));
+        if (p.id) consumedPunchKeys.add(p.id);
+      });
+
+      // Filter output to target month only if month filter was provided
+      if (targetDateOrMonth && targetDateOrMonth.length === 7 && !date.startsWith(targetDateOrMonth)) {
+        continue;
+      }
+
+      // If day was an OFF day with no remaining unconsumed punches, skip displaying or record as clean off_day
+      if (!shiftInfo?.isWorkingDay && !clockIn && !clockOut && dayPunches.length === 0) {
+        continue;
+      }
+
+      let status: AttendanceVsShiftComparison['status'] = 'unknown';
+      let statusLabel = 'ตรวจพบเวลาสแกน';
+      let lateMinutes = 0;
+
+      const shiftHours = shiftInfo?.isWorkingDay 
+        ? `${shiftInfo.startTime} - ${shiftInfo.endTime}`
+        : (shiftInfo ? (shiftInfo.name || shiftInfo.description || 'วันหยุด') : 'ไม่ได้กำหนดกะ');
+
+      if (shiftInfo) {
+        if (!shiftInfo.isWorkingDay) {
+          // Scheduled as Day OFF / Holiday / Leave
+          const codeUpper = rawShiftCode.toUpperCase();
+          if (codeUpper.startsWith('SL')) {
+            status = 'leave';
+            statusLabel = '🩺 ลาป่วย (Sick Leave)';
+          } else if (codeUpper.startsWith('AL')) {
+            status = 'leave';
+            statusLabel = '🏖️ ลาพักร้อน (Annual Leave)';
+          } else if (codeUpper === 'OFF' || codeUpper === 'H') {
+            if (clockIn || clockOut) {
+              status = 'worked_on_off';
+              statusLabel = '💼 มีสแกนในวันหยุด (Worked on OFF/Holiday)';
+            } else {
+              status = 'off_day';
+              statusLabel = '🏝️ วันหยุด (Day OFF / Holiday)';
+            }
+          } else {
+            status = 'leave';
+            statusLabel = `📋 วันลา/อื่นๆ (${rawShiftCode})`;
+          }
+        } else {
+          // Working Day
+          if (!clockIn && !clockOut) {
+            status = 'no_stamp';
+            statusLabel = '🔴 ไม่มีการสแกน (No Stamp)';
+          } else if (shiftInfo.startTime && clockIn) {
+            const inMin = hhmmToMinutes(clockIn);
+            const shiftInMin = hhmmToMinutes(shiftInfo.startTime);
+            if (inMin > shiftInMin) {
+              lateMinutes = inMin - shiftInMin;
+              status = 'late';
+              statusLabel = punchRes.hasIrregularity 
+                ? `⚠️ มาสาย (${lateMinutes} นาที) [ปรับตามกะ]` 
+                : `⚠️ มาสาย (${lateMinutes} นาที)`;
+            } else {
+              status = 'on_time';
+              statusLabel = punchRes.hasIrregularity 
+                ? `✅ เข้างานตรงเวลา [ปรับตามกะ]` 
+                : `✅ เข้างานตรงเวลา (On Time)`;
+            }
+          } else {
+            status = 'on_time';
+            statusLabel = punchRes.hasIrregularity ? 'สแกนเข้างานแล้ว [ปรับตามกะ]' : 'สแกนเข้างานแล้ว';
+          }
+        }
+      } else {
+        status = 'unknown';
+        statusLabel = `สแกน ${dayPunches.length} ครั้ง (ไม่มี Shift Plan)`;
+      }
+
+      results.push({
+        date,
+        empNo,
+        empName,
+        department: dept,
+        scheduledShiftCode: rawShiftCode || 'N/A',
+        shiftDescription: (shiftInfo ? (shiftInfo.name || shiftInfo.description) : null) || (rawShiftCode ? `รหัส ${rawShiftCode}` : 'ไม่มีข้อมูลกะ'),
+        shiftHours,
+        isWorkingDay: shiftInfo?.isWorkingDay || false,
+        clockIn,
+        clockOut,
+        secondIn,
+        secondOut,
+        allPunchesCount: dayPunches.length,
+        punchRecords: sortedPunches,
+        status,
+        statusLabel,
+        lateMinutes,
+        resolutionType: punchRes.resolutionType,
+        resolutionDescription: punchRes.resolutionDescription,
+        hasIrregularity: punchRes.hasIrregularity,
+      });
+    }
   }
 
   // Sort by date then empNo

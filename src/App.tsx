@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useTransition } from 'react';
 import { 
   UserAccount, 
   Employee, 
@@ -10,7 +10,7 @@ import {
   Department
 } from './types';
 import { storage } from './utils/storage';
-import { auth, onAuthStateChanged, logOut, firestoreSync, db, cleanDocId, subscribeToUserChanges } from './firebase';
+import { auth, onAuthStateChanged, logOut, firestoreSync, db, cleanDocId, subscribeToUserChanges, subscribeToCurrentUser, subscribeToCloudChanges } from './firebase';
 import { doc, getDoc } from 'firebase/firestore';
 import { SiemensSidebar } from './components/SiemensSidebar';
 import { SiemensHeader } from './components/SiemensHeader';
@@ -26,6 +26,20 @@ import { SettingsAndTemplatesView } from './components/SettingsAndTemplatesView'
 import { AuthModal } from './components/AuthModal';
 import { ManageMyAccountView } from './components/ManageMyAccountView';
 import { WaitingVerificationScreen } from './components/WaitingVerificationScreen';
+import { ErrorBoundary } from './components/ErrorBoundary';
+
+const TAB_TITLES: Record<string, { en: string; th: string }> = {
+  'roster': { en: 'Shift Roster', th: 'ตารางกะการทำงาน' },
+  'upload-shift-plan': { en: 'Upload Shift Plan', th: 'อัปโหลดตารางกะรายแผนก' },
+  'timesheet': { en: 'Time Sheet', th: 'บันทึกเวลาทำงานรายบุคคล' },
+  'statistics': { en: 'Statistics', th: 'สถิติการทำงานและการลา' },
+  'import': { en: 'Data Import Center', th: 'ศูนย์นำเข้าข้อมูลรวม' },
+  'export': { en: 'Reports & Export', th: 'ส่งออกรายงาน Time Sheet & Payroll' },
+  'employees': { en: 'Employee Master', th: 'ฐานข้อมูลพนักงานประจำแผนก' },
+  'users': { en: 'User Accounts', th: 'จัดการสิทธิ์ผู้ใช้งาน' },
+  'manage_account': { en: 'Manage My Account', th: 'จัดการบัญชีของฉัน' },
+  'settings': { en: 'Settings & Cloud', th: 'ตั้งค่าระบบและ Cloud' },
+};
 
 export default function App() {
   // Theme: Dark mode by default as requested by Siemens IX Industrial guidelines
@@ -45,8 +59,36 @@ export default function App() {
   });
   const [selectedDepartment, setSelectedDepartment] = useState<string>('ALL');
 
-  // Navigation tab
+  // Navigation tab & smooth transition
   const [activeTab, setActiveTab] = useState<string>('roster');
+  const [isPending, startTransition] = useTransition();
+  const [navigatingTab, setNavigatingTab] = useState<string | null>(null);
+  const [navigationProgress, setNavigationProgress] = useState<number>(0);
+  const [importInitialTab, setImportInitialTab] = useState<'shift-plan' | 'shift-code' | 'attendance' | 'ot' | 'allowances'>('shift-plan');
+
+  // Smooth, non-blocking page transition handler
+  const handleSelectTab = useCallback((tab: string) => {
+    if (tab === activeTab) return;
+    setNavigatingTab(tab);
+    setNavigationProgress(30);
+
+    const timer = setTimeout(() => {
+      setNavigationProgress(75);
+    }, 60);
+
+    // Yield control to browser so loading state repaints immediately
+    requestAnimationFrame(() => {
+      startTransition(() => {
+        setActiveTab(tab);
+        setNavigationProgress(100);
+        setTimeout(() => {
+          clearTimeout(timer);
+          setNavigatingTab(null);
+          setNavigationProgress(0);
+        }, 180);
+      });
+    });
+  }, [activeTab]);
 
   // Sidebar collapsed state
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
@@ -71,10 +113,12 @@ export default function App() {
     isConnected: boolean;
     isSyncing: boolean;
     lastSync: string | null;
+    isQuotaExceeded?: boolean;
   }>({
     isConnected: false,
     isSyncing: true,
     lastSync: null,
+    isQuotaExceeded: firestoreSync.isQuotaExceeded(),
   });
 
   // Load data from storage
@@ -92,6 +136,14 @@ export default function App() {
   // Initial load and Cloud Sync
   useEffect(() => {
     reloadData();
+
+    // Auto-purge any legacy demo datasets from LocalStorage and Cloud Firestore on startup
+    if (typeof window !== 'undefined' && !localStorage.getItem('sys_demo_dataset_purged_v3')) {
+      storage.purgeAllDemoDataset().then(() => {
+        try { localStorage.setItem('sys_demo_dataset_purged_v3', 'true'); } catch {}
+        reloadData();
+      }).catch(() => null);
+    }
 
     // Firebase Auth State Listener
     const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -175,6 +227,9 @@ export default function App() {
           } else {
             storage.setCurrentUser(targetUser);
             setCurrentUser(targetUser);
+            if (targetUser.role === 'User' && targetUser.department && targetUser.department !== 'ALL' && targetUser.department !== 'PENDING') {
+              setSelectedDepartment(targetUser.department);
+            }
             setIsAuthModalOpen(false);
           }
         }
@@ -189,10 +244,12 @@ export default function App() {
     // Connect and sync with Firebase Firestore
     storage.initCloudSync()
       .then((res) => {
+        const isQuota = firestoreSync.isQuotaExceeded();
         setCloudStatus({
-          isConnected: res.connected,
+          isConnected: res.connected && !isQuota,
           isSyncing: false,
           lastSync: new Date().toLocaleTimeString('th-TH'),
+          isQuotaExceeded: isQuota,
         });
         if (res.connected) {
           reloadData();
@@ -200,19 +257,43 @@ export default function App() {
       })
       .catch((err) => {
         console.error('Cloud sync initialization failed:', err);
-        setCloudStatus((prev) => ({ ...prev, isSyncing: false }));
+        setCloudStatus((prev) => ({ 
+          ...prev, 
+          isSyncing: false,
+          isQuotaExceeded: firestoreSync.isQuotaExceeded()
+        }));
       });
 
+    // Real-time listener for app_bundles updates (Employees, Departments, Shift Plans, Shift Codes, Punches, OT, etc.)
+    const unsubCloudBundles = subscribeToCloudChanges(async (source) => {
+      try {
+        console.log(`[Cloud Sync] Multi-user realtime update from ${source}...`);
+        await storage.initCloudSync();
+        reloadData();
+      } catch (e) {
+        console.warn('Realtime cloud sync refresh notice:', e);
+      }
+    });
+
     // Real-time listener for user account changes
-    const unsubUsersRealtime = subscribeToUserChanges(() => {
+    const unsubUsersRealtime = subscribeToUserChanges((cloudUsers) => {
+      if (cloudUsers && cloudUsers.length > 0) {
+        storage.updateUsersFromCloud(cloudUsers);
+      }
       const allUsers = storage.getUsers();
       const currentStored = storage.getCurrentUser();
       if (currentStored && currentStored.email) {
         const clean = currentStored.email.trim().toLowerCase();
         const updated = allUsers.find(u => u.email.trim().toLowerCase() === clean);
-        if (updated && (updated.status !== currentStored.status || updated.department !== currentStored.department || updated.role !== currentStored.role)) {
-          storage.setCurrentUser(updated);
-          setCurrentUser(updated);
+        if (updated) {
+          if (updated.status === 'Deactivated') {
+            handleSignOut();
+            return;
+          }
+          if (updated.status !== currentStored.status || updated.department !== currentStored.department || updated.role !== currentStored.role) {
+            storage.setCurrentUser(updated);
+            setCurrentUser(updated);
+          }
         }
       }
     });
@@ -220,39 +301,75 @@ export default function App() {
     // Listen to cross-component & multi-user real-time cloud data changes
     const handleDataUpdated = () => {
       reloadData();
+      const isQuota = firestoreSync.isQuotaExceeded();
       setCloudStatus((prev) => ({
         ...prev,
-        isConnected: true,
+        isConnected: !isQuota,
         lastSync: new Date().toLocaleTimeString('th-TH'),
+        isQuotaExceeded: isQuota,
       }));
     };
+
+    const handleQuotaExceeded = () => {
+      setCloudStatus((prev) => ({
+        ...prev,
+        isConnected: false,
+        isSyncing: false,
+        isQuotaExceeded: true,
+      }));
+    };
+
     window.addEventListener('siemens-data-updated', handleDataUpdated);
     window.addEventListener('storage-changed', handleDataUpdated);
     window.addEventListener('firestore-sync-completed', handleDataUpdated);
+    window.addEventListener('firestore-quota-exceeded', handleQuotaExceeded);
+
+    // Refresh instantly when user tabs back or focuses the window
+    const handleWindowFocus = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        storage.initCloudSync().then(res => {
+          if (res.connected) reloadData();
+        }).catch(() => null);
+      }
+    };
+    window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('visibilitychange', handleWindowFocus);
 
     return () => {
       window.removeEventListener('siemens-data-updated', handleDataUpdated);
       window.removeEventListener('storage-changed', handleDataUpdated);
       window.removeEventListener('firestore-sync-completed', handleDataUpdated);
+      window.removeEventListener('firestore-quota-exceeded', handleQuotaExceeded);
+      window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('visibilitychange', handleWindowFocus);
+      unsubCloudBundles();
       unsubUsersRealtime();
       unsubscribeAuth();
     };
   }, [reloadData]);
 
-  // Manual cloud sync trigger
+  // Manual cloud sync trigger / retry connection
   const handleSyncCloud = async () => {
     setCloudStatus((prev) => ({ ...prev, isSyncing: true }));
     try {
+      // Clear local quota exceeded flag to attempt fresh cloud probe
+      await firestoreSync.resetQuotaState();
       const res = await storage.initCloudSync();
       reloadData();
+      const isQuota = firestoreSync.isQuotaExceeded();
       setCloudStatus({
-        isConnected: res.connected,
+        isConnected: res.connected && !isQuota,
         isSyncing: false,
         lastSync: new Date().toLocaleTimeString('th-TH'),
+        isQuotaExceeded: isQuota,
       });
     } catch (e) {
       console.error('Manual sync failed:', e);
-      setCloudStatus((prev) => ({ ...prev, isSyncing: false }));
+      setCloudStatus((prev) => ({ 
+        ...prev, 
+        isSyncing: false, 
+        isQuotaExceeded: firestoreSync.isQuotaExceeded() 
+      }));
     }
   };
 
@@ -300,6 +417,42 @@ export default function App() {
     setCurrentUser(user);
   };
 
+  // Direct real-time sync for current user profile changes (Roles, Dept, Status)
+  useEffect(() => {
+    if (!currentUser?.email) return;
+    const unsubCurrentUser = subscribeToCurrentUser(currentUser.email, (cloudUser) => {
+      if (cloudUser) {
+        if (cloudUser.status === 'Deactivated') {
+          handleSignOut();
+          return;
+        }
+        if (
+          cloudUser.role !== currentUser.role ||
+          cloudUser.status !== currentUser.status ||
+          cloudUser.department !== currentUser.department
+        ) {
+          storage.setCurrentUser(cloudUser);
+          setCurrentUser(cloudUser);
+        }
+      }
+    });
+    return () => unsubCurrentUser();
+  }, [currentUser?.email, currentUser?.role, currentUser?.status, currentUser?.department]);
+
+  // Centralized, 1-Click Instant Sign-Out
+  const handleSignOut = async () => {
+    // 1. Immediately wipe local storage and UI state for instant response
+    storage.clearCurrentUser();
+    setCurrentUser(null);
+    setIsAuthModalOpen(true);
+    // 2. Terminate Firebase session cleanly
+    try {
+      await logOut();
+    } catch (err) {
+      console.warn('Sign-out error:', err);
+    }
+  };
+
   // Pending counts for badges
   const pendingOTCount = otRecords.filter(r => r.isRetroactive && r.status === 'Pending_Admin_Review').length;
   const pendingUserCount = storage.getUsers().filter(u => u.status === 'Pending_Approval').length;
@@ -318,6 +471,7 @@ export default function App() {
           onClose={() => {}}
           onSwitchUser={handleSwitchUser}
           isDark={isDark}
+          onSignOut={handleSignOut}
         />
       </div>
     );
@@ -334,22 +488,37 @@ export default function App() {
           storage.setCurrentUser(activatedUser);
           reloadData();
         }}
-        onSignOut={async () => {
-          await logOut();
-          storage.clearCurrentUser();
-          setCurrentUser(null);
-          setIsAuthModalOpen(true);
-        }}
+        onSignOut={handleSignOut}
       />
     );
   }
 
   return (
-    <div className={`min-h-screen flex font-sans transition-colors duration-200 overflow-hidden ${
+    <div className={`min-h-screen flex font-sans transition-colors duration-200 overflow-hidden relative ${
       isDark 
         ? 'bg-[#091017] text-slate-100' 
         : 'bg-[#f4f7f9] text-slate-800'
     }`}>
+      {/* Top Global Progress Bar for Smooth Page Transitions */}
+      {(navigatingTab || isPending) && (
+        <div className="fixed top-0 left-0 right-0 z-50 h-1 bg-[#002b30] overflow-hidden pointer-events-none">
+          <div 
+            className="h-full bg-gradient-to-r from-[#00b3b3] via-[#00e5e5] to-[#73ffff] transition-all duration-200 ease-out shadow-[0_0_12px_#00e5e5]"
+            style={{ width: `${navigationProgress}%` }}
+          />
+        </div>
+      )}
+
+      {/* Floating Transition Status Toast */}
+      {navigatingTab && (
+        <div className="fixed bottom-4 right-4 z-50 flex items-center space-x-2.5 px-3.5 py-2 rounded-lg bg-[#08121a]/95 border border-[#00e5e5]/40 text-slate-100 shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-bottom-2 duration-150">
+          <div className="w-3.5 h-3.5 border-2 border-[#00e5e5] border-t-transparent rounded-full animate-spin" />
+          <span className="text-xs font-medium text-slate-200">
+            กำลังสลับหน้าไปยัง <span className="text-[#00e5e5] font-semibold">{TAB_TITLES[navigatingTab]?.en || navigatingTab}</span> ({TAB_TITLES[navigatingTab]?.th || ''})...
+          </span>
+        </div>
+      )}
+
       {/* Siemens IX Left Sidebar Navigation */}
       <SiemensSidebar
         currentUser={currentUser}
@@ -358,12 +527,14 @@ export default function App() {
         isFullscreen={isFullscreen}
         onToggleFullscreen={handleToggleFullscreen}
         activeTab={activeTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={handleSelectTab}
+        navigatingTab={navigatingTab}
         pendingOTCount={pendingOTCount}
         pendingUserCount={pendingUserCount}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={() => setIsSidebarCollapsed(prev => !prev)}
         onOpenAuthModal={() => setIsAuthModalOpen(true)}
+        onSignOut={handleSignOut}
       />
 
       {/* Main Container: Top App Bar + Dynamic Module View */}
@@ -385,24 +556,26 @@ export default function App() {
           onToggleSidebar={() => setIsSidebarCollapsed(prev => !prev)}
           cloudStatus={cloudStatus}
           onSyncCloud={handleSyncCloud}
+          onSignOut={handleSignOut}
         />
 
         {/* Work Area Viewport */}
         <main className="flex-1 overflow-y-auto overflow-x-hidden p-0">
-          {activeTab === 'roster' && (
-            <ShiftRosterView
-              currentUser={currentUser}
-              theme={theme}
-              selectedMonthYear={selectedMonthYear}
-              onSelectMonthYear={setSelectedMonthYear}
-              selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
-              employees={employees}
-              shiftCodes={shiftCodes}
-              shiftPlans={shiftPlans}
-              onNavigateToImport={() => setActiveTab('upload-shift-plan')}
-            />
-          )}
+          <ErrorBoundary key={activeTab} onReset={reloadData}>
+            {activeTab === 'roster' && (
+              <ShiftRosterView
+                currentUser={currentUser}
+                theme={theme}
+                selectedMonthYear={selectedMonthYear}
+                onSelectMonthYear={setSelectedMonthYear}
+                selectedDepartment={selectedDepartment}
+                onSelectDepartment={setSelectedDepartment}
+                employees={employees}
+                shiftCodes={shiftCodes}
+                shiftPlans={shiftPlans}
+                onNavigateToImport={() => handleSelectTab('upload-shift-plan')}
+              />
+            )}
 
           {activeTab === 'upload-shift-plan' && (
             <UploadShiftPlanView
@@ -416,7 +589,12 @@ export default function App() {
               shiftCodes={shiftCodes}
               shiftPlans={shiftPlans}
               onDataImported={reloadData}
-              onNavigateToRoster={() => setActiveTab('roster')}
+              onNavigateToRoster={() => handleSelectTab('roster')}
+              onNavigateToShiftCodes={() => {
+                setImportInitialTab('shift-code');
+                handleSelectTab('import');
+              }}
+              onNavigateToEmployees={() => handleSelectTab('employees')}
             />
           )}
 
@@ -449,7 +627,7 @@ export default function App() {
               onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
               onSelectDepartment={setSelectedDepartment}
-              onNavigateToUploadShiftPlan={() => setActiveTab('upload-shift-plan')}
+              onNavigateToUploadShiftPlan={() => handleSelectTab('upload-shift-plan')}
             />
           )}
 
@@ -462,7 +640,9 @@ export default function App() {
               employees={employees}
               shiftCodes={shiftCodes}
               onDataImported={reloadData}
-              onNavigateToUploadShiftPlan={() => setActiveTab('upload-shift-plan')}
+              onNavigateToUploadShiftPlan={() => handleSelectTab('upload-shift-plan')}
+              onNavigateToRoster={() => handleSelectTab('roster')}
+              initialTab={importInitialTab}
             />
           )}
 
@@ -519,6 +699,7 @@ export default function App() {
               onClearAllData={handleClearAllData}
             />
           )}
+          </ErrorBoundary>
         </main>
       </div>
 
@@ -530,6 +711,7 @@ export default function App() {
         onClose={() => setIsAuthModalOpen(false)}
         onSwitchUser={handleSwitchUser}
         isDark={isDark}
+        onSignOut={handleSignOut}
       />
     </div>
   );

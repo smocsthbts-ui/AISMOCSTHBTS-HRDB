@@ -11,7 +11,8 @@ import {
   filterDeduplicatedPunches, 
   hhmmToMinutes, 
   minutesToHHMM,
-  isEmployeeMatch
+  isEmployeeMatch,
+  isEmployeePlanMatch
 } from '../utils/timeCalc';
 import { 
   BarChart3, 
@@ -276,7 +277,52 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
     return STAT_CATEGORIES.find(c => c.id === activeCategory) || STAT_CATEGORIES[0];
   }, [activeCategory]);
 
-  // 2. Core Statistics Engine: compute records for an employee across a given month
+  // Pre-indexed Shift Plans Map (O(1) lookup by empNo/gid + date)
+  const planLookupMap = useMemo(() => {
+    const map = new Map<string, DailyShiftPlan>();
+    for (const sp of shiftPlans) {
+      if (!sp || !sp.date) continue;
+      if (sp.empNo) {
+        const cleanEmp = sp.empNo.trim().toUpperCase();
+        map.set(`${cleanEmp}_${sp.date}`, sp);
+        map.set(`${cleanEmp.replace(/^0+/, '')}_${sp.date}`, sp);
+        map.set(`${cleanEmp.padStart(4, '0')}_${sp.date}`, sp);
+      }
+      if (sp.gid) {
+        map.set(`${sp.gid.trim().toUpperCase()}_${sp.date}`, sp);
+      }
+    }
+    return map;
+  }, [shiftPlans]);
+
+  // Pre-indexed Biometric Punches Map (O(1) lookup by empIdentifier + date)
+  const punchesByEmpAndDate = useMemo(() => {
+    const map = new Map<string, BiometricRawPunch[]>();
+    for (const p of (biometricPunches || [])) {
+      if (!p || !p.empIdentifier || !p.date || !p.time) continue;
+      const rawId = p.empIdentifier.trim().toUpperCase();
+      const strippedId = rawId.replace(/^0+/, '');
+      const paddedId = rawId.padStart(4, '0');
+      
+      const keys = new Set([
+        `${rawId}_${p.date}`,
+        `${strippedId}_${p.date}`,
+        `${paddedId}_${p.date}`,
+      ]);
+
+      for (const k of keys) {
+        let list = map.get(k);
+        if (!list) {
+          list = [];
+          map.set(k, list);
+        }
+        list.push(p);
+      }
+    }
+    return map;
+  }, [biometricPunches]);
+
+  // 2. Core Statistics Engine: compute records for an employee across a given month (Optimized O(1))
   const calculateEmployeeStatsForMonth = (
     emp: Employee,
     monthStr: string,
@@ -287,8 +333,8 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
     const month = parseInt(mStr, 10);
     const daysInMonth = new Date(year, month, 0).getDate();
 
-    // Punches for this employee (robust tolerance for leading zeros & prefixes)
-    const empPunches = biometricPunches.filter(p => isEmployeeMatch(p.empIdentifier, emp));
+    const empNoKey = (emp.empNo || '').trim().toUpperCase();
+    const gidKey = (emp.gid || '').trim().toUpperCase();
 
     const details: EmployeeStatDetail[] = [];
     let totalCount = 0;
@@ -303,10 +349,9 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
       const dateObj = new Date(year, month - 1, d);
       const dayOfWeek = dayNames[dateObj.getDay()];
 
-      // Find shift plan
-      const plan = shiftPlans.find(sp => 
-        (sp.empNo === emp.empNo || sp.gid === emp.gid) && sp.date === dateStr
-      );
+      // Find shift plan in O(1)
+      const plan = (empNoKey ? planLookupMap.get(`${empNoKey}_${dateStr}`) : undefined) ||
+                   (gidKey ? planLookupMap.get(`${gidKey}_${dateStr}`) : undefined);
 
       // If no plan exists for this day, skip or use default
       if (!plan) continue;
@@ -314,12 +359,21 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
       const rawCode = (plan.shiftCode || '').trim();
       if (!rawCode) continue;
 
-      const shiftInfo = resolveShiftInfo(rawCode, shiftCodeMap);
+      const shiftInfo = resolveShiftInfo(rawCode, shiftCodes, emp);
       const cleanCode = rawCode.toUpperCase().replace(/-X/gi, '').replace(/-ET/gi, '').trim();
 
-      // Find punches for this day
-      const dayPunches = empPunches.filter(p => p.date === dateStr);
-      const { clockIn, clockOut } = filterDeduplicatedPunches(dayPunches, shiftInfo);
+      // Find punches for this day in O(1)
+      const dayPunches = (empNoKey ? punchesByEmpAndDate.get(`${empNoKey}_${dateStr}`) : undefined) ||
+                         (gidKey ? punchesByEmpAndDate.get(`${gidKey}_${dateStr}`) : undefined) || [];
+      let clockIn = '';
+      let clockOut = '';
+      try {
+        const res = filterDeduplicatedPunches(dayPunches, shiftInfo);
+        clockIn = res.clockIn || '';
+        clockOut = res.clockOut || '';
+      } catch (err) {
+        console.warn('Punch resolution error in StatisticsView:', err);
+      }
 
       const shiftIn = shiftInfo?.isWorkingDay ? (shiftInfo.startTime || '') : '';
       const shiftOut = shiftInfo?.isWorkingDay ? (shiftInfo.endTime || '') : '';
@@ -647,7 +701,7 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
     }
 
     return monthsData;
-  }, [selectedYear, activeCategory, effectiveDepartment, targetEmployees, uploadedPlansInfo.monthDeptMap]);
+  }, [selectedYear, activeCategory, effectiveDepartment, targetEmployees, uploadedPlansInfo.monthDeptMap, planLookupMap, punchesByEmpAndDate]);
 
   // Export Table to Excel (.xlsx)
   const handleExportExcel = () => {
@@ -1154,7 +1208,7 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
                 dataKey="value" 
                 name={currentCategoryConfig.nameEn}
                 radius={[4, 4, 0, 0]}
-                onClick={(entry) => {
+                onClick={(entry: any) => {
                   if (entry && entry.hasData) {
                     onSelectMonthYear(entry.monthKey);
                   }

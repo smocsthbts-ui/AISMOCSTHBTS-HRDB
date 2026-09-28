@@ -19,7 +19,8 @@ import {
   Layers,
   Sparkles,
   FileSpreadsheet,
-  LogOut
+  LogOut,
+  Loader2
 } from 'lucide-react';
 import { UserAccount } from '../types';
 import { logOut } from '../firebase';
@@ -32,11 +33,13 @@ interface SiemensSidebarProps {
   onToggleFullscreen: () => void;
   activeTab: string;
   onSelectTab: (tab: string) => void;
+  navigatingTab?: string | null;
   pendingOTCount: number;
   pendingUserCount: number;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
   onOpenAuthModal: () => void;
+  onSignOut?: () => void;
 }
 
 export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
@@ -47,11 +50,13 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
   onToggleFullscreen,
   activeTab,
   onSelectTab,
+  navigatingTab,
   pendingOTCount,
   pendingUserCount,
   isCollapsed,
   onToggleCollapse,
   onOpenAuthModal,
+  onSignOut,
 }) => {
   const isDark = theme === 'dark';
 
@@ -193,6 +198,7 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
 
         {menuItems.map(item => {
           const isActive = activeTab === item.id;
+          const isNavigatingThis = navigatingTab === item.id;
           const Icon = item.icon;
 
           return (
@@ -200,6 +206,7 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
               key={item.id}
               id={`sidebar-tab-${item.id}`}
               onClick={() => onSelectTab(item.id)}
+              disabled={isNavigatingThis}
               title={isCollapsed ? `${item.label} (${item.sublabel})` : undefined}
               className={`w-full flex items-center rounded-md transition group text-left relative ${
                 isCollapsed ? 'justify-center p-2.5' : 'px-3 py-2.5 space-x-3'
@@ -211,17 +218,28 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
                   : isDark
                     ? 'text-slate-300 hover:bg-[#121c27] hover:text-white border-l-3 border-transparent'
                     : 'text-slate-200 hover:bg-white/10 hover:text-white border-l-3 border-transparent'
-              }`}
+              } ${isNavigatingThis ? 'ring-1 ring-[#00e5e5]/50 bg-[#00e5e5]/10 animate-pulse' : ''}`}
             >
-              <Icon className={`w-4 h-4 shrink-0 transition ${
-                isActive ? 'text-[#00e5e5]' : 'text-slate-400 group-hover:text-slate-200'
-              }`} />
+              {isNavigatingThis ? (
+                <Loader2 className="w-4 h-4 shrink-0 animate-spin text-[#00e5e5]" />
+              ) : (
+                <Icon className={`w-4 h-4 shrink-0 transition ${
+                  isActive ? 'text-[#00e5e5]' : 'text-slate-400 group-hover:text-slate-200'
+                }`} />
+              )}
 
               {!isCollapsed && (
                 <div className="flex-1 min-w-0">
                   <div className="text-xs font-medium truncate flex items-center justify-between">
-                    <span>{item.label}</span>
-                    {item.badge && (
+                    <span className="flex items-center space-x-1.5">
+                      <span>{item.label}</span>
+                      {isNavigatingThis && (
+                        <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-[#00e5e5]/20 text-[#00e5e5] animate-pulse">
+                          กำลังโหลด...
+                        </span>
+                      )}
+                    </span>
+                    {item.badge && !isNavigatingThis && (
                       <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ml-1 ${
                         item.badgeColor || 'bg-teal-500 text-slate-900'
                       }`}>
@@ -236,7 +254,7 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
               )}
 
               {/* Badge for Collapsed Mode */}
-              {isCollapsed && item.badge && (
+              {isCollapsed && item.badge && !isNavigatingThis && (
                 <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-amber-400 ring-2 ring-slate-900" />
               )}
             </button>
@@ -290,11 +308,17 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
         <div className={`mt-2 flex items-center ${isCollapsed ? 'flex-col space-y-1' : 'justify-between px-1'}`}>
           <div className="flex items-center space-x-1">
             <button
-              onClick={() => logOut()}
-              className={`p-1.5 rounded transition ${
-                isDark ? 'text-slate-400 hover:text-white hover:bg-red-500/20' : 'text-slate-300 hover:text-white hover:bg-red-500/30'
+              onClick={() => {
+                if (onSignOut) {
+                  onSignOut();
+                } else {
+                  logOut();
+                }
+              }}
+              className={`p-1.5 rounded transition cursor-pointer ${
+                isDark ? 'text-slate-400 hover:text-rose-300 hover:bg-rose-500/25' : 'text-slate-200 hover:text-white hover:bg-rose-600/30'
               }`}
-              title="ออกจากระบบ (Logout)"
+              title="ออกจากระบบ (Sign Out)"
             >
               <LogOut className="w-4 h-4" />
             </button>

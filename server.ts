@@ -4,15 +4,20 @@ import fs from 'fs';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  // Cloud Run passes PORT environment variable (e.g. 8080)
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   // Cloud Run / Health checks
-  app.get(['/api/health', '/healthz', '/_health'], (_req, res) => {
+  app.get(['/api/health', '/healthz', '/_health', '/health'], (_req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
   // Vite middleware for development vs static files for production
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.join(process.cwd(), 'dist');
+  const indexPath = path.join(distPath, 'index.html');
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (!isProduction || !fs.existsSync(indexPath)) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -20,19 +25,32 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.status(404).send('Application dist index.html not found. Run npm run build.');
+      }
     });
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Server listening on http://0.0.0.0:${PORT} (PORT=${process.env.PORT || '3000'})`);
   });
 
   process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
     server.close(() => {
+      console.log('HTTP server closed');
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGINT', () => {
+    console.log('SIGINT signal received: closing HTTP server');
+    server.close(() => {
+      console.log('HTTP server closed');
       process.exit(0);
     });
   });

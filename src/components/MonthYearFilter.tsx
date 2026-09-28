@@ -36,20 +36,43 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
     return [parseInt(parts[0], 10), parseInt(parts[1], 10)];
   }, [selectedMonthYear]);
 
-  // Generate historical list of months (2026 down to 2024)
+  // Limit future options to strictly 12 months in advance from current date (or next year)
+  const maxFutureVal = useMemo(() => {
+    const now = new Date();
+    const nowYear = now.getFullYear();
+    const nowMonth = now.getMonth() + 1;
+    const maxFutureObj = new Date(nowYear, nowMonth - 1 + 12, 1);
+    const maxFutureYear = maxFutureObj.getFullYear();
+    const maxFutureMonth = maxFutureObj.getMonth() + 1;
+    return `${maxFutureYear}-${String(maxFutureMonth).padStart(2, '0')}`;
+  }, []);
+
+  // Generate dynamic list of months covering past years down to 2024 and max 12 months in advance (next year)
   const monthOptions = useMemo(() => {
     const list: { value: string; label: string; year: number; month: number }[] = [];
-    // Start from end of 2026 down to 2024
-    for (let y = 2026; y >= 2024; y--) {
+    const maxFutureParts = maxFutureVal.split('-');
+    const maxFutureYear = parseInt(maxFutureParts[0], 10);
+
+    const maxYear = Math.max(maxFutureYear, currentYear);
+    const minYear = 2024;
+
+    for (let y = maxYear; y >= minYear; y--) {
       for (let m = 12; m >= 1; m--) {
         const mStr = String(m).padStart(2, '0');
         const value = `${y}-${mStr}`;
+
+        // Limit future options to max 12 months in advance from today
+        // (unless it matches the currently selected month)
+        if (value > maxFutureVal && value !== selectedMonthYear) {
+          continue;
+        }
+
         const thName = MONTH_NAMES_TH[m - 1];
         const enName = MONTH_NAMES_EN[m - 1];
-        const isSelected = value === selectedMonthYear;
+        const thaiYear = y + 543;
         list.push({
           value,
-          label: `${value} • ${thName} ${y} (${enName})`,
+          label: `${value} • ${thName} ${thaiYear} (${enName} ${y})`,
           year: y,
           month: m,
         });
@@ -58,15 +81,16 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
     // If selectedMonthYear is outside this range, prepend it
     if (!list.some(item => item.value === selectedMonthYear)) {
       const thName = MONTH_NAMES_TH[currentMonth - 1] || '';
+      const thaiYear = currentYear + 543;
       list.unshift({
         value: selectedMonthYear,
-        label: `${selectedMonthYear} • ${thName} ${currentYear}`,
+        label: `${selectedMonthYear} • ${thName} ${thaiYear} (${currentYear})`,
         year: currentYear,
         month: currentMonth,
       });
     }
     return list;
-  }, [selectedMonthYear, currentYear, currentMonth]);
+  }, [selectedMonthYear, currentYear, currentMonth, maxFutureVal]);
 
   // Handle previous month (ดูย้อนหลัง)
   const handlePrevMonth = () => {
@@ -79,7 +103,7 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
     onChange(`${newYear}-${String(newMonth).padStart(2, '0')}`);
   };
 
-  // Handle next month
+  // Handle next month (จำกัดล่วงหน้าไม่เกิน 12 เดือน)
   const handleNextMonth = () => {
     let newYear = currentYear;
     let newMonth = currentMonth + 1;
@@ -87,7 +111,11 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
       newMonth = 1;
       newYear += 1;
     }
-    onChange(`${newYear}-${String(newMonth).padStart(2, '0')}`);
+    const nextVal = `${newYear}-${String(newMonth).padStart(2, '0')}`;
+    if (nextVal > maxFutureVal && nextVal !== selectedMonthYear) {
+      return;
+    }
+    onChange(nextVal);
   };
 
   // Check if viewing historical period (before 2026-05)
@@ -143,15 +171,18 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
           ))}
         </select>
 
-        {/* Step forward (Next month) */}
+        {/* Step forward (Next month - จำกัดล่วงหน้า 12 เดือน) */}
         <button
           type="button"
           onClick={handleNextMonth}
-          title="ดูเดือนถัดไป"
+          disabled={selectedMonthYear >= maxFutureVal}
+          title={selectedMonthYear >= maxFutureVal ? "จำกัดการแสดงผลล่วงหน้าสูงสุด 12 เดือน (หรือปีถัดไป)" : "ดูเดือนถัดไป"}
           className={`px-1.5 py-1.5 border-l transition flex items-center justify-center ${
-            isDark 
-              ? 'bg-[#14202c] border-[#273a4e] text-slate-300 hover:text-white hover:bg-[#1a2838]' 
-              : 'bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200'
+            selectedMonthYear >= maxFutureVal
+              ? 'opacity-40 cursor-not-allowed bg-slate-800/40 text-slate-500'
+              : isDark 
+                ? 'bg-[#14202c] border-[#273a4e] text-slate-300 hover:text-white hover:bg-[#1a2838]' 
+                : 'bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200'
           }`}
         >
           <ChevronRight className="w-3.5 h-3.5" />
@@ -164,10 +195,16 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
         id={`${idPrefix}-input-native`}
         title="เลือกเดือน-ปีโดยตรงจากปฏิทิน"
         aria-label="เลือกเดือน-ปีจากปฏิทิน"
+        max={maxFutureVal}
         value={selectedMonthYear}
         onChange={e => {
           if (e.target.value) {
-            onChange(e.target.value);
+            const chosen = e.target.value;
+            if (chosen > maxFutureVal) {
+              onChange(maxFutureVal);
+            } else {
+              onChange(chosen);
+            }
           }
         }}
         className={`w-7 h-7 p-1 rounded border cursor-pointer text-xs transition ${

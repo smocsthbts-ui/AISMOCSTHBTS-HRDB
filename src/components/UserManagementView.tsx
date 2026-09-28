@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { UserAccount } from '../types';
 import { storage } from '../utils/storage';
-import { firestoreSync, subscribeToUserChanges } from '../firebase';
+import { firestoreSync, subscribeToUserChanges, isDemoUser } from '../firebase';
 import { 
   ShieldCheck, 
   UserCheck, 
@@ -88,24 +88,21 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     syncFromCloud();
 
     // 3. Realtime listener directly for user changes
-    const unsubUserChanges = subscribeToUserChanges(async () => {
-      try {
-        const fresh = await firestoreSync.fetchAllFromCloud();
-        if (fresh && fresh.users && fresh.users.length > 0) {
-          storage.setUsers(fresh.users);
-          setUsers(fresh.users);
-        } else {
-          refreshUsers();
-        }
-      } catch {
+    const unsubUserChanges = subscribeToUserChanges((cloudUsers) => {
+      if (cloudUsers && cloudUsers.length > 0) {
+        storage.updateUsersFromCloud(cloudUsers);
+        setUsers(storage.getUsers());
+      } else {
         refreshUsers();
       }
     });
 
+    window.addEventListener('siemens-data-updated', refreshUsers);
     window.addEventListener('storage-changed', refreshUsers);
     window.addEventListener('firestore-sync-completed', refreshUsers);
     return () => {
       unsubUserChanges();
+      window.removeEventListener('siemens-data-updated', refreshUsers);
       window.removeEventListener('storage-changed', refreshUsers);
       window.removeEventListener('firestore-sync-completed', refreshUsers);
     };
@@ -118,7 +115,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [userToDelete, setUserToDelete] = useState<UserAccount | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
-  const [notification, setNotification] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
+  const [notification, setNotification] = useState<{ type: 'success' | 'warning' | 'error' | 'info'; message: string } | null>(null);
 
   const [userForm, setUserForm] = useState<Partial<UserAccount>>({
     name: '',
@@ -138,6 +135,19 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const pendingUsers = useMemo(() => {
     return users.filter(u => u.status === 'Pending_Approval');
   }, [users]);
+
+  // Escape key handler to close modals instantly
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (isAddModalOpen) setIsAddModalOpen(false);
+        if (userToDelete) setUserToDelete(null);
+        if (userToActivate) setUserToActivate(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isAddModalOpen, userToDelete, userToActivate]);
 
   const openActivateModal = (targetUser: UserAccount) => {
     setUserToActivate(targetUser);
@@ -198,7 +208,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     }
   };
 
-  const showNotification = (type: 'success' | 'warning' | 'error', message: string) => {
+  const showNotification = (type: 'success' | 'warning' | 'error' | 'info', message: string) => {
     setNotification({ type, message });
     setTimeout(() => {
       setNotification(prev => (prev?.message === message ? null : prev));
@@ -256,28 +266,54 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
-    const updatedUser = { ...targetUser, role: newRole };
-    await storage.saveUser(updatedUser);
-    const updated = users.map(u => u.id === targetUser.id ? updatedUser : u);
+    const updatedUser: UserAccount = { 
+      ...targetUser, 
+      role: newRole,
+      updatedAt: new Date().toISOString()
+    };
+    
+    // Instant optimistic update
+    const updated = users.map(u => 
+      (u.id === targetUser.id || u.email.toLowerCase() === targetUser.email.toLowerCase()) ? updatedUser : u
+    );
     setUsers(updated);
     onUserChanged();
-    
+
     if (newRole === 'User') {
       showNotification('success', `ปรับ Role ของ ${targetUser.name} เป็น User เรียบร้อยแล้ว (สามารถลบบัญชีนี้ได้แล้ว)`);
     } else {
       showNotification('success', `ปรับ Role ของ ${targetUser.name} เป็น Admin เรียบร้อยแล้ว (ได้รับการป้องกันการลบ)`);
+    }
+
+    try {
+      await storage.saveUser(updatedUser);
+    } catch (err) {
+      console.warn('Role change save error:', err);
     }
   };
 
   // Change user department
   const handleChangeDept = async (targetUser: UserAccount, newDept: string) => {
     if (!isAdmin) return;
-    const updatedUser = { ...targetUser, department: newDept };
-    await storage.saveUser(updatedUser);
-    const updated = users.map(u => u.id === targetUser.id ? updatedUser : u);
+    const updatedUser: UserAccount = { 
+      ...targetUser, 
+      department: newDept,
+      updatedAt: new Date().toISOString()
+    };
+    
+    // Instant optimistic update
+    const updated = users.map(u => 
+      (u.id === targetUser.id || u.email.toLowerCase() === targetUser.email.toLowerCase()) ? updatedUser : u
+    );
     setUsers(updated);
     onUserChanged();
     showNotification('success', `เปลี่ยนแผนกของ ${targetUser.name} เป็น ${newDept} สำเร็จ`);
+
+    try {
+      await storage.saveUser(updatedUser);
+    } catch (err) {
+      console.warn('Dept change save error:', err);
+    }
   };
 
   // Delete User handler (permanently removes from LocalStorage and Cloud Firestore)
@@ -300,11 +336,14 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setIsDeleting(true);
     const targetEmail = userToDelete.email;
     const targetName = userToDelete.name;
+    const targetId = userToDelete.id;
+
+    // Immediately close modal to eliminate modal freezing/hanging
+    setUserToDelete(null);
 
     try {
-      await storage.deleteUser(userToDelete.id, userToDelete.email);
+      await storage.deleteUser(targetId, targetEmail);
       onUserChanged();
-      setUserToDelete(null);
       showNotification('success', `ลบบัญชีผู้ใช้ ${targetName} (${targetEmail}) ออกจากฐานข้อมูลเรียบร้อยแล้วอย่างถาวร`);
     } catch (err: any) {
       showNotification('error', `เกิดข้อผิดพลาดในการลบบัญชี: ${err?.message || 'โปรดลองใหม่อีกครั้ง'}`);
@@ -314,38 +353,50 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   };
 
   // Add new user
-  const handleCreateUser = (e: React.FormEvent) => {
+  const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isAdmin) return;
     if (!userForm.name || !userForm.email) return;
 
-    if (users.some(u => u.email.toLowerCase() === userForm.email?.toLowerCase())) {
-      showNotification('error', 'อีเมลนี้มีอยู่ในระบบแล้ว');
+    const cleanEmail = userForm.email.trim().toLowerCase();
+    const currentUsers = storage.getUsers();
+    const existing = currentUsers.find(u => u.email.trim().toLowerCase() === cleanEmail);
+    if (existing) {
+      showNotification('error', `อีเมล ${cleanEmail} มีอยู่ในระบบแล้ว (สถานะ: ${existing.status || 'Active'}, แผนก: ${existing.department || '-'}) ไม่สามารถสร้างซ้ำได้`);
       return;
     }
 
     const newUser: UserAccount = {
       id: `usr-${Date.now()}`,
-      email: userForm.email.trim(),
+      email: cleanEmail,
       name: userForm.name.trim(),
       department: userForm.department || 'GM',
       role: userForm.role || 'User',
       status: userForm.status || 'Active',
       createdAt: new Date().toISOString(),
       lastLogin: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
 
-    storage.setUsers([...users, newUser]);
+    // Close modal immediately and clear form to prevent UI hang
     setIsAddModalOpen(false);
-    onUserChanged();
-    showNotification('success', `สร้างบัญชีผู้ใช้ ${newUser.name} สำเร็จ`);
+    setUserForm({ name: '', email: '', department: 'GM', role: 'User', status: 'Active' });
+    showNotification('info', `กำลังสร้างและซิงค์บัญชีผู้ใช้ ${newUser.name}...`);
+
+    try {
+      await storage.saveUser(newUser);
+      onUserChanged();
+      showNotification('success', `สร้างบัญชีผู้ใช้ ${newUser.name} (${newUser.email}) สำเร็จ`);
+    } catch (err: any) {
+      showNotification('error', `เกิดข้อผิดพลาดในการสร้างบัญชี: ${err?.message || 'โปรดลองอีกครั้ง'}`);
+    }
   };
 
-  // Filtered users list (strictly deduplicated by email)
+  // Filtered users list (strictly deduplicated by email and excluding demo users)
   const filteredUsers = useMemo(() => {
     const uMap = new Map<string, UserAccount>();
     users.forEach(u => {
-      if (u && u.email) {
+      if (u && u.email && !isDemoUser(u)) {
         const cleanEmail = u.email.trim().toLowerCase();
         const existing = uMap.get(cleanEmail);
         if (!existing) {
@@ -361,7 +412,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         }
       }
     });
-    const uniqueUsers = Array.from(uMap.values());
+    const uniqueUsers = Array.from(uMap.values()).filter(u => !isDemoUser(u));
 
     return uniqueUsers.filter(u => {
       const matchesSearch = 
@@ -396,7 +447,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
               การจัดการสิทธิ์และบัญชีผู้ใช้งาน (User Accounts & Roles)
             </h1>
             <p className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-              Admin: สิทธิ์เต็มรูปแบบจัดการทุกแผนกและลบบัญชี User | User: สิทธิ์เฉพาะแผนกของตนเอง
+              {isAdmin 
+                ? 'Admin: สิทธิ์เต็มรูปแบบจัดการทุกแผนก อนุมัติผู้ใช้ และกำหนดสิทธิ์' 
+                : `Role User (${currentUser.name}): โหมดเรียกดูข้อมูลผู้ใช้งาน (View Only) • การเพิ่ม อนุมัติ กำหนดบทบาท และลบบัญชีสงวนไว้สำหรับ Admin เท่านั้น`}
             </p>
           </div>
         </div>
@@ -494,11 +547,14 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         <div className={`p-3.5 rounded border text-xs font-medium flex items-center space-x-2.5 transition-all ${
           notification.type === 'success'
             ? isDark ? 'bg-teal-500/15 border-teal-500/30 text-teal-200' : 'bg-teal-50 border-teal-200 text-teal-800'
-            : notification.type === 'warning'
-              ? isDark ? 'bg-amber-500/15 border-amber-500/30 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-800'
-              : isDark ? 'bg-red-500/15 border-red-500/30 text-red-200' : 'bg-red-50 border-red-200 text-red-800'
+            : notification.type === 'info'
+              ? isDark ? 'bg-sky-500/15 border-sky-500/30 text-sky-200' : 'bg-sky-50 border-sky-200 text-sky-800'
+              : notification.type === 'warning'
+                ? isDark ? 'bg-amber-500/15 border-amber-500/30 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-800'
+                : isDark ? 'bg-red-500/15 border-red-500/30 text-red-200' : 'bg-red-50 border-red-200 text-red-800'
         }`}>
           {notification.type === 'success' && <CheckCircle2 className="w-4 h-4 shrink-0 text-teal-400" />}
+          {notification.type === 'info' && <CheckCircle2 className="w-4 h-4 shrink-0 text-sky-400" />}
           {notification.type === 'warning' && <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />}
           {notification.type === 'error' && <XCircle className="w-4 h-4 shrink-0 text-red-400" />}
           <span>{notification.message}</span>
@@ -828,7 +884,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
       {/* Delete User Confirmation Modal */}
       {userToDelete && (
-        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-xs">
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setUserToDelete(null);
+          }}
+          className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in duration-150"
+        >
           <div className={`w-full max-w-md rounded-lg border shadow-2xl p-5 ${
             isDark ? 'bg-[#142230] border-[#294058] text-white' : 'bg-white border-slate-300 text-slate-900'
           }`}>
@@ -902,7 +963,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
       {/* Add User Modal */}
       {isAddModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-xs">
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setIsAddModalOpen(false);
+          }}
+          className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in duration-150"
+        >
           <div className={`w-full max-w-md rounded-lg border shadow-2xl p-5 ${
             isDark ? 'bg-[#142230] border-[#294058] text-white' : 'bg-white border-slate-300 text-slate-900'
           }`}>

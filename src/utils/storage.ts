@@ -23,15 +23,20 @@ import {
   testFirestoreConnection, 
   isDemoDepartment, 
   isDemoShiftCode,
+  isDemoUser,
+  isDemoEmployee,
+  cleanDocId,
   sanitizeEmployeeDepartment,
   subscribeToCloudChanges 
 } from '../firebase';
-import { mergeAndDeduplicateOTRecords } from './otManager';
+import { mergeAndDeduplicateOTRecords, sanitizeOTRecords } from './otManager';
+import { normalizeShiftTimeString } from './timeCalc';
 
 const STORAGE_KEYS = {
   USERS: 'siemens_ix_users',
   CURRENT_USER: 'siemens_ix_current_user',
   DEPARTMENTS: 'siemens_ix_departments',
+  DEPARTMENTS_MODIFIED: 'siemens_ix_departments_modified',
   EMPLOYEES: 'siemens_ix_employees',
   EMPLOYEES_MODIFIED: 'siemens_ix_employees_modified',
   SHIFT_CODES: 'siemens_ix_shift_codes',
@@ -50,13 +55,117 @@ const STORAGE_KEYS = {
   DELETED_DEPARTMENTS: 'siemens_ix_deleted_departments',
 };
 
-const CURRENT_SCHEMA_VERSION = 'v2026_09_master_shifts_v4';
+export const HISTORY_CUTOFF_DATE = '2025-01-01';
+export const HISTORY_CUTOFF_MONTH = '2025-01';
+
+const CURRENT_SCHEMA_VERSION = 'v2026_09_prune_pre_aug2026_v5';
 
 // Self-healing migration for all connected clients upon opening the app
 try {
+  // Purge any demo users immediately from local storage cache
+  const userRaw = localStorage.getItem(STORAGE_KEYS.USERS);
+  if (userRaw) {
+    const parsed = JSON.parse(userRaw);
+    if (Array.isArray(parsed)) {
+      const cleaned = parsed.filter(u => !isDemoUser(u));
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleaned));
+    }
+  }
+
+  // Purge any demo employees immediately from local storage cache
+  const empRaw = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
+  if (empRaw) {
+    try {
+      const parsed = JSON.parse(empRaw);
+      if (Array.isArray(parsed)) {
+        const cleaned = parsed.filter(e => e && e.empNo && !isDemoEmployee(e));
+        localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleaned));
+      }
+    } catch {}
+  }
+
   const currentVer = localStorage.getItem(STORAGE_KEYS.SCHEMA_VERSION);
   if (currentVer !== CURRENT_SCHEMA_VERSION) {
-    // 2. Clean distorted department names
+    // 1. Prune punches before Aug 2026 and deduplicate
+    const punchesRaw = localStorage.getItem(STORAGE_KEYS.RAW_PUNCHES);
+    if (punchesRaw) {
+      try {
+        const parsed = JSON.parse(punchesRaw);
+        if (Array.isArray(parsed)) {
+          const punchMap = new Map<string, any>();
+          parsed.forEach((p: any) => {
+            if (!p || !p.date || !p.time) return;
+            if (p.date < HISTORY_CUTOFF_DATE) return;
+            const key = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+            if (!punchMap.has(key)) punchMap.set(key, p);
+          });
+          localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(Array.from(punchMap.values())));
+        }
+      } catch {}
+    }
+
+    // 2. Prune shift plans before Aug 2026 and deduplicate
+    const plansRaw = localStorage.getItem(STORAGE_KEYS.SHIFT_PLANS);
+    if (plansRaw) {
+      try {
+        const parsed = JSON.parse(plansRaw);
+        if (Array.isArray(parsed)) {
+          const planMap = new Map<string, any>();
+          parsed.forEach((p: any) => {
+            if (!p || !p.date) return;
+            if (p.date < HISTORY_CUTOFF_DATE) return;
+            const key = `${(p.empNo || '').trim()}_${(p.gid || '').trim().toLowerCase()}_${p.date}`;
+            if (!planMap.has(key)) planMap.set(key, p);
+          });
+          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(Array.from(planMap.values())));
+        }
+      } catch {}
+    }
+
+    // 3. Prune OT records before Aug 2026
+    const otRaw = localStorage.getItem(STORAGE_KEYS.OT_RECORDS);
+    if (otRaw) {
+      try {
+        const parsed = JSON.parse(otRaw);
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed.filter((o: any) => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+          localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleaned));
+        }
+      } catch {}
+    }
+
+    // 4. Prune other allowances before Aug 2026
+    const allowRaw = localStorage.getItem(STORAGE_KEYS.OTHER_ALLOWANCES);
+    if (allowRaw) {
+      try {
+        const parsed = JSON.parse(allowRaw);
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed.filter((a: any) => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
+          localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleaned));
+        }
+      } catch {}
+    }
+
+    // 5. Prune manual overrides before Aug 2026
+    const overridesRaw = localStorage.getItem(STORAGE_KEYS.MANUAL_OVERRIDES);
+    if (overridesRaw) {
+      try {
+        const parsed = JSON.parse(overridesRaw);
+        if (parsed && typeof parsed === 'object') {
+          const cleaned: Record<string, any> = {};
+          Object.entries(parsed).forEach(([k, v]) => {
+            const parts = k.split('_');
+            const dateStr = parts[parts.length - 1];
+            if (!dateStr || dateStr >= HISTORY_CUTOFF_DATE) {
+              cleaned[k] = v;
+            }
+          });
+          localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cleaned));
+        }
+      } catch {}
+    }
+
+    // 6. Clean distorted department names
     const deptRaw = localStorage.getItem(STORAGE_KEYS.DEPARTMENTS);
     if (deptRaw) {
       const parsedDepts = JSON.parse(deptRaw);
@@ -76,14 +185,28 @@ try {
   }
 } catch {}
 
-// Event emitter helper for cross-component re-renders
+// Event emitter helper for cross-component re-renders with debounce protection
+let notifyTimer: any = null;
 export const notifyDataChanged = () => {
+  if (notifyTimer) clearTimeout(notifyTimer);
+  notifyTimer = setTimeout(() => {
+    window.dispatchEvent(new Event('siemens-data-updated'));
+    window.dispatchEvent(new Event('storage-changed'));
+    window.dispatchEvent(new Event('firestore-sync-completed'));
+  }, 50);
+};
+
+export const notifyDataChangedImmediate = () => {
+  if (notifyTimer) clearTimeout(notifyTimer);
   window.dispatchEvent(new Event('siemens-data-updated'));
   window.dispatchEvent(new Event('storage-changed'));
   window.dispatchEvent(new Event('firestore-sync-completed'));
 };
 
+// In-memory cache for high-volume biometric punches to eliminate synchronous JSON stringify overhead
+let memoryPunchesCache: BiometricRawPunch[] | null = null;
 let cloudListenerAttached = false;
+let isLocalSavingPunches = false;
 
 // Parse raw punches text to punch objects
 export function parseBiometricText(text: string): BiometricRawPunch[] {
@@ -217,10 +340,11 @@ export const storage = {
       list = INITIAL_USERS;
     }
 
-    // Strictly deduplicate by email, normalizing status and properties
+    // Strictly deduplicate by email, normalizing status, and filtering out demo accounts
     const uMap = new Map<string, UserAccount>();
     list.forEach(u => {
       if (!u || !u.email) return;
+      if (isDemoUser(u)) return;
       const cleanEmail = u.email.trim().toLowerCase();
       const idLower = (u.id || '').toLowerCase();
       if (deletedKeys.has(cleanEmail)) return;
@@ -247,26 +371,27 @@ export const storage = {
       if (!existing) {
         uMap.set(cleanEmail, normalized);
       } else {
+        // When merging duplicate entries, merge with normalized taking precedence for updated fields
         const existingTime = existing.updatedAt || existing.lastLogin || existing.createdAt || '';
         const incomingTime = normalized.updatedAt || normalized.lastLogin || normalized.createdAt || '';
         const isIncomingNewer = incomingTime >= existingTime;
 
-        const primary = isIncomingNewer ? normalized : existing;
-        const secondary = isIncomingNewer ? existing : normalized;
+        const base = isIncomingNewer ? existing : normalized;
+        const top = isIncomingNewer ? normalized : existing;
 
         uMap.set(cleanEmail, {
-          ...secondary,
-          ...primary,
-          role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (primary.role || secondary.role),
-          department: (primary.department && primary.department !== 'PENDING') ? primary.department : (secondary.department || primary.department),
-          status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (primary.status || secondary.status || 'Active'),
-          photoURL: primary.photoURL || secondary.photoURL,
+          ...base,
+          ...top,
+          role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (top.role || base.role),
+          department: top.department || base.department,
+          status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (top.status || base.status || 'Active'),
+          photoURL: top.photoURL || base.photoURL,
         });
       }
     });
 
-    const deduplicated = Array.from(uMap.values());
-    // Self-heal localStorage if duplicates were present
+    const deduplicated = Array.from(uMap.values()).filter(u => !isDemoUser(u));
+    // Self-heal localStorage if duplicates or demo users were present
     if (deduplicated.length !== list.length) {
       try {
         localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(deduplicated));
@@ -275,15 +400,22 @@ export const storage = {
     return deduplicated;
   },
 
-  setUsers(users: UserAccount[]) {
+  updateUsersFromCloud(cloudUsers: UserAccount[]) {
+    if (!Array.isArray(cloudUsers)) return;
     const deletedKeys = new Set(this.getDeletedUserKeys());
     const uMap = new Map<string, UserAccount>();
-    users.forEach(u => {
+
+    cloudUsers.forEach(u => {
       if (!u || !u.email) return;
+      if (isDemoUser(u)) return;
       const cleanEmail = u.email.trim().toLowerCase();
       const idLower = (u.id || '').toLowerCase();
-      if (deletedKeys.has(cleanEmail)) return;
-      if (idLower && deletedKeys.has(idLower)) return;
+      
+      const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
+      if (!isProtected) {
+        if (deletedKeys.has(cleanEmail)) return;
+        if (idLower && deletedKeys.has(idLower)) return;
+      }
 
       let status = u.status;
       if (status) {
@@ -297,7 +429,45 @@ export const storage = {
 
       uMap.set(cleanEmail, { ...u, email: cleanEmail, status });
     });
-    const cleanUsers = Array.from(uMap.values());
+
+    const cleanList = Array.from(uMap.values()).filter(u => !isDemoUser(u));
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanList));
+      notifyDataChanged();
+    } catch (e) {
+      console.warn('updateUsersFromCloud cache warning:', e);
+    }
+  },
+
+  setUsers(users: UserAccount[]) {
+    const deletedKeys = new Set(this.getDeletedUserKeys());
+    const now = new Date().toISOString();
+    const uMap = new Map<string, UserAccount>();
+    users.forEach(u => {
+      if (!u || !u.email) return;
+      if (isDemoUser(u)) return;
+      const cleanEmail = u.email.trim().toLowerCase();
+      const idLower = (u.id || '').toLowerCase();
+      
+      const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
+      if (!isProtected) {
+        if (deletedKeys.has(cleanEmail)) return;
+        if (idLower && deletedKeys.has(idLower)) return;
+      }
+
+      let status = u.status;
+      if (status) {
+        const s = status.toLowerCase();
+        if (s === 'active') status = 'Active';
+        else if (s.includes('pending')) status = 'Pending_Approval';
+        else if (s === 'deactivated') status = 'Deactivated';
+      } else {
+        status = 'Active';
+      }
+
+      uMap.set(cleanEmail, { ...u, email: cleanEmail, status, updatedAt: u.updatedAt || now });
+    });
+    const cleanUsers = Array.from(uMap.values()).filter(u => !isDemoUser(u));
     localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
     notifyDataChanged();
     // Targeted cloud sync for users
@@ -305,9 +475,14 @@ export const storage = {
   },
 
   async saveUser(user: UserAccount): Promise<boolean> {
+    if (isDemoUser(user)) {
+      console.warn('Cannot save demo user:', user.email);
+      return false;
+    }
     this.unrecordDeletedUser(user.id, user.email);
     const current = this.getUsers();
     const cleanEmail = (user.email || '').trim().toLowerCase();
+    const now = new Date().toISOString();
     let status = user.status;
     if (status) {
       const s = status.toLowerCase();
@@ -321,17 +496,18 @@ export const storage = {
       ...user,
       email: cleanEmail,
       status,
+      updatedAt: now,
     };
 
     const uMap = new Map<string, UserAccount>();
     current.forEach(u => {
-      if (u && u.email) {
+      if (u && u.email && !isDemoUser(u)) {
         uMap.set(u.email.trim().toLowerCase(), u);
       }
     });
     uMap.set(cleanEmail, { ...(uMap.get(cleanEmail) || {}), ...normalizedUser });
 
-    const cleanUsers = Array.from(uMap.values());
+    const cleanUsers = Array.from(uMap.values()).filter(u => !isDemoUser(u));
     localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
     notifyDataChanged();
     return await firestoreSync.saveUserDirect(normalizedUser);
@@ -434,42 +610,29 @@ export const storage = {
       });
     }
 
-    // Auto-discover departments from active Shift Codes (only if NOT in deletedSet)
-    try {
-      const scData = localStorage.getItem(STORAGE_KEYS.SHIFT_CODES);
-      if (scData) {
-        const scs: ShiftCode[] = JSON.parse(scData);
-        scs.forEach(sc => {
-          const dept = (sc.department || '').trim().toUpperCase();
-          if (dept && dept !== 'ALL' && !deptMap.has(dept) && !deletedSet.has(dept)) {
-            deptMap.set(dept, { code: dept, name: dept });
-          }
-        });
-      }
-    } catch {}
-
-    // Auto-discover departments from active Employees (only if NOT in deletedSet)
-    try {
-      const empData = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
-      if (empData) {
-        const emps: Employee[] = JSON.parse(empData);
-        emps.forEach(emp => {
-          const dept = (emp.department || '').trim().toUpperCase();
-          if (dept && dept !== 'ALL' && !deptMap.has(dept) && !deletedSet.has(dept)) {
-            deptMap.set(dept, { code: dept, name: dept });
-          }
-        });
-      }
-    } catch {}
-
     const sorted = Array.from(deptMap.values()).sort((a, b) => a.code.localeCompare(b.code));
     return sorted;
   },
 
   async setDepartments(departments: Department[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(departments));
+    const nowIso = new Date().toISOString();
+    const clean = departments.map(d => ({
+      code: d.code.trim().toUpperCase(),
+      name: (d.name || d.code).trim(),
+      updatedAt: d.updatedAt || nowIso,
+    }));
+    // Also un-record from deleted if explicitly added/updated
+    const deletedCodes = this.getDeletedDepartmentCodes();
+    const cleanCodesSet = new Set(clean.map(d => d.code));
+    const newDeleted = deletedCodes.filter(c => !cleanCodesSet.has(c));
+    if (newDeleted.length !== deletedCodes.length) {
+      localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(newDeleted));
+    }
+
+    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(clean));
+    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
     notifyDataChanged();
-    return await firestoreSync.syncDepartments(departments);
+    return await firestoreSync.syncDepartments(clean);
   },
 
   async deleteDepartment(code: string): Promise<boolean> {
@@ -478,6 +641,52 @@ export const storage = {
     const list = this.getDepartments();
     const filtered = list.filter(d => (d.code || '').trim().toUpperCase() !== clean);
     localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(filtered));
+    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+
+    const fallbackDept = filtered.find(d => d.code === 'RST')?.code || filtered[0]?.code || 'GM';
+
+    // Cascade clean any Employees associated with this deleted department
+    try {
+      const emps = this.getEmployees();
+      const hasMatchingEmps = emps.some(e => (e.department || '').trim().toUpperCase() === clean);
+      if (hasMatchingEmps) {
+        const cleanedEmps = emps.map(e =>
+          (e.department || '').trim().toUpperCase() === clean
+            ? { ...e, department: fallbackDept, updatedAt: new Date().toISOString() }
+            : e
+        );
+        this.setEmployees(cleanedEmps).catch(() => null);
+      }
+    } catch {}
+
+    // Cascade clean any ShiftCodes associated with this deleted department
+    try {
+      const shiftCodes = this.getShiftCodes();
+      const hasMatchingCodes = shiftCodes.some(sc => (sc.department || '').trim().toUpperCase() === clean);
+      if (hasMatchingCodes) {
+        const cleanedCodes = shiftCodes.map(sc => 
+          (sc.department || '').trim().toUpperCase() === clean
+            ? { ...sc, department: 'ALL', updatedAt: new Date().toISOString() }
+            : sc
+        );
+        this.setShiftCodes(cleanedCodes).catch(() => null);
+      }
+    } catch {}
+
+    // Cascade clean any Users assigned to this deleted department
+    try {
+      const users = this.getUsers();
+      const hasMatchingUsers = users.some(u => (u.department || '').trim().toUpperCase() === clean);
+      if (hasMatchingUsers) {
+        const cleanedUsers = users.map(u =>
+          (u.department || '').trim().toUpperCase() === clean
+            ? { ...u, department: fallbackDept, updatedAt: new Date().toISOString() }
+            : u
+        );
+        this.setUsers(cleanedUsers).catch(() => null);
+      }
+    } catch {}
+
     notifyDataChanged();
     return await firestoreSync.deleteDepartment(clean, filtered);
   },
@@ -485,24 +694,77 @@ export const storage = {
   getEmployees(): Employee[] {
     const data = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
     if (!data) {
-      return INITIAL_EMPLOYEES;
+      const deletedNos = new Set(this.getDeletedEmployeeNos().map(x => x.trim().toUpperCase()));
+      return INITIAL_EMPLOYEES.filter(e => {
+        if (!e || !e.empNo || isDemoEmployee(e)) return false;
+        const no = e.empNo.trim().toUpperCase();
+        const gid = (e.gid || '').trim().toUpperCase();
+        const id = cleanDocId(e.empNo).toUpperCase();
+        return !deletedNos.has(no) && !deletedNos.has(gid) && !deletedNos.has(id);
+      });
     }
     try {
       const parsed: Employee[] = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
+      if (Array.isArray(parsed)) {
+        return parsed.filter(e => Boolean(e && e.empNo && !isDemoEmployee(e)));
       }
-      return INITIAL_EMPLOYEES;
+      return [];
     } catch {
-      return INITIAL_EMPLOYEES;
+      return [];
     }
   },
 
   async setEmployees(employees: Employee[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(employees));
+    const now = new Date().toISOString();
+    const cleanEmployees = (employees || [])
+      .filter(emp => emp && emp.empNo && !isDemoEmployee(emp))
+      .map(emp => {
+        const cleanItem: any = {
+          ...emp,
+          empNo: String(emp.empNo || '').trim(),
+          gid: String(emp.gid || '').trim(),
+          firstName: String(emp.firstName || '').trim(),
+          familyName: String(emp.familyName || '').trim(),
+          department: String(emp.department || 'GM').trim().toUpperCase(),
+          division: String(emp.division || 'MO CS BTS').trim(),
+          functionTitle: String(emp.functionTitle || '').trim(),
+          costCenter: String(emp.costCenter || 'C93056').trim(),
+          isShiftWorker: Boolean(emp.isShiftWorker),
+          isActive: emp.isActive !== false,
+          updatedAt: emp.updatedAt || now,
+        };
+        if (emp.empCode && String(emp.empCode).trim()) {
+          cleanItem.empCode = String(emp.empCode).trim();
+        } else {
+          delete cleanItem.empCode;
+        }
+        return cleanItem as Employee;
+      });
+
+    // Enforce uniqueness by employee number without cross-merging separate employee records
+    const empMap = new Map<string, Employee>();
+    for (const emp of cleanEmployees) {
+      const upperNo = emp.empNo.trim().toUpperCase();
+      empMap.set(upperNo, emp);
+    }
+
+    const uniqueEmployees = Array.from(empMap.values());
+
+    // Un-blacklist any active employees so getEmployees() won't filter them out
+    const identifiersToUnrecord: string[] = [];
+    uniqueEmployees.forEach(emp => {
+      if (emp.empNo) identifiersToUnrecord.push(emp.empNo);
+      if (emp.gid) identifiersToUnrecord.push(emp.gid);
+      if (emp.empCode) identifiersToUnrecord.push(emp.empCode);
+      const cleanId = cleanDocId(emp.empNo);
+      if (cleanId) identifiersToUnrecord.push(cleanId);
+    });
+    this.unrecordDeletedEmployees(identifiersToUnrecord);
+
+    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(uniqueEmployees));
     localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
     notifyDataChanged();
-    return await firestoreSync.syncEmployees(employees);
+    return await firestoreSync.syncEmployees(uniqueEmployees);
   },
 
   getDeletedEmployeeNos(): string[] {
@@ -514,12 +776,37 @@ export const storage = {
     }
   },
 
-  recordDeletedEmployee(empNo: string) {
+  unrecordDeletedEmployees(identifiers: string[]) {
     try {
-      const clean = empNo.trim().toUpperCase();
       const current = this.getDeletedEmployeeNos();
-      if (!current.includes(clean)) {
-        current.push(clean);
+      if (!current || current.length === 0) return;
+      const toRemove = new Set(identifiers.map(x => String(x || '').trim().toUpperCase()).filter(Boolean));
+      const filtered = current.filter(x => !toRemove.has(x.trim().toUpperCase()));
+      if (filtered.length !== current.length) {
+        localStorage.setItem(STORAGE_KEYS.DELETED_EMPLOYEES, JSON.stringify(filtered));
+      }
+    } catch (e) {
+      console.warn('unrecordDeletedEmployees warning:', e);
+    }
+  },
+
+  recordDeletedEmployee(empNo: string, gid?: string, empCode?: string) {
+    try {
+      const current = this.getDeletedEmployeeNos();
+      const toAdd = [empNo.trim().toUpperCase()];
+      if (gid && gid.trim()) toAdd.push(gid.trim().toUpperCase());
+      if (empCode && empCode.trim()) toAdd.push(empCode.trim().toUpperCase());
+      const cleanId = cleanDocId(empNo).toUpperCase();
+      if (cleanId) toAdd.push(cleanId);
+
+      let changed = false;
+      toAdd.forEach(item => {
+        if (!current.includes(item)) {
+          current.push(item);
+          changed = true;
+        }
+      });
+      if (changed) {
         localStorage.setItem(STORAGE_KEYS.DELETED_EMPLOYEES, JSON.stringify(current));
       }
     } catch (e) {
@@ -527,15 +814,317 @@ export const storage = {
     }
   },
 
-  async deleteEmployee(empNo: string): Promise<boolean> {
-    const clean = empNo.trim().toUpperCase();
-    this.recordDeletedEmployee(clean);
+  async saveEmployee(emp: Employee): Promise<boolean> {
     const list = this.getEmployees();
-    const filtered = list.filter(e => e.empNo.trim().toUpperCase() !== clean);
+    const cleanNo = (emp.empNo || '').trim().toUpperCase();
+    const cleanGid = (emp.gid || '').trim().toUpperCase();
+    const nowIso = new Date().toISOString();
+
+    const idx = list.findIndex(e => 
+      (e.empNo && e.empNo.trim().toUpperCase() === cleanNo) ||
+      (e.gid && e.gid.trim().toUpperCase() === cleanGid)
+    );
+
+    const updatedEmp: Employee = {
+      ...emp,
+      empNo: emp.empNo?.trim() || (idx >= 0 ? list[idx].empNo : cleanNo),
+      gid: emp.gid?.trim() || (idx >= 0 ? list[idx].gid : cleanGid),
+      department: (emp.department || (idx >= 0 ? list[idx].department : 'GM')).trim().toUpperCase(),
+      updatedAt: nowIso,
+    };
+
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], ...updatedEmp };
+    } else {
+      list.push(updatedEmp);
+    }
+
+    return await this.setEmployees(list);
+  },
+
+  async deleteEmployee(empNo: string): Promise<boolean> {
+    const cleanNo = empNo.trim().toUpperCase();
+    const list = this.getEmployees();
+    const targetEmp = list.find(e => 
+      (e.empNo || '').trim().toUpperCase() === cleanNo || 
+      (e.gid || '').trim().toUpperCase() === cleanNo ||
+      (e.empCode && e.empCode.trim().toUpperCase() === cleanNo)
+    );
+    this.recordDeletedEmployee(empNo, targetEmp?.gid, targetEmp?.empCode);
+
+    const filtered = list.filter(e => {
+      const eNo = (e.empNo || '').trim().toUpperCase();
+      const eGid = (e.gid || '').trim().toUpperCase();
+      const eCode = (e.empCode || '').trim().toUpperCase();
+      const matchEmpNo = eNo === cleanNo;
+      const matchGid = Boolean(targetEmp?.gid && eGid === targetEmp.gid.trim().toUpperCase());
+      const matchCode = Boolean(targetEmp?.empCode && eCode === targetEmp.empCode.trim().toUpperCase());
+      return !matchEmpNo && !matchGid && !matchCode && !isDemoEmployee(e);
+    });
+
     localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(filtered));
     localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
     notifyDataChanged();
-    return await firestoreSync.deleteEmployee(empNo, filtered);
+    
+    // Non-blocking background sync so UI never hangs or freezes
+    firestoreSync.deleteEmployee(empNo, filtered).catch(e => {
+      console.warn('firestoreSync.deleteEmployee background notice:', e);
+    });
+    return true;
+  },
+
+  /**
+   * Safely rename an employee's Primary Key (Employee No.) and cascade-update
+   * all related Shift Plans, Biometric Punches, OT Records, Allowances, and Manual Overrides
+   */
+  async changeEmployeeNo(oldEmpNo: string, newEmpNo: string): Promise<{
+    success: boolean;
+    error?: string;
+    updatedPlansCount: number;
+    updatedPunchesCount: number;
+    updatedOTCount: number;
+    updatedAllowancesCount: number;
+  }> {
+    const cleanOld = (oldEmpNo || '').trim();
+    const cleanNew = (newEmpNo || '').trim();
+
+    if (!cleanOld || !cleanNew) {
+      return {
+        success: false,
+        error: 'รหัสพนักงานเดิมและรหัสใหม่ต้องไม่เป็นค่าว่าง',
+        updatedPlansCount: 0,
+        updatedPunchesCount: 0,
+        updatedOTCount: 0,
+        updatedAllowancesCount: 0
+      };
+    }
+
+    if (cleanOld.toUpperCase() === cleanNew.toUpperCase()) {
+      return {
+        success: true,
+        updatedPlansCount: 0,
+        updatedPunchesCount: 0,
+        updatedOTCount: 0,
+        updatedAllowancesCount: 0
+      };
+    }
+
+    const emps = this.getEmployees();
+    const oldNum = /^\d+$/.test(cleanOld) ? parseInt(cleanOld, 10) : null;
+    const newNum = /^\d+$/.test(cleanNew) ? parseInt(cleanNew, 10) : null;
+
+    let targetIdx = emps.findIndex(e => (e.empNo || '').trim().toUpperCase() === cleanOld.toUpperCase());
+    if (targetIdx === -1 && oldNum !== null) {
+      targetIdx = emps.findIndex(e => {
+        const eNo = (e.empNo || '').trim();
+        return /^\d+$/.test(eNo) && parseInt(eNo, 10) === oldNum;
+      });
+    }
+
+    if (targetIdx === -1) {
+      return {
+        success: false,
+        error: `ไม่พบพนักงานรหัส ${cleanOld} ในระบบ`,
+        updatedPlansCount: 0,
+        updatedPunchesCount: 0,
+        updatedOTCount: 0,
+        updatedAllowancesCount: 0
+      };
+    }
+
+    // Check if newEmpNo is already taken by another employee
+    const collision = emps.find((e, idx) => {
+      if (idx === targetIdx) return false;
+      const eNo = (e.empNo || '').trim().toUpperCase();
+      if (eNo === cleanNew.toUpperCase()) return true;
+      if (newNum !== null && /^\d+$/.test(eNo) && parseInt(eNo, 10) === newNum) return true;
+      return false;
+    });
+
+    if (collision) {
+      return {
+        success: false,
+        error: `รหัสพนักงานใหม่ "${cleanNew}" ซ้ำกับพนักงานที่มีอยู่แล้ว (${collision.firstName} ${collision.familyName} แผนก ${collision.department})`,
+        updatedPlansCount: 0,
+        updatedPunchesCount: 0,
+        updatedOTCount: 0,
+        updatedAllowancesCount: 0
+      };
+    }
+
+    // Un-record cleanNew from deleted employees
+    this.unrecordDeletedEmployees([cleanNew, cleanDocId(cleanNew)]);
+
+    // 1. Update Employee Record
+    const targetEmp = emps[targetIdx];
+    const actualOldEmpNo = targetEmp.empNo || cleanOld;
+    const updatedEmp: Employee = {
+      ...targetEmp,
+      empNo: cleanNew,
+      id: `emp-${cleanNew}`,
+      updatedAt: new Date().toISOString()
+    };
+    emps[targetIdx] = updatedEmp;
+
+    // 2. Cascade Update Shift Plans
+    let updatedPlansCount = 0;
+    const plans = this.getShiftPlans();
+    let plansChanged = false;
+    const updatedPlans = plans.map(p => {
+      const pEmpNo = (p.empNo || '').trim().toUpperCase();
+      const matchOld = pEmpNo === cleanOld.toUpperCase() || pEmpNo === actualOldEmpNo.toUpperCase() ||
+        (oldNum !== null && /^\d+$/.test(pEmpNo) && parseInt(pEmpNo, 10) === oldNum);
+      if (matchOld) {
+        updatedPlansCount++;
+        plansChanged = true;
+        return {
+          ...p,
+          empNo: cleanNew,
+          id: p.id ? p.id.replace(actualOldEmpNo, cleanNew).replace(cleanOld, cleanNew) : `${cleanNew}_${p.date}`
+        };
+      }
+      return p;
+    });
+
+    // 3. Cascade Update Biometric Punches
+    let updatedPunchesCount = 0;
+    const punches = this.getBiometricPunches();
+    let punchesChanged = false;
+    const updatedPunches = punches.map(p => {
+      const pId = (p.empIdentifier || '').trim().toUpperCase();
+      const matchOld = pId === cleanOld.toUpperCase() || pId === actualOldEmpNo.toUpperCase() ||
+        (oldNum !== null && /^\d+$/.test(pId) && parseInt(pId, 10) === oldNum);
+      if (matchOld) {
+        updatedPunchesCount++;
+        punchesChanged = true;
+        return {
+          ...p,
+          empIdentifier: cleanNew
+        };
+      }
+      return p;
+    });
+
+    // 4. Cascade Update OT Records
+    let updatedOTCount = 0;
+    const ot = this.getOTRecords();
+    let otChanged = false;
+    const updatedOT = ot.map(o => {
+      const oEmpNo = (o.empNo || '').trim().toUpperCase();
+      const matchOld = oEmpNo === cleanOld.toUpperCase() || oEmpNo === actualOldEmpNo.toUpperCase() ||
+        (oldNum !== null && /^\d+$/.test(oEmpNo) && parseInt(oEmpNo, 10) === oldNum);
+      if (matchOld) {
+        updatedOTCount++;
+        otChanged = true;
+        return {
+          ...o,
+          empNo: cleanNew
+        };
+      }
+      return o;
+    });
+
+    // 5. Cascade Update Other Allowances
+    let updatedAllowancesCount = 0;
+    const allow = this.getOtherAllowances();
+    let allowChanged = false;
+    const updatedAllow = allow.map(a => {
+      const aEmpNo = (a.empNo || '').trim().toUpperCase();
+      const matchOld = aEmpNo === cleanOld.toUpperCase() || aEmpNo === actualOldEmpNo.toUpperCase() ||
+        (oldNum !== null && /^\d+$/.test(aEmpNo) && parseInt(aEmpNo, 10) === oldNum);
+      if (matchOld) {
+        updatedAllowancesCount++;
+        allowChanged = true;
+        return {
+          ...a,
+          empNo: cleanNew
+        };
+      }
+      return a;
+    });
+
+    // 6. Cascade Update Manual Overrides
+    const overrides = this.getManualOverrides();
+    let overridesChanged = false;
+    const newOverrides: Record<string, Partial<TimeSheetRow>> = {};
+    Object.entries(overrides).forEach(([key, val]) => {
+      if (key.startsWith(`${cleanOld}_`)) {
+        overridesChanged = true;
+        const newKey = `${cleanNew}_${key.substring(cleanOld.length + 1)}`;
+        newOverrides[newKey] = val;
+      } else if (key.startsWith(`${actualOldEmpNo}_`)) {
+        overridesChanged = true;
+        const newKey = `${cleanNew}_${key.substring(actualOldEmpNo.length + 1)}`;
+        newOverrides[newKey] = val;
+      } else {
+        newOverrides[key] = val;
+      }
+    });
+
+    // 7. Synchronously persist all changes immediately so UI updates instantaneously
+    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(emps));
+    localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+
+    if (plansChanged) {
+      localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(updatedPlans));
+      localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+    }
+
+    if (punchesChanged) {
+      memoryPunchesCache = updatedPunches;
+      try {
+        localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(updatedPunches));
+        localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+      } catch (err) {
+        console.warn('LocalStorage quota warning saving punches:', err);
+      }
+    }
+
+    if (otChanged) {
+      localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(updatedOT));
+    }
+
+    if (allowChanged) {
+      localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(updatedAllow));
+    }
+
+    if (overridesChanged) {
+      localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(newOverrides));
+    }
+
+    notifyDataChanged();
+
+    // 8. Fire non-blocking Cloud Firestore background sync
+    (async () => {
+      try {
+        // Clean up old legacy doc in Firestore
+        firestoreSync.deleteEmployee(cleanOld).catch(() => null);
+        if (actualOldEmpNo !== cleanOld) {
+          firestoreSync.deleteEmployee(actualOldEmpNo).catch(() => null);
+        }
+
+        const cloudTasks: Promise<any>[] = [
+          firestoreSync.syncEmployees(emps)
+        ];
+        if (plansChanged) cloudTasks.push(firestoreSync.syncShiftPlans(updatedPlans));
+        if (punchesChanged) cloudTasks.push(firestoreSync.syncBiometricPunches(updatedPunches));
+        if (otChanged) cloudTasks.push(firestoreSync.syncOTRecords(updatedOT));
+        if (allowChanged) cloudTasks.push(firestoreSync.syncOtherAllowances(updatedAllow));
+        if (overridesChanged) cloudTasks.push(firestoreSync.syncManualOverrides(newOverrides));
+
+        await Promise.allSettled(cloudTasks);
+      } catch (err) {
+        console.warn('Background Firestore sync for changeEmployeeNo caught warning:', err);
+      }
+    })();
+
+    return {
+      success: true,
+      updatedPlansCount,
+      updatedPunchesCount,
+      updatedOTCount,
+      updatedAllowancesCount
+    };
   },
 
   getShiftCodes(): ShiftCode[] {
@@ -549,15 +1138,35 @@ export const storage = {
         return INITIAL_SHIFT_CODES;
       }
 
-      // Preserve all custom and master shift codes cleanly without trimming
+      // Preserve all custom and master shift codes cleanly and ensure normalized HH:mm times
       const cleaned: ShiftCode[] = parsed.map(sc => {
-        const base = INITIAL_SHIFT_CODES.find(m => m.code.toUpperCase() === sc.code.toUpperCase());
+        const isWorking = sc.isWorkingDay !== undefined ? sc.isWorkingDay : true;
+        const normStart = !isWorking 
+          ? (normalizeShiftTimeString(sc.startTime) || '00:00')
+          : (normalizeShiftTimeString(sc.startTime) || '08:00');
+        const normEnd = !isWorking 
+          ? (normalizeShiftTimeString(sc.endTime) || '00:00')
+          : (normalizeShiftTimeString(sc.endTime) || '17:00');
+
         return {
           ...sc,
-          name: base ? base.name : (sc.name || sc.code).replace(/\s*\([A-Z0-9_\/]+\)$/, '').trim(),
+          department: (sc.department || 'ALL').trim(),
+          name: (sc.name || sc.code).trim(),
+          startTime: normStart,
+          endTime: normEnd,
           description: sc.description || '',
         };
       });
+
+      // Ensure essential initial shift codes (such as D2 for BES/PSY) are always present
+      const existingKeySet = new Set(cleaned.map(c => `${c.code.trim().toUpperCase()}_${(c.department || 'ALL').trim().toUpperCase()}`));
+      for (const initCode of INITIAL_SHIFT_CODES) {
+        const initKey = `${initCode.code.trim().toUpperCase()}_${(initCode.department || 'ALL').trim().toUpperCase()}`;
+        if (!existingKeySet.has(initKey)) {
+          cleaned.push({ ...initCode, department: (initCode.department || 'ALL').trim() });
+          existingKeySet.add(initKey);
+        }
+      }
 
       return cleaned;
     } catch {
@@ -566,11 +1175,18 @@ export const storage = {
   },
 
   async setShiftCodes(codes: ShiftCode[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(codes));
+    const nowIso = new Date().toISOString();
+    const stamped = codes.map(c => ({
+      ...c,
+      code: (c.code || '').trim().toUpperCase(),
+      department: (c.department || 'ALL').trim(),
+      updatedAt: c.updatedAt || nowIso,
+    }));
+    localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(stamped));
     localStorage.setItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
     notifyDataChanged();
     // Targeted sync in bundled collection (1 write)
-    const res = await firestoreSync.syncShiftCodes(codes);
+    const res = await firestoreSync.syncShiftCodes(stamped);
     // Also sync departments if any newly discovered departments were added
     const depts = this.getDepartments();
     firestoreSync.syncDepartments(depts).catch(console.warn);
@@ -585,7 +1201,7 @@ export const storage = {
     try {
       const parsed: DailyShiftPlan[] = JSON.parse(data);
       if (Array.isArray(parsed)) {
-        return parsed;
+        return parsed.filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
       }
       return [];
     } catch {
@@ -593,30 +1209,75 @@ export const storage = {
     }
   },
   async setShiftPlans(plans: DailyShiftPlan[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(plans));
+    const cleanPlans = (plans || []).filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
+    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
     localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
-    notifyDataChanged();
-    return await firestoreSync.syncShiftPlans(plans);
+    notifyDataChangedImmediate();
+    return await firestoreSync.syncShiftPlans(cleanPlans);
   },
 
   getBiometricPunches(): BiometricRawPunch[] {
+    if (memoryPunchesCache !== null) {
+      return memoryPunchesCache;
+    }
     const data = localStorage.getItem(STORAGE_KEYS.RAW_PUNCHES);
     if (!data) {
-      return [];
+      memoryPunchesCache = [];
+      return memoryPunchesCache;
     }
     try {
       const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) return parsed;
-      return [];
+      if (Array.isArray(parsed)) {
+        memoryPunchesCache = parsed.filter(
+          (p): p is BiometricRawPunch =>
+            Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '' && (!p.date || p.date >= HISTORY_CUTOFF_DATE))
+        );
+        return memoryPunchesCache;
+      }
+      memoryPunchesCache = [];
+      return memoryPunchesCache;
     } catch {
-      return [];
+      memoryPunchesCache = [];
+      return memoryPunchesCache;
     }
   },
   async setBiometricPunches(punches: BiometricRawPunch[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(punches));
-    localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+    const cleanPunches = (punches || []).filter(
+      (p): p is BiometricRawPunch =>
+        Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '' && (!p.date || p.date >= HISTORY_CUTOFF_DATE))
+    );
+    
+    // 1. Immediately update fast memory cache so UI components receive data synchronously with zero blocking
+    memoryPunchesCache = cleanPunches;
+    isLocalSavingPunches = true;
+
+    // 2. Persist to LocalStorage with quota exhaustion safety
+    try {
+      localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
+      localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+    } catch (storageErr) {
+      console.warn('LocalStorage quota limit reached for full biometric dataset; falling back to memory & Firestore persistence:', storageErr);
+      // Try keeping the most recent 15,000 punches in localStorage if quota exceeded
+      try {
+        const trimmedForLocalStorage = cleanPunches.slice(-15000);
+        localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(trimmedForLocalStorage));
+        localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+      } catch {}
+    }
+
     notifyDataChanged();
-    return await firestoreSync.syncBiometricPunches(punches);
+
+    // 3. Background Sync full bundle to Cloud Firestore (non-blocking for UI)
+    firestoreSync.syncBiometricPunches(cleanPunches)
+      .then(() => {
+        setTimeout(() => { isLocalSavingPunches = false; }, 1000);
+      })
+      .catch((e) => {
+        console.warn('Background syncBiometricPunches caught error:', e);
+        isLocalSavingPunches = false;
+      });
+
+    return true;
   },
 
   getOTRecords(): OTRecord[] {
@@ -625,15 +1286,21 @@ export const storage = {
       return [];
     }
     try {
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) {
+        return sanitizeOTRecords(parsed).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+      }
+      return [];
     } catch {
       return [];
     }
   },
   async setOTRecords(records: OTRecord[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(records));
+    const sanitized = sanitizeOTRecords(records || []);
+    const cleanRecords = sanitized.filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+    localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanRecords));
     notifyDataChanged();
-    return await firestoreSync.syncOTRecords(records);
+    return await firestoreSync.syncOTRecords(cleanRecords);
   },
 
   getOtherAllowances(): OtherAllowance[] {
@@ -642,30 +1309,57 @@ export const storage = {
       return [];
     }
     try {
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) {
+        return parsed.filter(a => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
+      }
+      return [];
     } catch {
       return [];
     }
   },
   async setOtherAllowances(allw: OtherAllowance[]): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(allw));
+    const cleanAllowances = (allw || []).filter(a => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
+    localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleanAllowances));
     notifyDataChanged();
-    return await firestoreSync.syncOtherAllowances(allw);
+    return await firestoreSync.syncOtherAllowances(cleanAllowances);
   },
 
   getManualOverrides(): Record<string, Partial<TimeSheetRow>> {
     const data = localStorage.getItem(STORAGE_KEYS.MANUAL_OVERRIDES);
     if (!data) return {};
     try {
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') {
+        const filtered: Record<string, Partial<TimeSheetRow>> = {};
+        Object.entries(parsed).forEach(([k, v]) => {
+          const parts = k.split('_');
+          const dateStr = parts[parts.length - 1];
+          if (!dateStr || dateStr >= HISTORY_CUTOFF_DATE) {
+            filtered[k] = v as Partial<TimeSheetRow>;
+          }
+        });
+        return filtered;
+      }
+      return {};
     } catch {
       return {};
     }
   },
   async setManualOverrides(overrides: Record<string, Partial<TimeSheetRow>>): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(overrides));
+    const cleanOverrides: Record<string, Partial<TimeSheetRow>> = {};
+    if (overrides && typeof overrides === 'object') {
+      Object.entries(overrides).forEach(([k, v]) => {
+        const parts = k.split('_');
+        const dateStr = parts[parts.length - 1];
+        if (!dateStr || dateStr >= HISTORY_CUTOFF_DATE) {
+          cleanOverrides[k] = v;
+        }
+      });
+    }
+    localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cleanOverrides));
     notifyDataChanged();
-    return await firestoreSync.syncManualOverrides(overrides);
+    return await firestoreSync.syncManualOverrides(cleanOverrides);
   },
 
   async syncAllToCloud(): Promise<boolean> {
@@ -683,168 +1377,117 @@ export const storage = {
   },
 
   async initCloudSync(): Promise<{ connected: boolean; source: 'cloud' | 'local' }> {
+    if (firestoreSync.isQuotaExceeded()) {
+      return { connected: false, source: 'local' };
+    }
     try {
       const isConnected = await testFirestoreConnection();
-      if (!isConnected) {
+      if (!isConnected || firestoreSync.isQuotaExceeded()) {
         return { connected: false, source: 'local' };
       }
 
       const cloudData = await firestoreSync.fetchAllFromCloud();
       if (cloudData && cloudData.hasData) {
-        // 1. SAFE MERGE SHIFT CODES (Preserve Cloud + Local + Master without trimming)
-        const codeMap = new Map<string, ShiftCode>();
-        INITIAL_SHIFT_CODES.forEach(c => {
-          const key = `${c.code.toUpperCase()}_${(c.department || 'ALL').toUpperCase()}`;
-          codeMap.set(key, { ...c });
-        });
-
-        // Overlay cloud codes
+        // 1. SHIFT CODES (Cloud is authoritative master)
         if (cloudData.shiftCodes && cloudData.shiftCodes.length > 0) {
-          cloudData.shiftCodes.forEach(c => {
-            if (c && c.code) {
-              const key = `${c.code.toUpperCase()}_${(c.department || 'ALL').toUpperCase()}`;
-              codeMap.set(key, {
-                ...c,
-                name: c.name ? c.name.replace(/\s*\([A-Z0-9_\/]+\)$/, '').trim() : c.code,
-              });
-            }
-          });
+          const cleanCodes = cloudData.shiftCodes.map(c => ({
+            ...c,
+            code: (c.code || '').trim().toUpperCase(),
+            department: (c.department || 'ALL').trim(),
+            name: (c.name || c.code).trim(),
+          }));
+          localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(cleanCodes));
+          localStorage.setItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
         }
 
-        // Overlay local codes (if local machine has newly uploaded/custom shift codes)
-        const localCodes = this.getShiftCodes();
-        localCodes.forEach(c => {
-          if (c && c.code) {
-            const key = `${c.code.toUpperCase()}_${(c.department || 'ALL').toUpperCase()}`;
-            if (!codeMap.has(key)) {
-              codeMap.set(key, c);
-            }
-          }
-        });
-
-        const mergedCodes = Array.from(codeMap.values());
-        localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(mergedCodes));
-
-        // If local merged set contains codes not yet in Cloud, or Cloud was empty, sync to Cloud
-        if (!cloudData.shiftCodes || mergedCodes.length > cloudData.shiftCodes.length) {
-          firestoreSync.syncShiftCodes(mergedCodes).catch(console.warn);
-        }
-
-        // 2. SAFE MERGE BIOMETRIC PUNCHES (Deduplicate and preserve records)
-        const localPunches = this.getBiometricPunches();
+        // 2. BIOMETRIC PUNCHES (Cloud is authoritative master)
         if (cloudData.punches && cloudData.punches.length > 0) {
-          const punchMap = new Map<string, BiometricRawPunch>();
-          cloudData.punches.forEach(p => {
-            punchMap.set(`${p.empIdentifier}_${p.date}_${p.time}_${p.type}`, p);
-          });
-          localPunches.forEach(p => {
-            punchMap.set(`${p.empIdentifier}_${p.date}_${p.time}_${p.type}`, p);
-          });
-          const mergedPunches = Array.from(punchMap.values());
-          localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(mergedPunches));
-          if (mergedPunches.length > cloudData.punches.length) {
-            firestoreSync.syncBiometricPunches(mergedPunches).catch(console.warn);
+          const cleanPunches = cloudData.punches.filter(
+            (p): p is BiometricRawPunch =>
+              Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '' && (!p.date || p.date >= HISTORY_CUTOFF_DATE))
+          );
+          memoryPunchesCache = cleanPunches;
+          try {
+            localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
+            localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+          } catch {
+            try {
+              localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches.slice(-15000)));
+            } catch {}
           }
-        } else if (localPunches.length > 0) {
-          firestoreSync.syncBiometricPunches(localPunches).catch(console.warn);
         }
 
-        // 3. EMPLOYEES (Cloud is source of truth)
-        const localEmps = this.getEmployees();
-        const deletedNos = new Set(this.getDeletedEmployeeNos());
+        // 3. EMPLOYEES (Cloud is authoritative master)
         if (cloudData.employees && cloudData.employees.length > 0) {
-          const empMap = new Map<string, Employee>();
-          cloudData.employees.forEach(e => {
-            if (e && e.empNo) {
-              const key = e.empNo.trim().toUpperCase();
-              if (!deletedNos.has(key)) {
-                empMap.set(key, e);
-              }
-            }
-          });
-          const mergedEmps = Array.from(empMap.values());
-          localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(mergedEmps));
-        } else if (localEmps.length > 0) {
-          const cleanLocal = localEmps.filter(e => !deletedNos.has(e.empNo.trim().toUpperCase()));
-          firestoreSync.syncEmployees(cleanLocal).catch(console.warn);
-        }
-
-        // 4. SAFE MERGE SHIFT PLANS (Cloud takes priority unless local updatedAt is strictly newer)
-        const localPlans = this.getShiftPlans();
-        if (cloudData.shiftPlans && cloudData.shiftPlans.length > 0) {
-          const planMap = new Map<string, DailyShiftPlan>();
-          cloudData.shiftPlans.forEach(p => {
-            if (p && p.date && (p.empNo || p.gid)) {
-              planMap.set(`${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`, p);
-            }
-          });
-          localPlans.forEach(p => {
-            if (p && p.date && (p.empNo || p.gid)) {
-              const key = `${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`;
-              const existing = planMap.get(key);
-              if (!existing) {
-                planMap.set(key, p);
-              } else {
-                const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
-                const localTime = p.updatedAt ? new Date(p.updatedAt).getTime() : 0;
-                if (localTime > existingTime) {
-                  planMap.set(key, p);
-                }
-              }
-            }
-          });
-          const mergedPlans = Array.from(planMap.values());
-          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(mergedPlans));
-          if (mergedPlans.length > cloudData.shiftPlans.length) {
-            firestoreSync.syncShiftPlans(mergedPlans).catch(console.warn);
+          const cleanCloudEmps = cloudData.employees.filter(e => e && e.empNo && !isDemoEmployee(e));
+          if (cleanCloudEmps.length > 0) {
+            localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanCloudEmps));
+            localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
           }
-        } else if (localPlans.length > 0) {
-          firestoreSync.syncShiftPlans(localPlans).catch(console.warn);
         }
 
-        // 5. DEPARTMENTS
+        // 4. SHIFT PLANS (Cloud is authoritative master)
+        if ((cloudData as any).hasShiftPlansBundle || (cloudData.shiftPlans && cloudData.shiftPlans.length > 0)) {
+          const cleanPlans = (cloudData.shiftPlans || []).filter(p => p && (!p.date || p.date >= HISTORY_CUTOFF_DATE) && (p.empNo || p.gid));
+          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
+          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+        }
+
+        // 5. DEPARTMENTS & DELETED DEPARTMENTS (Cloud is authoritative master)
+        if (cloudData.deletedDepartments && Array.isArray(cloudData.deletedDepartments) && cloudData.deletedDepartments.length > 0) {
+          const currentDeleted = new Set(this.getDeletedDepartmentCodes());
+          cloudData.deletedDepartments.forEach(d => currentDeleted.add(d.trim().toUpperCase()));
+          localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(currentDeleted)));
+        }
+
         if (cloudData.departments && cloudData.departments.length > 0) {
-          const deletedSet = new Set(this.getDeletedDepartmentCodes());
-          const cleanDepts = cloudData.departments.filter(d => d && d.code && !deletedSet.has(d.code.trim().toUpperCase()));
+          const deletedDeptSet = new Set(this.getDeletedDepartmentCodes());
+          const cleanDepts = cloudData.departments
+            .filter(d => d && d.code && !deletedDeptSet.has(d.code.trim().toUpperCase()))
+            .map(d => ({ ...d, code: d.code.trim().toUpperCase(), name: (d.name || d.code).trim() }))
+            .sort((a, b) => a.code.localeCompare(b.code));
           if (cleanDepts.length > 0) {
             localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
+            localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
           }
         }
 
-        // 6. OT, Allowances, Users, Manual Overrides
-        if (cloudData.otRecords && cloudData.otRecords.length > 0) {
-          const localOT = this.getOTRecords();
-          if (localOT.length === 0) {
-            localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cloudData.otRecords));
-          } else {
-            const mergedOT = mergeAndDeduplicateOTRecords(
-              cloudData.otRecords,
-              localOT,
-              'ALL',
-              'ALL',
-              'smart_merge',
-              this.getEmployees()
-            ).merged;
-            localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(mergedOT));
-          }
+        // 6. OT RECORDS (Cloud is authoritative master)
+        if ((cloudData as any).hasOTBundle || (cloudData.otRecords && cloudData.otRecords.length > 0)) {
+          const cleanOT = (cloudData.otRecords || []).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+          localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanOT));
         }
+
+        // 7. OTHER ALLOWANCES (Cloud is authoritative master)
         if (cloudData.otherAllowances && cloudData.otherAllowances.length > 0) {
-          localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cloudData.otherAllowances));
+          const cleanAllw = cloudData.otherAllowances.filter(a => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
+          localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleanAllw));
         }
+
+        // 8. USERS (Cloud is authoritative master)
         if (cloudData.users && cloudData.users.length > 0) {
           const deletedKeys = new Set(this.getDeletedUserKeys());
           const cleanCloudUsers = cloudData.users.filter(u => {
             if (!u) return false;
-            if (u.id && deletedKeys.has(u.id)) return false;
-            if (u.email && deletedKeys.has(u.email.trim().toLowerCase())) return false;
+            if (isDemoUser(u)) return false;
+            const cleanEmail = (u.email || '').trim().toLowerCase();
+            const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
+            if (!isProtected) {
+              if (u.id && deletedKeys.has(u.id)) return false;
+              if (u.email && deletedKeys.has(cleanEmail)) return false;
+            }
             return true;
           });
           localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanCloudUsers));
         }
+
+        // 9. MANUAL OVERRIDES (Cloud is authoritative master)
         if (cloudData.manualOverrides && Object.keys(cloudData.manualOverrides).length > 0) {
-          const localOv = this.getManualOverrides();
-          localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({ ...cloudData.manualOverrides, ...localOv }));
+          localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cloudData.manualOverrides));
         }
+
+        // Asynchronously purge any cloud demo user records in the background
+        firestoreSync.purgeDemoUsersFromCloud().catch(() => null);
 
         notifyDataChanged();
 
@@ -859,14 +1502,33 @@ export const storage = {
                   localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(fresh.shiftCodes));
                 }
                 if (fresh.employees && fresh.employees.length > 0) {
-                  const deletedNos = new Set(this.getDeletedEmployeeNos());
-                  const cleanFreshEmps = fresh.employees.filter(e => !deletedNos.has(e.empNo.trim().toUpperCase()));
-                  localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanFreshEmps));
+                  const cleanFreshEmps = fresh.employees.filter(e => e && e.empNo && !isDemoEmployee(e));
+                  if (cleanFreshEmps.length > 0) {
+                    const localEmps = this.getEmployees();
+                    const localMod = parseInt(localStorage.getItem(STORAGE_KEYS.EMPLOYEES_MODIFIED) || '0', 10);
+                    const isFreshLocalEdit = localEmps.length > 0 && (Date.now() - localMod < 6000);
+                    
+                    if (!isFreshLocalEdit) {
+                      localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanFreshEmps));
+                      localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+                    }
+                  }
+                }
+                if (fresh.deletedDepartments && Array.isArray(fresh.deletedDepartments) && fresh.deletedDepartments.length > 0) {
+                  const currentDeleted = new Set(this.getDeletedDepartmentCodes());
+                  fresh.deletedDepartments.forEach(d => currentDeleted.add(d.trim().toUpperCase()));
+                  localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(currentDeleted)));
                 }
                 if (fresh.departments && fresh.departments.length > 0) {
                   const deletedCodes = new Set(this.getDeletedDepartmentCodes());
-                  const cleanFreshDepts = fresh.departments.filter(d => d && d.code && !deletedCodes.has(d.code.trim().toUpperCase()));
-                  localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanFreshDepts));
+                  const cleanFreshDepts = fresh.departments
+                    .filter(d => d && d.code && !deletedCodes.has(d.code.trim().toUpperCase()))
+                    .map(d => ({ ...d, code: d.code.trim().toUpperCase(), name: (d.name || d.code).trim() }))
+                    .sort((a, b) => a.code.localeCompare(b.code));
+                  if (cleanFreshDepts.length > 0) {
+                    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanFreshDepts));
+                    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+                  }
                 }
                 if (fresh.shiftPlans && fresh.shiftPlans.length > 0) {
                   localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(fresh.shiftPlans));
@@ -875,17 +1537,37 @@ export const storage = {
                   const deletedKeys = new Set(this.getDeletedUserKeys());
                   const cleanFreshUsers = fresh.users.filter(u => {
                     if (!u) return false;
-                    if (u.id && deletedKeys.has(u.id)) return false;
-                    if (u.email && deletedKeys.has(u.email.trim().toLowerCase())) return false;
+                    if (isDemoUser(u)) return false;
+                    const cleanEmail = (u.email || '').trim().toLowerCase();
+                    const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
+                    if (!isProtected) {
+                      if (u.id && deletedKeys.has(u.id)) return false;
+                      if (u.email && deletedKeys.has(cleanEmail)) return false;
+                    }
                     return true;
                   });
                   localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanFreshUsers));
                 }
-                if (fresh.punches && fresh.punches.length > 0) {
-                  localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(fresh.punches));
+                if (fresh.punches && fresh.punches.length > 0 && !isLocalSavingPunches) {
+                  const cleanFreshPunches = fresh.punches.filter(
+                    (p): p is BiometricRawPunch =>
+                      Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '')
+                  );
+                  memoryPunchesCache = cleanFreshPunches;
+                  localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanFreshPunches));
                 }
-                if (fresh.otRecords && fresh.otRecords.length > 0) {
-                  localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(fresh.otRecords));
+                if ((fresh as any).hasShiftPlansBundle || (fresh.shiftPlans && fresh.shiftPlans.length > 0)) {
+                  const cleanFreshPlans = (fresh.shiftPlans || []).filter(p => p && (!p.date || p.date >= HISTORY_CUTOFF_DATE) && (p.empNo || p.gid));
+                  localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanFreshPlans));
+                  localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+                }
+                if ((fresh as any).hasOTBundle || (fresh.otRecords && fresh.otRecords.length > 0)) {
+                  const cleanFreshOT = (fresh.otRecords || []).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+                  localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanFreshOT));
+                }
+                if (fresh.manualOverrides && Object.keys(fresh.manualOverrides).length > 0) {
+                  const currentLocal = this.getManualOverrides();
+                  localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({ ...fresh.manualOverrides, ...currentLocal }));
                 }
                 notifyDataChanged();
               }
@@ -920,15 +1602,15 @@ export const storage = {
     const cleanDepts = currentDepts.filter(d => !isDemoDepartment(d.code));
     localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
 
-    // 3. Clean Employees: reassign any employees having demo departments to authentic railway depts
+    // 3. Clean Employees: remove any demo employees & sanitize departments
     const currentEmps = this.getEmployees();
-    const cleanEmps = currentEmps.map(sanitizeEmployeeDepartment);
+    const cleanEmps = currentEmps.filter(e => e && e.empNo && !isDemoEmployee(e)).map(sanitizeEmployeeDepartment);
     localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanEmps));
     localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
 
-    // 4. Clean Users: reassign any user account having RS/SIG/STN
+    // 4. Clean Users: remove any demo user accounts
     const users = this.getUsers();
-    const cleanUsers = users.map(u => {
+    const cleanUsers = users.filter(u => !isDemoUser(u)).map(u => {
       const d = (u.department || '').trim().toUpperCase();
       if (isDemoDepartment(d)) {
         return { ...u, department: d === 'SIG' ? 'TEL' : 'RST' };
@@ -984,6 +1666,43 @@ export const storage = {
   },
   resetToDefaults() {
     this.resetAllToInitial();
+  },
+
+  // Prune all historical data prior to August 2026 (Aug 1, 2026) to reduce payload and eliminate lag
+  async prunePreAugust2026Data(): Promise<{ prunedPunches: number; prunedPlans: number; prunedOT: number; prunedAllowances: number }> {
+    const punches = this.getBiometricPunches();
+    const cleanPunches = punches.filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
+    const prunedPunches = punches.length - cleanPunches.length;
+    await this.setBiometricPunches(cleanPunches);
+
+    const plans = this.getShiftPlans();
+    const cleanPlans = plans.filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
+    const prunedPlans = plans.length - cleanPlans.length;
+    await this.setShiftPlans(cleanPlans);
+
+    const ot = this.getOTRecords();
+    const cleanOT = ot.filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+    const prunedOT = ot.length - cleanOT.length;
+    await this.setOTRecords(cleanOT);
+
+    const allow = this.getOtherAllowances();
+    const cleanAllow = allow.filter(a => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
+    const prunedAllowances = allow.length - cleanAllow.length;
+    await this.setOtherAllowances(cleanAllow);
+
+    const overrides = this.getManualOverrides();
+    const cleanOverrides: Record<string, Partial<TimeSheetRow>> = {};
+    Object.entries(overrides).forEach(([k, v]) => {
+      const parts = k.split('_');
+      const dateStr = parts[parts.length - 1];
+      if (!dateStr || dateStr >= HISTORY_CUTOFF_DATE) {
+        cleanOverrides[k] = v;
+      }
+    });
+    await this.setManualOverrides(cleanOverrides);
+
+    notifyDataChanged();
+    return { prunedPunches, prunedPlans, prunedOT, prunedAllowances };
   },
 
   // Clear all operational / demo transaction records and purge demo items

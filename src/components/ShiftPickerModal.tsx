@@ -78,6 +78,7 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
     if (includeStandby) clean += '-X';
     if (includeEmergency) clean += '-ET';
     onApplyShift(clean, rangeOption);
+    onClose();
   };
 
   // Top Most-used Favorites
@@ -234,7 +235,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
               <span className="text-[10px] text-slate-400">ด่วน:</span>
               <button
                 type="button"
-                onClick={() => onApplyShift('AD1-X', rangeOption)}
+                onClick={() => {
+                  onApplyShift('AD1-X', rangeOption);
+                  onClose();
+                }}
                 className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:scale-105 transition cursor-pointer"
                 title="AD1-X: กะ D1 + Standby Allowance 300฿"
               >
@@ -242,7 +246,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => onApplyShift('E-ET', rangeOption)}
+                onClick={() => {
+                  onApplyShift('E-ET', rangeOption);
+                  onClose();
+                }}
                 className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-200 border border-rose-500/40 hover:scale-105 transition cursor-pointer"
                 title="E-ET: กะ E + Emergency Allowance 300฿"
               >
@@ -250,7 +257,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => onApplyShift('D-X', rangeOption)}
+                onClick={() => {
+                  onApplyShift('D-X', rangeOption);
+                  onClose();
+                }}
                 className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-teal-500/20 text-teal-200 border border-teal-500/40 hover:scale-105 transition cursor-pointer"
                 title="D-X: กะ D + Standby Allowance 300฿"
               >
@@ -413,7 +423,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
               <div className="flex items-center space-x-1 shrink-0">
                 <button
                   type="button"
-                  onClick={() => onApplyShift(searchTerm.trim().toUpperCase(), rangeOption)}
+                  onClick={() => {
+                    onApplyShift(searchTerm.trim().toUpperCase(), rangeOption);
+                    onClose();
+                  }}
                   className="px-2.5 py-1 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-xs transition cursor-pointer"
                 >
                   เลือกกะนี้
@@ -421,8 +434,11 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                 {!searchTerm.toUpperCase().includes('-X') && (
                   <button
                     type="button"
-                    onClick={() => onApplyShift(`${searchTerm.trim().toUpperCase()}-X`, rangeOption)}
-                    className="px-2 py-1 rounded text-[11px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition cursor-pointer"
+                    onClick={() => {
+                      onApplyShift(`${searchTerm.trim().toUpperCase()}-X`, rangeOption);
+                      onClose();
+                    }}
+                    className="px-2.5 py-1 rounded text-[11px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition cursor-pointer"
                     title="ใส่กะนี้พร้อม Stand by Allowance 300฿"
                   >
                     + Stand by (-X)
@@ -431,8 +447,11 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                 {!searchTerm.toUpperCase().includes('-ET') && (
                   <button
                     type="button"
-                    onClick={() => onApplyShift(`${searchTerm.trim().toUpperCase()}-ET`, rangeOption)}
-                    className="px-2 py-1 rounded text-[11px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 transition cursor-pointer"
+                    onClick={() => {
+                      onApplyShift(`${searchTerm.trim().toUpperCase()}-ET`, rangeOption);
+                      onClose();
+                    }}
+                    className="px-2.5 py-1 rounded text-[11px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 transition cursor-pointer"
                     title="ใส่กะนี้พร้อม Emergency Allowance 300฿"
                   >
                     + Emergency (-ET)
@@ -515,7 +534,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                     <div className="pt-2 border-t border-slate-700/30 flex items-center justify-between gap-1 flex-wrap">
                       <button
                         type="button"
-                        onClick={() => onApplyShift(sc.code, rangeOption)}
+                        onClick={() => {
+                          onApplyShift(sc.code, rangeOption);
+                          onClose();
+                        }}
                         className={`px-2 py-0.5 rounded text-[10px] font-mono font-medium transition cursor-pointer ${
                           isDark 
                             ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700' 
@@ -529,7 +551,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
                       <div className="flex items-center space-x-1">
                         <button
                           type="button"
-                          onClick={() => onApplyShift(`${sc.code}-X`, rangeOption)}
+                          onClick={() => {
+                            onApplyShift(`${sc.code}-X`, rangeOption);
+                            onClose();
+                          }}
                           className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition cursor-pointer"
                           title={`ใส่กะ ${sc.code} พร้อม Stand by Allowance 300฿ (${sc.code}-X)`}
                         >
@@ -538,7 +563,10 @@ export const ShiftPickerModal: React.FC<ShiftPickerModalProps> = ({
 
                         <button
                           type="button"
-                          onClick={() => onApplyShift(`${sc.code}-ET`, rangeOption)}
+                          onClick={() => {
+                            onApplyShift(`${sc.code}-ET`, rangeOption);
+                            onClose();
+                          }}
                           className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 transition cursor-pointer"
                           title={`ใส่กะ ${sc.code} พร้อม Emergency Allowance 300฿ (${sc.code}-ET)`}
                         >

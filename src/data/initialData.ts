@@ -42,6 +42,7 @@ export const INITIAL_USERS: UserAccount[] = [
 export const INITIAL_EMPLOYEES: Employee[] = [
   {
     empNo: '0950',
+    empCode: '10000950',
     gid: 'Z00430UZ',
     firstName: 'Napassawan',
     familyName: 'Ngamsomsong',
@@ -54,6 +55,7 @@ export const INITIAL_EMPLOYEES: Employee[] = [
   },
   {
     empNo: '0149',
+    empCode: '10000149',
     gid: 'Z00149TH',
     firstName: 'Somchai',
     familyName: 'Prasert',
@@ -66,6 +68,7 @@ export const INITIAL_EMPLOYEES: Employee[] = [
   },
   {
     empNo: '0094',
+    empCode: '10000094',
     gid: 'Z00094TH',
     firstName: 'Wiroj',
     familyName: 'Srisuk',
@@ -78,6 +81,7 @@ export const INITIAL_EMPLOYEES: Employee[] = [
   },
   {
     empNo: '1442',
+    empCode: '10001442',
     gid: 'Z00144TH',
     firstName: 'Kittisak',
     familyName: 'Boonma',
@@ -90,6 +94,7 @@ export const INITIAL_EMPLOYEES: Employee[] = [
   },
   {
     empNo: '0077',
+    empCode: '10000077',
     gid: 'Z00077TH',
     firstName: 'Anan',
     familyName: 'Chaisiri',
@@ -101,19 +106,8 @@ export const INITIAL_EMPLOYEES: Employee[] = [
     isActive: true,
   },
   {
-    empNo: '0315',
-    gid: 'Z00315TH',
-    firstName: 'Thanaporn',
-    familyName: 'Wattana',
-    department: 'ADM',
-    division: 'MO CS BTS',
-    functionTitle: 'Administration Officer',
-    costCenter: 'C93010',
-    isShiftWorker: true,
-    isActive: true,
-  },
-  {
     empNo: '1234',
+    empCode: '10001234',
     gid: 'Z0057PU',
     firstName: 'Sarawut',
     familyName: 'Phromdee',
@@ -126,6 +120,7 @@ export const INITIAL_EMPLOYEES: Employee[] = [
   },
   {
     empNo: '1477',
+    empCode: '10001477',
     gid: 'Z00147TH',
     firstName: 'Supachai',
     familyName: 'Ratanaporn',
@@ -201,6 +196,18 @@ export const INITIAL_SHIFT_CODES: ShiftCode[] = [
     isWorkingDay: true,
     color: "#0284c7",
     description: ""
+  },
+  {
+    code: "D2",
+    department: "BES/PSY",
+    name: "Day Shift 2 BES/PSY (08:30-17:30)",
+    startTime: "08:30",
+    endTime: "17:30",
+    breakMinutes: 60,
+    workingHours: 8,
+    isWorkingDay: true,
+    color: "#0284c7",
+    description: "BES/PSY Standard Day Shift 2"
   },
   {
     code: "D3",

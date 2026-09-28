@@ -1,11 +1,16 @@
-import React from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   UserCircle2, 
   RefreshCw,
   ChevronDown,
   Menu,
   Cloud,
-  CloudOff
+  CloudOff,
+  Database,
+  LogOut,
+  Shield,
+  Building2,
+  Settings
 } from 'lucide-react';
 import { UserAccount } from '../types';
 
@@ -23,21 +28,34 @@ interface SiemensHeaderProps {
   onResetData: () => void;
   activeTab: string;
   onToggleSidebar?: () => void;
-  cloudStatus?: { isConnected: boolean; isSyncing: boolean; lastSync: string | null };
+  cloudStatus?: { isConnected: boolean; isSyncing: boolean; lastSync: string | null; isQuotaExceeded?: boolean };
   onSyncCloud?: () => void;
+  onSignOut?: () => void;
 }
 
 export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
   currentUser,
   theme,
   onOpenAuthModal,
-  onResetData,
   activeTab,
   onToggleSidebar,
   cloudStatus,
   onSyncCloud,
+  onSignOut,
 }) => {
   const isDark = theme === 'dark';
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setIsMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   const tabTitles: Record<string, string> = {
     roster: 'Shift Roster — Monthly Schedule (ตารางกะทำงานรายเดือน)',
@@ -95,26 +113,44 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
           <button
             id="btn-cloud-status"
             onClick={onSyncCloud}
-            title={cloudStatus?.isConnected ? `Cloud Firestore: Connected (${cloudStatus.lastSync ? `Last synced: ${cloudStatus.lastSync}` : 'Click to sync'})` : 'Cloud Firestore: Connecting...'}
+            title={
+              cloudStatus?.isQuotaExceeded
+                ? 'ระบบจดจำสถานะโควตาเต็มก่อนหน้า (คลิกที่นี่เพื่อลองเชื่อมต่อซิงค์ใหม่): ระบบเปิดใช้งาน Local Storage 100% ข้อมูลปลอดภัยครบถ้วน'
+                : cloudStatus?.isConnected 
+                  ? `Cloud Firestore: เชื่อมต่อแล้ว (${cloudStatus.lastSync ? `ซิงค์ล่าสุด: ${cloudStatus.lastSync}` : 'คลิกเพื่อซิงค์'})` 
+                  : 'Cloud Firestore: กำลังเชื่อมต่อหรืออยู่ในโหมด Local (คลิกเพื่อทดสอบเชื่อมต่อใหม่)...'
+            }
             className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded border text-xs transition cursor-pointer ${
-              cloudStatus?.isConnected
-                ? isDark 
-                  ? 'bg-teal-950/40 border-teal-500/40 text-teal-300 hover:bg-teal-900/40' 
-                  : 'bg-emerald-600/20 border-white/30 text-white hover:bg-emerald-600/30'
-                : isDark 
-                  ? 'bg-amber-950/40 border-amber-500/40 text-amber-300' 
-                  : 'bg-amber-500/20 text-white'
+              cloudStatus?.isQuotaExceeded
+                ? isDark
+                  ? 'bg-amber-950/40 border-amber-500/50 text-amber-300 hover:bg-amber-900/40'
+                  : 'bg-amber-500/20 border-amber-300/40 text-amber-100 hover:bg-amber-500/30'
+                : cloudStatus?.isConnected
+                  ? isDark 
+                    ? 'bg-teal-950/40 border-teal-500/40 text-teal-300 hover:bg-teal-900/40' 
+                    : 'bg-emerald-600/20 border-white/30 text-white hover:bg-emerald-600/30'
+                  : isDark 
+                    ? 'bg-amber-950/40 border-amber-500/40 text-amber-300' 
+                    : 'bg-amber-500/20 text-white'
             }`}
           >
             {cloudStatus?.isSyncing ? (
               <RefreshCw className="w-3.5 h-3.5 animate-spin text-teal-300" />
+            ) : cloudStatus?.isQuotaExceeded ? (
+              <Database className="w-3.5 h-3.5 text-amber-400" />
             ) : cloudStatus?.isConnected ? (
               <Cloud className="w-3.5 h-3.5 text-teal-400" />
             ) : (
               <CloudOff className="w-3.5 h-3.5 text-amber-400" />
             )}
             <span className="font-mono text-[11px] hidden sm:inline flex items-center gap-1">
-              {cloudStatus?.isSyncing ? 'Syncing...' : cloudStatus?.isConnected ? 'Cloud Online' : 'Offline'}
+              {cloudStatus?.isSyncing 
+                ? 'Syncing...' 
+                : cloudStatus?.isQuotaExceeded
+                  ? 'Local Active (โควตาคลาวด์เต็ม)'
+                  : cloudStatus?.isConnected 
+                    ? 'Cloud Online' 
+                    : 'Offline'}
               {cloudStatus?.isConnected && cloudStatus.lastSync && (
                 <span className="text-[10px] opacity-80 font-normal hidden lg:inline ml-0.5">
                   ({cloudStatus.lastSync})
@@ -124,30 +160,95 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
             {cloudStatus?.isConnected && !cloudStatus.isSyncing && (
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
             )}
+            {cloudStatus?.isQuotaExceeded && (
+              <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" title="Local Persistence Active" />
+            )}
           </button>
 
-          {/* User Profile Pill */}
-          <button
-            id="btn-user-profile"
-            onClick={onOpenAuthModal}
-            title="Switch User / View Permissions (สลับผู้ใช้งาน / ดูสิทธิ์)"
-            className={`flex items-center space-x-2 px-3 py-1.5 rounded border text-xs transition cursor-pointer ${
-              isDark 
-                ? 'bg-[#141f2c] border-[#273a4e] hover:bg-[#1a2838]' 
-                : 'bg-white/15 border-white/25 hover:bg-white/25'
-            }`}
-          >
-            <UserCircle2 className="w-4 h-4 text-[#00e5e5]" />
-            <span className="font-semibold hidden md:inline">{currentUser.name}</span>
-            <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${
-              currentUser.role === 'Admin'
-                ? 'bg-red-500/25 text-red-300 border border-red-500/30'
-                : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
-            }`}>
-              {currentUser.role}
-            </span>
-            <ChevronDown className="w-3 h-3 text-slate-400" />
-          </button>
+          {/* User Profile Pill & Dropdown */}
+          <div className="relative" ref={menuRef}>
+            <button
+              id="btn-user-profile"
+              onClick={() => setIsMenuOpen(!isMenuOpen)}
+              title="ข้อมูลบัญชีและสิทธิ์การใช้งาน"
+              className={`flex items-center space-x-2 px-3 py-1.5 rounded border text-xs transition cursor-pointer ${
+                isDark 
+                  ? 'bg-[#141f2c] border-[#273a4e] hover:bg-[#1a2838]' 
+                  : 'bg-white/15 border-white/25 hover:bg-white/25'
+              }`}
+            >
+              <UserCircle2 className="w-4 h-4 text-[#00e5e5]" />
+              <span className="font-semibold hidden md:inline">{currentUser.name}</span>
+              <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${
+                currentUser.role === 'Admin'
+                  ? 'bg-red-500/25 text-red-300 border border-red-500/30'
+                  : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
+              }`}>
+                {currentUser.role}
+              </span>
+              <ChevronDown className="w-3 h-3 text-slate-400" />
+            </button>
+
+            {/* Dropdown Menu */}
+            {isMenuOpen && (
+              <div className={`absolute right-0 mt-2 w-56 rounded-xl shadow-2xl border py-2 z-50 animate-in fade-in zoom-in-95 duration-100 ${
+                isDark ? 'bg-[#121a28] border-slate-700 text-slate-200' : 'bg-white border-slate-200 text-slate-800'
+              }`}>
+                <div className="px-3 py-2 border-b border-slate-700/50">
+                  <div className="text-xs font-bold truncate">{currentUser.name}</div>
+                  <div className="text-[11px] text-slate-400 truncate">{currentUser.email}</div>
+                  <div className="text-[10px] text-cyan-400 mt-0.5">
+                    แผนก: <span className="font-semibold">{currentUser.department}</span> • สิทธิ์: <span className="font-semibold">{currentUser.role}</span>
+                  </div>
+                </div>
+
+                <div className="p-1 space-y-0.5">
+                  <button
+                    onClick={() => {
+                      setIsMenuOpen(false);
+                      onOpenAuthModal();
+                    }}
+                    className={`w-full text-left px-3 py-1.5 rounded text-xs flex items-center gap-2 transition cursor-pointer ${
+                      isDark ? 'hover:bg-slate-800 text-slate-300' : 'hover:bg-slate-100 text-slate-700'
+                    }`}
+                  >
+                    <Settings className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>จัดการบัญชี / สลับผู้ใช้</span>
+                  </button>
+
+                  {onSignOut && (
+                    <button
+                      onClick={() => {
+                        setIsMenuOpen(false);
+                        onSignOut();
+                      }}
+                      className="w-full text-left px-3 py-1.5 rounded text-xs flex items-center gap-2 text-rose-400 hover:bg-rose-500/15 transition cursor-pointer font-medium"
+                    >
+                      <LogOut className="w-3.5 h-3.5 text-rose-400" />
+                      <span>ออกจากระบบ (Sign Out)</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Quick Direct Sign Out Button */}
+          {onSignOut && (
+            <button
+              id="btn-header-signout"
+              onClick={onSignOut}
+              title="ออกจากระบบทันที (Sign Out)"
+              className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded border text-xs transition cursor-pointer ${
+                isDark
+                  ? 'bg-rose-950/30 border-rose-500/30 text-rose-300 hover:bg-rose-900/50'
+                  : 'bg-rose-700/25 border-rose-300/40 text-white hover:bg-rose-700/40'
+              }`}
+            >
+              <LogOut className="w-3.5 h-3.5 text-rose-400" />
+              <span className="hidden sm:inline font-medium">ลงชื่อออก</span>
+            </button>
+          )}
         </div>
       </div>
     </header>

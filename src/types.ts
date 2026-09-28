@@ -16,16 +16,20 @@ export interface UserAccount {
   assignedBy?: string;
   activatedAt?: string;
   updatedAt?: string;
+  empNo?: string;
+  gid?: string;
 }
 
 export interface Department {
   code: string;
   name: string;
+  updatedAt?: string;
 }
 
 export interface Employee {
   id?: string;
   empNo: string;        // e.g. "0950"
+  empCode?: string;     // 8-digit number e.g. "10000950" for Export to Payroll
   gid: string;          // e.g. "Z00430UZ"
   firstName: string;    // "Napassawan"
   familyName: string;   // "Ngamsomsong"
@@ -35,6 +39,7 @@ export interface Employee {
   costCenter: string;   // "C93056"
   isShiftWorker: boolean;// Yes/No (เข้ากะหรือไม่)
   isActive: boolean;    // Activate / Deactivate by Admin
+  updatedAt?: string;   // ISO timestamp for conflict resolution
 }
 
 export interface ShiftCode {
@@ -48,6 +53,7 @@ export interface ShiftCode {
   isWorkingDay: boolean;// false for H, OFF
   color: string;        // hex/tailwind color
   description?: string;
+  updatedAt?: string;
 }
 
 export interface DailyShiftPlan {
