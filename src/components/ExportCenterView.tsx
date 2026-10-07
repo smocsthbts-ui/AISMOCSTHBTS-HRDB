@@ -17,8 +17,12 @@ import {
   generatePayrollTSV, 
   filterPayrollEligibleSummaries, 
   downloadBlob,
-  escapeCSV 
+  downloadWorkbook,
+  escapeCSV,
+  ANNUAL_TEMPLATE_MONTH_NAMES,
+  isSameDepartment
 } from '../utils/fileParser';
+import * as XLSX from 'xlsx';
 import { storage } from '../utils/storage';
 import { MonthYearFilter } from './MonthYearFilter';
 import { 
@@ -46,7 +50,8 @@ import {
   Square,
   Loader2,
   X,
-  AlertCircle
+  AlertCircle,
+  Download
 } from 'lucide-react';
 
 interface ExportCenterViewProps {
@@ -85,8 +90,8 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
   // Active Main Tab
   const [activeTab, setActiveTab] = useState<MainTab>('payroll');
 
-  // Scope Settings
-  const [exportScope, setExportScope] = useState<'all' | 'dept' | 'single'>('dept');
+  // Scope Settings - Defaults to 'all' because Payroll is normally exported for all departments each month
+  const [exportScope, setExportScope] = useState<'all' | 'dept' | 'single'>('all');
   const [targetDept, setTargetDept] = useState<string>(
     selectedDepartment !== 'ALL' ? selectedDepartment : (employees[0]?.department || 'GM')
   );
@@ -112,15 +117,75 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
   const manualOverrides = useMemo(() => storage.getManualOverrides(), []);
   const departments = useMemo(() => storage.getDepartments(), []);
 
+  // Synthesize employees from shiftPlans for current month if any missing from master employees list
+  const effectiveEmployees = useMemo(() => {
+    const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
+    const list = [...baseEmployees];
+    const knownEmpNos = new Set<string>();
+    baseEmployees.forEach(e => {
+      if (e.empNo) {
+        const clean = e.empNo.trim().toUpperCase();
+        knownEmpNos.add(clean);
+        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          knownEmpNos.add(digits);
+          knownEmpNos.add(digits.padStart(4, '0'));
+          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
+        }
+      }
+      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
+      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
+    });
+    
+    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
+    (shiftPlans || []).forEach(p => {
+      if (!p || !p.date || !p.date.startsWith(selectedMonthYear)) return;
+      const eNo = (p.empNo || '').trim().toUpperCase();
+      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
+      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
+        missingEmpsFromPlans.set(eNo, p);
+      }
+    });
+
+    missingEmpsFromPlans.forEach((p, eNo) => {
+      const cleanNo = p.empNo || eNo;
+      const digits = cleanNo.replace(/\D/g, '');
+      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
+      list.push({
+        id: `synth-${paddedNo}`,
+        empNo: paddedNo,
+        empCode: digits ? `1000${paddedNo}` : cleanNo,
+        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
+        firstName: 'พนักงาน',
+        familyName: cleanNo,
+        department: p.department || (targetDept !== 'ALL' ? targetDept : 'GM'),
+        division: 'MO CS BTS',
+        functionTitle: 'Service Technician',
+        costCenter: 'C93051',
+        isShiftWorker: true,
+        isActive: true,
+      });
+    });
+
+    return list;
+  }, [employees, shiftPlans, selectedMonthYear, targetDept]);
+
   // Filter employees according to chosen scope
   const targetEmployees = useMemo(() => {
     let list: Employee[] = [];
     if (exportScope === 'single') {
-      list = employees.filter(e => e.empNo === targetEmpNo);
+      const cleanTarget = (targetEmpNo || '').trim().toLowerCase();
+      const targetDigits = cleanTarget.replace(/\D/g, '').replace(/^0+/, '');
+      list = effectiveEmployees.filter(e => {
+        const eNo = (e.empNo || '').trim().toLowerCase();
+        const eDigits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+        return eNo === cleanTarget || (targetDigits && eDigits && targetDigits === eDigits);
+      });
     } else if (exportScope === 'dept') {
-      list = employees.filter(e => e.department === targetDept);
+      list = effectiveEmployees.filter(e => isSameDepartment(e.department, targetDept));
     } else {
-      list = employees;
+      list = effectiveEmployees;
     }
 
     if (searchQuery.trim()) {
@@ -135,7 +200,7 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
       );
     }
     return list;
-  }, [exportScope, targetDept, targetEmpNo, employees, searchQuery]);
+  }, [exportScope, targetDept, targetEmpNo, effectiveEmployees, searchQuery]);
 
   // Compute summaries on-demand for target employees in ultra-fast batch mode (<10ms)
   const computedSummaries: TimeSheetSummary[] = useMemo(() => {
@@ -249,6 +314,21 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
     }, 600);
   };
 
+  // Helper to obtain all departments payroll summaries
+  const getAllDeptsSummaries = () => {
+    if (exportScope === 'all') return computedSummaries;
+    return buildTimeSheetsInBatch(
+      employees,
+      selectedMonthYear,
+      shiftCodes,
+      shiftPlans,
+      biometricPunches,
+      otRecords,
+      otherAllowances,
+      manualOverrides
+    );
+  };
+
   // Handle Payroll CSV Export
   const handleExportPayrollCSV = () => {
     const csvData = generatePayrollCSV(computedSummaries, selectedMonthYear, filterOnlyExtraIncome);
@@ -268,6 +348,28 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
       excelBytes,
       `Siemens_Payroll_Summary_${scopeLabel}_${selectedMonthYear}.xlsx`,
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+  };
+
+  // Dedicated ALL Departments Payroll Excel (.xlsx) Export
+  const handleExportAllDeptsPayrollExcel = () => {
+    const allSummaries = getAllDeptsSummaries();
+    const excelBytes = generatePayrollExcel(allSummaries, selectedMonthYear, filterOnlyExtraIncome);
+    downloadBlob(
+      excelBytes,
+      `Siemens_Payroll_Summary_AllDepts_${selectedMonthYear}.xlsx`,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+  };
+
+  // Dedicated ALL Departments Payroll CSV Export
+  const handleExportAllDeptsPayrollCSV = () => {
+    const allSummaries = getAllDeptsSummaries();
+    const csvData = generatePayrollCSV(allSummaries, selectedMonthYear, filterOnlyExtraIncome);
+    downloadBlob(
+      csvData,
+      `Siemens_Payroll_Summary_AllDepts_${selectedMonthYear}.csv`,
+      'text/csv;charset=utf-8;'
     );
   };
 
@@ -330,10 +432,58 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
     return map;
   }, [shiftPlans]);
 
+  // Handle Shift Matrix Excel (.xlsx) Export with Sheet name e.g. SEP-2026
+  const handleExportRosterExcel = () => {
+    const [yStr, mStr] = selectedMonthYear.split('-');
+    const yNum = parseInt(yStr, 10) || 2026;
+    const mNum = parseInt(mStr, 10) || 9;
+    const monthInfo = ANNUAL_TEMPLATE_MONTH_NAMES[mNum - 1] || { short: 'SEP' };
+    const sheetName = `${monthInfo.short}-${yNum}`;
+
+    const headers = ['Emp No', 'Name', 'Department', ...daysList.map(d => String(d).padStart(2, '0')), 'Total_Work_Shifts', 'Total_OFF'];
+    const rows = targetEmployees.map(emp => {
+      const empKey = (emp.empNo || '').trim().toUpperCase();
+      let workCount = 0;
+      let offCount = 0;
+      const rowObj: any = {
+        'Emp No': emp.empNo || '',
+        'Name': `${emp.firstName || ''} ${emp.familyName || ''}`.trim() || (emp as any).name || emp.empNo,
+        'Department': emp.department || '',
+      };
+      daysList.forEach(d => {
+        const dStr = `${selectedMonthYear}-${String(d).padStart(2, '0')}`;
+        const code = shiftPlanMap.get(`${empKey}_${dStr}`) || '-';
+        if (code === 'OFF') offCount++;
+        else if (code !== '-') workCount++;
+        rowObj[String(d).padStart(2, '0')] = code;
+      });
+      rowObj['Total_Work_Shifts'] = workCount;
+      rowObj['Total_OFF'] = offCount;
+      return rowObj;
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(rows, { header: headers });
+    const colWidths = [
+      { wch: 14 }, // Emp No
+      { wch: 28 }, // Name
+      { wch: 16 }, // Department
+    ];
+    for (let d = 1; d <= daysList.length; d++) {
+      colWidths.push({ wch: 6 });
+    }
+    colWidths.push({ wch: 16 }); // Total_Work_Shifts
+    colWidths.push({ wch: 12 }); // Total_OFF
+    worksheet['!cols'] = colWidths;
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+    downloadWorkbook(workbook, `ShiftPlan_Matrix_${selectedDepartment}_${sheetName}.xlsx`);
+  };
+
   // Handle Shift Matrix CSV Export
   const handleExportRosterCSV = () => {
     const BOM = '\uFEFF';
-    const headerCols = ['EmpCode', 'GID', 'Department', 'Name', ...daysList.map(d => `Day_${d}`), 'Total_Work_Shifts', 'Total_OFF'];
+    const headerCols = ['Emp No', 'Name', 'Department', ...daysList.map(d => String(d).padStart(2, '0')), 'Total_Work_Shifts', 'Total_OFF'];
     const lines = [headerCols.join(',')];
     targetEmployees.forEach(emp => {
       const empKey = (emp.empNo || '').trim().toUpperCase();
@@ -347,18 +497,20 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
         return escapeCSV(code);
       });
       lines.push([
-        escapeCSV(emp.empCode || emp.empNo),
-        escapeCSV(emp.gid || ''),
+        escapeCSV(emp.empNo || ''),
+        escapeCSV(`${emp.firstName || ''} ${emp.familyName || ''}`.trim() || (emp as any).name || emp.empNo),
         escapeCSV(emp.department || ''),
-        escapeCSV(`${emp.firstName || ''} ${emp.familyName || ''}`),
         ...dayCodes,
         workCount,
         offCount
       ].join(','));
     });
+    const [yStr, mStr] = selectedMonthYear.split('-');
+    const mNum = parseInt(mStr, 10) || 9;
+    const shortM = ANNUAL_TEMPLATE_MONTH_NAMES[mNum - 1]?.short || 'SEP';
     downloadBlob(
       BOM + lines.join('\r\n'),
-      `Siemens_Shift_Matrix_${selectedMonthYear}.csv`,
+      `ShiftPlan_Matrix_${selectedDepartment}_${shortM}-${yStr}.csv`,
       'text/csv;charset=utf-8;'
     );
   };
@@ -623,29 +775,58 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
                 <span>กรองเฉพาะผู้มีรายได้เสริม</span>
               </label>
 
-              <button
-                type="button"
-                id="btn-export-payroll-excel"
-                onClick={handleExportPayrollExcel}
-                disabled={displayedSummaries.length === 0}
-                className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-teal-600 hover:bg-teal-500 text-white shadow transition disabled:opacity-50 cursor-pointer"
-                title="ดาวน์โหลดไฟล์ Excel .xlsx 14 คอลัมน์"
-              >
-                <FileSpreadsheet className="w-4 h-4 shrink-0 text-amber-300" />
-                <span>Export Excel (.xlsx)</span>
-              </button>
+              {exportScope === 'all' ? (
+                <>
+                  <button
+                    type="button"
+                    id="btn-export-payroll-excel"
+                    onClick={handleExportPayrollExcel}
+                    disabled={displayedSummaries.length === 0}
+                    className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-teal-600 hover:bg-teal-500 text-white shadow transition disabled:opacity-50 cursor-pointer"
+                    title={`ดาวน์โหลดไฟล์ Excel .xlsx 14 คอลัมน์ ทุกแผนก ประจำงวด ${selectedMonthYear}`}
+                  >
+                    <FileSpreadsheet className="w-4 h-4 shrink-0 text-amber-300" />
+                    <span>Export ทุกแผนก Excel (.xlsx)</span>
+                  </button>
 
-              <button
-                type="button"
-                id="btn-export-payroll-csv"
-                onClick={handleExportPayrollCSV}
-                disabled={displayedSummaries.length === 0}
-                className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-emerald-600 hover:bg-emerald-500 text-white shadow transition disabled:opacity-50 cursor-pointer"
-                title="ดาวน์โหลดไฟล์ CSV 14 คอลัมน์"
-              >
-                <FileSpreadsheet className="w-4 h-4 shrink-0" />
-                <span>Export CSV</span>
-              </button>
+                  <button
+                    type="button"
+                    id="btn-export-payroll-csv"
+                    onClick={handleExportPayrollCSV}
+                    disabled={displayedSummaries.length === 0}
+                    className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-emerald-600 hover:bg-emerald-500 text-white shadow transition disabled:opacity-50 cursor-pointer"
+                    title={`ดาวน์โหลดไฟล์ CSV 14 คอลัมน์ ทุกแผนก ประจำงวด ${selectedMonthYear}`}
+                  >
+                    <FileSpreadsheet className="w-4 h-4 shrink-0" />
+                    <span>Export ทุกแผนก CSV</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    id="btn-export-payroll-excel"
+                    onClick={handleExportPayrollExcel}
+                    disabled={displayedSummaries.length === 0}
+                    className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-teal-700 hover:bg-teal-600 text-white shadow transition disabled:opacity-50 cursor-pointer"
+                    title={`ดาวน์โหลดไฟล์ Excel .xlsx เฉพาะแผนก ${targetDept}`}
+                  >
+                    <FileSpreadsheet className="w-4 h-4 shrink-0 text-amber-300" />
+                    <span>Export แผนก {targetDept} (.xlsx)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    id="btn-export-all-depts-payroll-excel"
+                    onClick={handleExportAllDeptsPayrollExcel}
+                    className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-teal-600 hover:bg-teal-500 text-white shadow transition cursor-pointer"
+                    title={`ดาวน์โหลดไฟล์ Excel รวมทุกแผนกในบริษัท ประจำเดือน ${selectedMonthYear}`}
+                  >
+                    <Layers className="w-4 h-4 shrink-0 text-amber-300" />
+                    <span>Export ทุกแผนกประจำเดือน (.xlsx)</span>
+                  </button>
+                </>
+              )}
 
               <button
                 type="button"
@@ -1096,14 +1277,34 @@ export const ExportCenterView: React.FC<ExportCenterViewProps> = ({
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={handleExportRosterCSV}
-              className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-teal-600 hover:bg-teal-500 text-white shadow transition cursor-pointer"
-            >
-              <FileSpreadsheet className="w-4 h-4" />
-              <span>Export ตารางกะ (CSV)</span>
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                type="button"
+                onClick={handleExportRosterExcel}
+                className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition cursor-pointer"
+                title={`Export Excel (Sheet: ${(() => {
+                  const [y, m] = selectedMonthYear.split('-');
+                  const mNum = parseInt(m, 10) || 9;
+                  return `${ANNUAL_TEMPLATE_MONTH_NAMES[mNum - 1]?.short || 'SEP'}-${y}`;
+                })()})`}
+              >
+                <Download className="w-4 h-4" />
+                <span>Export Excel (.xlsx) [Sheet: {(() => {
+                  const [y, m] = selectedMonthYear.split('-');
+                  const mNum = parseInt(m, 10) || 9;
+                  return `${ANNUAL_TEMPLATE_MONTH_NAMES[mNum - 1]?.short || 'SEP'}-${y}`;
+                })()}]</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleExportRosterCSV}
+                className="flex items-center space-x-1.5 py-1.5 px-3 rounded font-semibold text-xs bg-slate-700 hover:bg-slate-600 text-teal-300 border border-slate-600 shadow transition cursor-pointer"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                <span>Export CSV</span>
+              </button>
+            </div>
           </div>
 
           <div className={`rounded border overflow-hidden ${

@@ -3,6 +3,7 @@ import { UserAccount } from '../types';
 import { storage } from '../utils/storage';
 import { 
   downloadBlob, 
+  downloadWorkbook,
   generateShiftCodeTemplate, 
   generateOTApprovedTemplate, 
   generateShiftPlanTemplate,
@@ -30,6 +31,9 @@ interface SettingsAndTemplatesViewProps {
 export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> = ({
   currentUser,
   theme,
+  onResetData,
+  onClearDemoData,
+  onClearAllData,
 }) => {
   const isDark = theme === 'dark';
   const isAdmin = currentUser.role === 'Admin';
@@ -182,19 +186,34 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
               </span>
             </div>
             <p className="text-slate-400">
-              ไฟล์เทมเพลตจัดตารางการทำงานของแต่ละแผนก อ้างอิงด้วยรหัสพนักงาน (Emp No), ชื่อพนักงาน (Name) และแผนก (Department) พร้อมคอลัมน์วันที่ 1-31
+              ไฟล์เทมเพลตจัดตารางการทำงานของแต่ละแผนก ใช้ข้อมูลรหัสพนักงาน <strong>(Emp No)</strong> สำหรับใช้ Mapping และคอลัมน์ชื่อ <strong>(Name)</strong>, แผนก <strong>(Department)</strong> เพื่อใช้อ้างอิง พร้อมคอลัมน์วันที่ 01-31 (ตัดคอลัมน์ Emp Code / GID / Function ออกเพื่อความกระชับ) ชื่อ Sheet ตั้งชื่อตามงวดเดือนจริง เช่น <strong>SEP-2026</strong> รูปแบบเดียวกันกับเทมเพลตรายปี
             </p>
-            <button
-              onClick={() => {
-                const employees = storage.getEmployees();
-                const { csvContent } = generateShiftPlanTemplate('GM', '2026-05', employees);
-                downloadBlob(csvContent, 'Template_ShiftPlan_GM_2026-05.csv', 'text/csv;charset=utf-8;');
-              }}
-              className="w-full py-2 rounded bg-slate-700 hover:bg-slate-600 text-white font-medium flex items-center justify-center space-x-1.5 cursor-pointer"
-            >
-              <Download className="w-3.5 h-3.5 text-teal-400" />
-              <span>ดาวน์โหลด Shift Plan (ตัวอย่าง แผนก GM)</span>
-            </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                onClick={() => {
+                  const employees = storage.getEmployees();
+                  const shiftCodes = storage.getShiftCodes();
+                  const { workbook, filename, sheetName } = generateShiftPlanTemplate('GM', '2026-09', employees, shiftCodes);
+                  downloadWorkbook(workbook, filename || `Template_ShiftPlan_GM_${sheetName || 'SEP-2026'}.xlsx`);
+                }}
+                className="w-full py-2 rounded bg-teal-700 hover:bg-teal-600 text-white font-medium flex items-center justify-center space-x-1.5 cursor-pointer text-xs"
+              >
+                <Download className="w-3.5 h-3.5 text-amber-300" />
+                <span>โหลด Excel (.xlsx) [Sheet: SEP-2026]</span>
+              </button>
+              <button
+                onClick={() => {
+                  const employees = storage.getEmployees();
+                  const shiftCodes = storage.getShiftCodes();
+                  const { csvContent, sheetName } = generateShiftPlanTemplate('GM', '2026-09', employees, shiftCodes);
+                  downloadBlob(csvContent, `Template_ShiftPlan_GM_${sheetName || 'SEP-2026'}.csv`, 'text/csv;charset=utf-8;');
+                }}
+                className="w-full py-2 rounded bg-slate-700 hover:bg-slate-600 text-white font-medium flex items-center justify-center space-x-1.5 cursor-pointer text-xs"
+              >
+                <Download className="w-3.5 h-3.5 text-teal-400" />
+                <span>โหลด CSV (.csv)</span>
+              </button>
+            </div>
           </div>
 
           {/* Template 2: Shift Code */}
@@ -329,6 +348,17 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
       {/* SUB-TAB 2: Backup, Restore & Clean */}
       {activeSubTab === 'backup' && (
         <div className="space-y-4 max-w-2xl">
+          {actionMessage && (
+            <div className={`p-3 rounded border flex items-center gap-2 text-xs ${
+              actionMessage.type === 'success' 
+                ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300' 
+                : 'bg-rose-950/40 border-rose-500/40 text-rose-300'
+            }`}>
+              {actionMessage.type === 'success' ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+              <span>{actionMessage.text}</span>
+            </div>
+          )}
+
           {/* Section 1: Backup & Restore */}
           <div className={`p-5 rounded border space-y-4 text-xs ${
             isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'

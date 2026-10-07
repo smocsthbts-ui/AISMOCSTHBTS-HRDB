@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0e1d24"/>
+      <stop offset="100%" stop-color="#050c10"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Rounded Base Container with slim padding -->
+  <rect width="512" height="512" rx="88" fill="url(#bgGrad)"/>
+  <rect width="496" height="496" x="8" y="8" rx="80" fill="none" stroke="#00FFB9" stroke-opacity="0.4" stroke-width="8"/>
+  
+  <!-- Maximized Letter S in #00FFB9 filling the entire area -->
+  <text 
+    x="50%" 
+    y="51%" 
+    dominant-baseline="central" 
+    text-anchor="middle" 
+    font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Plus Jakarta Sans', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" 
+    font-size="520" 
+    font-weight="900" 
+    fill="#00FFB9"
+  >S</text>
+</svg>

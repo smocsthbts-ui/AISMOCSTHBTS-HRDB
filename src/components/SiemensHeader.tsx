@@ -8,8 +8,6 @@ import {
   CloudOff,
   Database,
   LogOut,
-  Shield,
-  Building2,
   Settings
 } from 'lucide-react';
 import { UserAccount } from '../types';
@@ -107,18 +105,22 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
           </div>
         </div>
 
-        {/* Right: Cloud Firestore Status Badge + User Profile + Quick Tools */}
+        {/* Right: Cloud / Local Status Badge + User Profile + Quick Tools */}
         <div className="flex items-center space-x-2.5 text-xs shrink-0">
-          {/* Cloud Firestore Status Badge */}
+          {/* Cloud / Local Status Badge */}
           <button
             id="btn-cloud-status"
-            onClick={onSyncCloud}
+            onClick={() => {
+              if (onSyncCloud) {
+                onSyncCloud();
+              }
+            }}
             title={
               cloudStatus?.isQuotaExceeded
-                ? 'ระบบจดจำสถานะโควตาเต็มก่อนหน้า (คลิกที่นี่เพื่อลองเชื่อมต่อซิงค์ใหม่): ระบบเปิดใช้งาน Local Storage 100% ข้อมูลปลอดภัยครบถ้วน'
+                ? 'ระบบทำงานบน Local Storage ปลอดภัย 100% (คลิกเพื่อทดสอบเชื่อมต่อ Cloud ใหม่)'
                 : cloudStatus?.isConnected 
                   ? `Cloud Firestore: เชื่อมต่อแล้ว (${cloudStatus.lastSync ? `ซิงค์ล่าสุด: ${cloudStatus.lastSync}` : 'คลิกเพื่อซิงค์'})` 
-                  : 'Cloud Firestore: กำลังเชื่อมต่อหรืออยู่ในโหมด Local (คลิกเพื่อทดสอบเชื่อมต่อใหม่)...'
+                  : 'โหมด Local พร้อมใช้งาน (คลิกเพื่อทดสอบเชื่อมต่อ Cloud ใหม่)...'
             }
             className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded border text-xs transition cursor-pointer ${
               cloudStatus?.isQuotaExceeded
@@ -130,8 +132,8 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
                     ? 'bg-teal-950/40 border-teal-500/40 text-teal-300 hover:bg-teal-900/40' 
                     : 'bg-emerald-600/20 border-white/30 text-white hover:bg-emerald-600/30'
                   : isDark 
-                    ? 'bg-amber-950/40 border-amber-500/40 text-amber-300' 
-                    : 'bg-amber-500/20 text-white'
+                    ? 'bg-amber-950/40 border-amber-500/40 text-amber-300 hover:bg-amber-900/40' 
+                    : 'bg-amber-500/20 text-white hover:bg-amber-500/30'
             }`}
           >
             {cloudStatus?.isSyncing ? (
@@ -147,10 +149,10 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
               {cloudStatus?.isSyncing 
                 ? 'Syncing...' 
                 : cloudStatus?.isQuotaExceeded
-                  ? 'Local Active (โควตาคลาวด์เต็ม)'
+                  ? 'Local Mode'
                   : cloudStatus?.isConnected 
                     ? 'Cloud Online' 
-                    : 'Offline'}
+                    : 'Local Mode'}
               {cloudStatus?.isConnected && cloudStatus.lastSync && (
                 <span className="text-[10px] opacity-80 font-normal hidden lg:inline ml-0.5">
                   ({cloudStatus.lastSync})

@@ -120,13 +120,6 @@ export function isEmployeePlanMatch(
   const rCleanEmpNo = rEmpNo.replace(/[^a-z0-9]/gi, '');
   const eCleanEmpNo = eEmpNo.replace(/[^a-z0-9]/gi, '');
 
-  // CRITICAL CONFLICT GUARD:
-  // If both record and employee have distinct GIDs, and they do NOT match,
-  // they belong to completely different people! NEVER match them even if empNo happens to collide!
-  if (rCleanGid && eCleanGid && rCleanGid.length >= 4 && eCleanGid.length >= 4 && rCleanGid !== eCleanGid) {
-    return false;
-  }
-
   // 1. Direct or clean GID-to-GID match
   if (rCleanGid && eCleanGid && rCleanGid === eCleanGid) return true;
 
@@ -139,7 +132,7 @@ export function isEmployeePlanMatch(
   // 4. EmpNo stored in record.gid matching employee.empNo
   if (rCleanGid && eCleanEmpNo && rCleanGid === eCleanEmpNo) return true;
 
-  // 5. Numeric EmpNo match with leading zero tolerance (e.g. "0005" vs "5", "01432" vs "1432")
+  // 5. Numeric EmpNo match with leading zero tolerance (e.g. "0005" vs "5", "0503" vs "503", "0082" vs "82", "1157" vs "1157")
   const rDigits = rEmpNo.replace(/\D/g, '');
   const eDigits = eEmpNo.replace(/\D/g, '');
   if (rDigits && eDigits) {
@@ -149,10 +142,10 @@ export function isEmployeePlanMatch(
     if (rDigits.padStart(4, '0') === eDigits.padStart(4, '0')) return true;
   }
 
-  // 6. EmpCode (Payroll) match (e.g. "10000005" vs "5", "65091432" vs "1432")
+  // 6. EmpCode (Payroll) match (e.g. "10000503" vs "503", "10000082" vs "82", "65091157" vs "1157")
   if (eEmpCode) {
     const eCodeClean = eEmpCode.replace(/[^a-z0-9]/gi, '');
-    if (rCleanEmpNo && rCleanEmpNo === eCodeClean) return true;
+    if (rCleanEmpNo && (rCleanEmpNo === eCodeClean || rCleanGid === eCodeClean)) return true;
     const eCodeDigits = eEmpCode.replace(/\D/g, '').replace(/^0+/, '');
     if (rDigits) {
       const rNum = rDigits.replace(/^0+/, '');
@@ -164,9 +157,13 @@ export function isEmployeePlanMatch(
   if (rDigits && eDigits) {
     const rNum = rDigits.replace(/^0+/, '');
     const eNum = eDigits.replace(/^0+/, '');
-    if (rNum.length >= 7 && (rNum.startsWith('1000') || rNum.startsWith('6509'))) {
-      const rStripped = rNum.replace(/^(10000|1000|6509)/, '').replace(/^0+/, '');
+    if (rNum.length >= 7 && (rNum.startsWith('1000') || rNum.startsWith('6509') || rNum.startsWith('650'))) {
+      const rStripped = rNum.replace(/^(10000|1000|6509|650)/, '').replace(/^0+/, '');
       if (rStripped && eNum && rStripped === eNum) return true;
+    }
+    if (eNum.length >= 7 && (eNum.startsWith('1000') || eNum.startsWith('6509') || eNum.startsWith('650'))) {
+      const eStripped = eNum.replace(/^(10000|1000|6509|650)/, '').replace(/^0+/, '');
+      if (eStripped && rNum && eStripped === rNum) return true;
     }
   }
 
@@ -1256,11 +1253,25 @@ export function buildTimeSheetForEmployee(
   const empGidClean = cleanIdentifier(employee.gid).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const empCodeClean = cleanIdentifier(employee.empCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
 
+  // Pre-filter candidate plans for this employee if a global array was passed, avoiding sorting thousands of irrelevant plans
+  const candidatePlans = (shiftPlans && shiftPlans.length > 60)
+    ? shiftPlans.filter(sp => sp && isEmployeePlanMatch(sp, employee))
+    : (shiftPlans || []);
+
+  // Sort candidate shift plans by updatedAt ascending so newest plans always take precedence
+  const sortedPlans = [...candidatePlans].sort((a, b) => {
+    const timeA = a && a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const timeB = b && b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    const vA = isNaN(timeA) ? 0 : timeA;
+    const vB = isNaN(timeB) ? 0 : timeB;
+    return vA - vB;
+  });
+
   // Pre-index shiftPlans by EmpNo and by GID
   const planByEmpNo = new Map<string, DailyShiftPlan>();
   const planByGid = new Map<string, DailyShiftPlan>();
 
-  for (const sp of shiftPlans) {
+  for (const sp of sortedPlans) {
     if (!sp || !sp.date) continue;
     const spEmp = cleanIdentifier(sp.empNo).toUpperCase();
     const spGid = cleanIdentifier(sp.gid).toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -1271,6 +1282,7 @@ export function buildTimeSheetForEmployee(
       if (spDigits) {
         planByEmpNo.set(`${spDigits}_${sp.date}`, sp);
         planByEmpNo.set(`${spDigits.padStart(4, '0')}_${sp.date}`, sp);
+        planByEmpNo.set(`1000${spDigits.padStart(4, '0')}_${sp.date}`, sp);
       }
     }
     if (spGid) {
@@ -1279,14 +1291,15 @@ export function buildTimeSheetForEmployee(
   }
 
   // Populate empPlanMap for each date (EmpNo check first, then GID fallback)
-  for (const sp of shiftPlans) {
-    if (!sp || !sp.date || empPlanMap.has(sp.date)) continue;
+  for (const sp of sortedPlans) {
+    if (!sp || !sp.date) continue;
     const date = sp.date;
 
     let matched: DailyShiftPlan | undefined;
     if (empNoClean) matched = planByEmpNo.get(`${empNoClean}_${date}`);
     if (!matched && empNoDigits) matched = planByEmpNo.get(`${empNoDigits}_${date}`);
     if (!matched && empNoPadded) matched = planByEmpNo.get(`${empNoPadded}_${date}`);
+    if (!matched && empNoDigits) matched = planByEmpNo.get(`1000${empNoDigits.padStart(4, '0')}_${date}`);
     if (!matched && empCodeClean) matched = planByEmpNo.get(`${empCodeClean}_${date}`);
     if (!matched && empGidClean) matched = planByGid.get(`${empGidClean}_${date}`);
 
@@ -1679,24 +1692,40 @@ export function buildTimeSheetsInBatch(
 ): TimeSheetSummary[] {
   if (!employees || employees.length === 0) return [];
 
-  // Index shift plans once
-  const planByEmpNo = new Map<string, DailyShiftPlan>();
-  const planByGid = new Map<string, DailyShiftPlan>();
-  for (const sp of shiftPlans || []) {
+  // Index and pre-sort shift plans once for all employees (eliminates O(N_emp * N_plans log N_plans) bottleneck)
+  const sortedPlans = [...(shiftPlans || [])].sort((a, b) => {
+    const timeA = a && a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const timeB = b && b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return (isNaN(timeA) ? 0 : timeA) - (isNaN(timeB) ? 0 : timeB);
+  });
+
+  const plansByEmpKey = new Map<string, DailyShiftPlan[]>();
+  for (const sp of sortedPlans) {
     if (!sp || !sp.date) continue;
     const spEmp = cleanIdentifier(sp.empNo).toUpperCase();
     const spGid = cleanIdentifier(sp.gid).toUpperCase().replace(/[^A-Z0-9]/g, '');
 
+    const addSp = (k: string) => {
+      if (!k) return;
+      let list = plansByEmpKey.get(k);
+      if (!list) {
+        list = [];
+        plansByEmpKey.set(k, list);
+      }
+      list.push(sp);
+    };
+
     if (spEmp) {
-      planByEmpNo.set(`${spEmp}_${sp.date}`, sp);
-      const spDigits = spEmp.replace(/\D/g, '').replace(/^0+/, '');
-      if (spDigits) {
-        planByEmpNo.set(`${spDigits}_${sp.date}`, sp);
-        planByEmpNo.set(`${spDigits.padStart(4, '0')}_${sp.date}`, sp);
+      addSp(spEmp);
+      const digits = spEmp.replace(/\D/g, '').replace(/^0+/, '');
+      if (digits) {
+        addSp(digits);
+        addSp(digits.padStart(4, '0'));
+        addSp(`1000${digits.padStart(4, '0')}`);
       }
     }
     if (spGid) {
-      planByGid.set(`${spGid}_${sp.date}`, sp);
+      addSp(spGid);
     }
   }
 
@@ -1801,29 +1830,38 @@ export function buildTimeSheetsInBatch(
     if (empGidClean && punchesById.has(empGidClean)) punchesById.get(empGidClean)!.forEach(p => empPunchesSet.add(p));
     if (empCodeClean && punchesById.has(empCodeClean)) punchesById.get(empCodeClean)!.forEach(p => empPunchesSet.add(p));
 
-    const empPunches = empPunchesSet.size > 0 ? Array.from(empPunchesSet) : allPunches;
+    // Collect shift plans for this employee from indexed pre-sorted map
+    const empPlanSet = new Set<DailyShiftPlan>();
+    if (empNoClean && plansByEmpKey.has(empNoClean)) plansByEmpKey.get(empNoClean)!.forEach(p => empPlanSet.add(p));
+    if (empNoDigits && plansByEmpKey.has(empNoDigits)) plansByEmpKey.get(empNoDigits)!.forEach(p => empPlanSet.add(p));
+    if (empGidClean && plansByEmpKey.has(empGidClean)) plansByEmpKey.get(empGidClean)!.forEach(p => empPlanSet.add(p));
+    if (empCodeClean && plansByEmpKey.has(empCodeClean)) plansByEmpKey.get(empCodeClean)!.forEach(p => empPlanSet.add(p));
+    const empShiftPlans = Array.from(empPlanSet);
 
-    // Collect OT for this employee
+    // Unmatched employees have 0 punches (NEVER pass global allPunches)
+    const empPunches = empPunchesSet.size > 0 ? Array.from(empPunchesSet) : [];
+
+    // Collect OT for this employee (NEVER pass global otRecords)
     const empOTSet = new Set<OTRecord>();
     if (empNoClean && otByEmpKey.has(empNoClean)) otByEmpKey.get(empNoClean)!.forEach(o => empOTSet.add(o));
     if (empNoDigits && otByEmpKey.has(empNoDigits)) otByEmpKey.get(empNoDigits)!.forEach(o => empOTSet.add(o));
     if (empGidClean && otByEmpKey.has(empGidClean)) otByEmpKey.get(empGidClean)!.forEach(o => empOTSet.add(o));
     if (empCodeClean && otByEmpKey.has(empCodeClean)) otByEmpKey.get(empCodeClean)!.forEach(o => empOTSet.add(o));
-    const empOT = empOTSet.size > 0 ? Array.from(empOTSet) : otRecords;
+    const empOT = empOTSet.size > 0 ? Array.from(empOTSet) : [];
 
-    // Collect allowances for this employee
+    // Collect allowances for this employee (NEVER pass global allowances)
     const empAllowancesSet = new Set<OtherAllowance>();
     if (empNoClean && allowancesByEmpKey.has(empNoClean)) allowancesByEmpKey.get(empNoClean)!.forEach(a => empAllowancesSet.add(a));
     if (empNoDigits && allowancesByEmpKey.has(empNoDigits)) allowancesByEmpKey.get(empNoDigits)!.forEach(a => empAllowancesSet.add(a));
     if (empGidClean && allowancesByEmpKey.has(empGidClean)) allowancesByEmpKey.get(empGidClean)!.forEach(a => empAllowancesSet.add(a));
     if (empCodeClean && allowancesByEmpKey.has(empCodeClean)) allowancesByEmpKey.get(empCodeClean)!.forEach(a => empAllowancesSet.add(a));
-    const empAllowances = empAllowancesSet.size > 0 ? Array.from(empAllowancesSet) : allowances;
+    const empAllowances = empAllowancesSet.size > 0 ? Array.from(empAllowancesSet) : [];
 
     return buildTimeSheetForEmployee(
       employee,
       monthYear,
       shiftCodes,
-      shiftPlans,
+      empShiftPlans,
       empPunches,
       empOT,
       empAllowances,

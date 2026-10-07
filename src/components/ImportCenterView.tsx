@@ -49,7 +49,11 @@ import {
   generateOTApprovedTemplate,
   downloadBlob,
   downloadWorkbook,
-  parseCSVTextToRows
+  parseCSVTextToRows,
+  ANNUAL_TEMPLATE_MONTH_NAMES,
+  inspectShiftPlanWorkbook,
+  parseSpecificSheetToRows,
+  isSameDepartment
 } from '../utils/fileParser';
 import { storage, parseBiometricText } from '../utils/storage';
 import { mergeAndDeduplicatePunches } from '../utils/biometricManager';
@@ -78,20 +82,24 @@ interface ImportCenterViewProps {
   currentUser: UserAccount;
   theme: 'dark' | 'light';
   selectedMonthYear: string;
+  onSelectMonthYear?: (my: string) => void;
   selectedDepartment: string;
+  onSelectDepartment?: (dept: string) => void;
   employees: Employee[];
   shiftCodes: ShiftCode[];
   onDataImported: () => void;
   onNavigateToUploadShiftPlan?: () => void;
   onNavigateToRoster?: () => void;
-  initialTab?: 'shift-plan' | 'shift-code' | 'attendance' | 'ot' | 'allowances';
+  initialTab?: 'shift-plan' | 'shift-code' | 'attendance' | 'ot';
 }
 
 export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
   currentUser,
   theme,
   selectedMonthYear,
+  onSelectMonthYear,
   selectedDepartment,
+  onSelectDepartment,
   employees,
   shiftCodes,
   onDataImported,
@@ -102,10 +110,10 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
   const isDark = theme === 'dark';
   const isAdmin = currentUser.role === 'Admin';
 
-  const [activeImportTab, setActiveImportTab] = useState<'shift-plan' | 'shift-code' | 'attendance' | 'ot' | 'allowances'>(initialTab || 'shift-plan');
+  const [activeImportTab, setActiveImportTab] = useState<'shift-plan' | 'shift-code' | 'attendance' | 'ot'>(initialTab || 'shift-plan');
 
   useEffect(() => {
-    if (initialTab) {
+    if (initialTab && initialTab !== ('allowances' as any)) {
       setActiveImportTab(initialTab);
     }
   }, [initialTab]);
@@ -117,6 +125,19 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
       : (selectedDepartment !== 'ALL' ? selectedDepartment : (currentUser.department !== 'ALL' ? currentUser.department : 'GM'))
   );
   const [importMonthYear, setImportMonthYear] = useState<string>(selectedMonthYear);
+
+  // Sync state when props change
+  useEffect(() => {
+    if (selectedMonthYear) {
+      setImportMonthYear(selectedMonthYear);
+    }
+  }, [selectedMonthYear]);
+
+  useEffect(() => {
+    if (selectedDepartment && selectedDepartment !== 'ALL') {
+      setImportDept(selectedDepartment);
+    }
+  }, [selectedDepartment]);
 
   // Status message
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string; details?: string[] } | null>(null);
@@ -827,13 +848,50 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
 
     try {
       const buffer = await readFileAsArrayBuffer(file);
-      const rawRows = parseSheetToRows(buffer);
+      const inspection = inspectShiftPlanWorkbook(buffer);
 
-      const targetDept = !isAdmin ? (currentUser.department || 'GM') : importDept;
+      let targetMY = importMonthYear;
+      let targetDept = !isAdmin ? (currentUser.department || 'GM') : importDept;
+      let rawRows: any[] = [];
+      let detectedSheetName = '';
+
+      // Determine best sheet from inspection
+      if (inspection.sheets && inspection.sheets.length > 0) {
+        // First priority: find sheet whose detectedMonthYear matches importMonthYear
+        let matchingSheet = inspection.sheets.find(s => s.isMonthSheet && s.detectedMonthYear === importMonthYear);
+        if (!matchingSheet) {
+          // Second priority: find any month sheet (e.g. SEP-2026)
+          matchingSheet = inspection.sheets.find(s => s.isMonthSheet);
+        }
+        if (matchingSheet) {
+          targetMY = matchingSheet.detectedMonthYear;
+          detectedSheetName = matchingSheet.sheetName;
+          rawRows = parseSpecificSheetToRows(buffer, matchingSheet.sheetName);
+        } else {
+          detectedSheetName = inspection.sheets[0].sheetName;
+          rawRows = parseSpecificSheetToRows(buffer, detectedSheetName);
+        }
+      } else {
+        rawRows = parseSheetToRows(buffer);
+      }
+
+      if (!rawRows || rawRows.length === 0) {
+        throw new Error('ไม่พบข้อมูลตารางกะในไฟล์ที่เลือก');
+      }
+
+      // Check if rows have department specified
+      const foundRowWithDept = rawRows.find(r => r['Department'] || r['department'] || r['Dept'] || r['dept'] || r['แผนก']);
+      const firstRowDept = foundRowWithDept ? (foundRowWithDept['Department'] || foundRowWithDept['department'] || foundRowWithDept['Dept'] || foundRowWithDept['dept'] || foundRowWithDept['แผนก']) : '';
+      if (firstRowDept) {
+        const cleanFirst = String(firstRowDept).trim().toUpperCase();
+        if (targetDept === 'ALL' || targetDept === 'GM' || isAdmin) {
+          targetDept = cleanFirst;
+        }
+      }
 
       const result = validateAndParseShiftPlan(
         rawRows,
-        importMonthYear,
+        targetMY,
         targetDept,
         employees,
         shiftCodes,
@@ -842,7 +900,7 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
 
       // Security check: Role User can only upload shift plans for their own department
       if (!isAdmin) {
-        const foreignDeptPlans = result.plans.filter(p => p.department && p.department !== currentUser.department);
+        const foreignDeptPlans = result.plans.filter(p => p.department && !isSameDepartment(p.department, currentUser.department));
         if (foreignDeptPlans.length > 0) {
           setStatusMessage({
             type: 'error',
@@ -862,38 +920,87 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
         return;
       }
 
-      // Merge into stored shift plans: overwrite only matching employees & month
+      // Normalized Employee ID helper (pads 1-4 digit numeric strings e.g. "503" -> "0503", "82" -> "0082")
+      const normalizeEmpId = (id?: string | null): string => {
+        if (!id) return '';
+        const clean = String(id).trim().toUpperCase();
+        const digits = clean.replace(/\D/g, '');
+        if (digits && digits.length <= 4) {
+          return digits.padStart(4, '0');
+        }
+        return clean;
+      };
+
+      const getShiftPlanDedupeKey = (empNo: string, date: string): string => {
+        return `${normalizeEmpId(empNo)}_${(date || '').trim()}`;
+      };
+
+      // Merge into stored shift plans: strictly overwrite matching employees & date to avoid doubles
       const currentPlans = storage.getShiftPlans();
       const newPlanMap = new Map<string, DailyShiftPlan>();
       
-      // Keep existing plans not affected by this upload
+      // Keep existing plans indexed by normalized key
       currentPlans.forEach(p => {
-        const key = `${p.empNo}_${p.date}`;
-        newPlanMap.set(key, p);
+        if (!p || !p.empNo || !p.date) return;
+        const normNo = normalizeEmpId(p.empNo);
+        const key = getShiftPlanDedupeKey(normNo, p.date);
+        newPlanMap.set(key, {
+          ...p,
+          empNo: normNo,
+        });
       });
 
-      // Overwrite with uploaded records
+      // Overwrite cleanly with uploaded records
       result.plans.forEach(p => {
-        const key = `${p.empNo}_${p.date}`;
-        newPlanMap.set(key, p);
+        if (!p || !p.empNo || !p.date) return;
+        const normNo = normalizeEmpId(p.empNo);
+        const key = getShiftPlanDedupeKey(normNo, p.date);
+        newPlanMap.set(key, {
+          ...p,
+          empNo: normNo,
+        });
       });
 
       const updatedPlans = Array.from(newPlanMap.values());
-      storage.setShiftPlans(updatedPlans);
+      await storage.setShiftPlans(updatedPlans);
+      await firestoreSync.syncShiftPlans(updatedPlans);
 
-      // If new Employees were discovered & auto-created from template, persist them into Employee Master Database
+      // If new Employees were discovered & auto-created from template, persist them cleanly into Employee Master Database
       if (result.newEmployees && result.newEmployees.length > 0) {
         const currentEmployees = storage.getEmployees();
         const empMap = new Map<string, Employee>();
-        currentEmployees.forEach(e => empMap.set(e.empNo, e));
+
+        currentEmployees.forEach(e => {
+          const normNo = normalizeEmpId(e.empNo);
+          empMap.set(normNo, {
+            ...e,
+            empNo: normNo,
+          });
+        });
 
         result.newEmployees.forEach(ne => {
-          if (!empMap.has(ne.empNo)) {
-            empMap.set(ne.empNo, ne);
+          const normNo = normalizeEmpId(ne.empNo);
+          const existing = empMap.get(normNo);
+          if (existing) {
+            empMap.set(normNo, {
+              ...existing,
+              ...ne,
+              id: existing.id,
+              empNo: normNo,
+              department: ne.department || existing.department,
+              updatedAt: new Date().toISOString(),
+            });
+          } else {
+            empMap.set(normNo, {
+              ...ne,
+              empNo: normNo,
+            });
           }
         });
 
-        await storage.setEmployees(Array.from(empMap.values()));
+        const newEmpList = Array.from(empMap.values());
+        await storage.setEmployees(newEmpList);
+        await firestoreSync.syncEmployees(newEmpList);
       }
 
       // If new Shift Codes were discovered & generated, persist them into storage
@@ -911,24 +1018,32 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
           }
         });
 
-        await storage.setShiftCodes(Array.from(codeMap.values()));
+        const newCodeList = Array.from(codeMap.values());
+        await storage.setShiftCodes(newCodeList);
+        await firestoreSync.syncShiftCodes(newCodeList);
       }
+
+      // Sync active filters to ensure Roster view immediately matches
+      setImportMonthYear(targetMY);
+      setImportDept(targetDept);
+      if (onSelectMonthYear) onSelectMonthYear(targetMY);
+      if (onSelectDepartment) onSelectDepartment(targetDept);
 
       const importNotices: string[] = [];
       if (result.newEmployees && result.newEmployees.length > 0) {
-        importNotices.push(`เพิ่มพนักงานใหม่เข้าสู่ Employee Master พร้อมกำหนดตำแหน่ง "Service Technician" & Cost Center ตามแผนก ${result.newEmployees.length} คน`);
+        importNotices.push(`เพิ่ม/อัปเดตพนักงานเข้าสู่ Employee Master ${result.newEmployees.length} คน`);
       }
       if (result.newShiftCodes && result.newShiftCodes.length > 0) {
         importNotices.push(`เพิ่ม Shift Code ใหม่ ${result.newShiftCodes.length} รายการ (08:00 - 17:00)`);
       }
       if (result.skippedRows && result.skippedRows.length > 0) {
-        importNotices.push(`ข้ามรายการที่ไม่สมบูรณ์/ไม่มี GID จริง ${result.skippedRows.length} รายการ`);
+        importNotices.push(`ข้ามรายการที่ไม่ระบุรหัสพนักงาน ${result.skippedRows.length} รายการ`);
       }
 
       const allDetails: string[] = [];
       if (result.skippedRows && result.skippedRows.length > 0) {
         result.skippedRows.forEach(sr => {
-          allDetails.push(`[ข้ามแถวที่ ${sr.row}] พนักงาน: ${sr.name || sr.empNo || '-'} (GID: ${sr.gid || 'ว่าง'}) — ${sr.reason}`);
+          allDetails.push(`[ข้ามแถวที่ ${sr.row}] พนักงาน: ${sr.name || sr.empNo || '-'} — ${sr.reason}`);
         });
       }
       if (result.warnings && result.warnings.length > 0) {
@@ -937,7 +1052,7 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
 
       setStatusMessage({
         type: (result.skippedRows && result.skippedRows.length > 0) ? 'warning' : (result.warnings.length > 0 ? 'warning' : 'success'),
-        text: `อัปโหลดตารางกะสำเร็จ! นำเข้าข้อมูล ${result.plans.length} วันทำงาน (พนักงาน ${result.matchedEmployeesCount} คน แผนก ${targetDept})` +
+        text: `อัปโหลดตารางกะสำเร็จ! นำเข้าข้อมูล ${result.plans.length} วันทำงาน (พนักงาน ${result.matchedEmployeesCount} คน แผนก ${targetDept} งวดเดือน ${targetMY}${detectedSheetName ? ` จาก Sheet "${detectedSheetName}"` : ''})` +
           (importNotices.length > 0 ? ` [${importNotices.join(' | ')}]` : ''),
         details: allDetails.length > 0 ? allDetails : undefined,
       });
@@ -1444,8 +1559,8 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
   // Quick download department Excel & CSV templates
   const handleDownloadDeptPlanTemplateExcel = () => {
     try {
-      const { workbook } = generateShiftPlanTemplate(importDept, importMonthYear, employees);
-      downloadWorkbook(workbook, `Template_ShiftPlan_${importDept}_${importMonthYear}.xlsx`);
+      const { workbook, sheetName, filename } = generateShiftPlanTemplate(importDept, importMonthYear, employees, shiftCodes);
+      downloadWorkbook(workbook, filename || `Template_ShiftPlan_${importDept}_${sheetName || importMonthYear}.xlsx`);
     } catch (err) {
       console.error('Download Excel Template Error:', err);
     }
@@ -1453,10 +1568,10 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
 
   const handleDownloadDeptPlanTemplate = () => {
     try {
-      const { csvContent } = generateShiftPlanTemplate(importDept, importMonthYear, employees);
+      const { csvContent, sheetName } = generateShiftPlanTemplate(importDept, importMonthYear, employees, shiftCodes);
       downloadBlob(
         csvContent,
-        `Template_ShiftPlan_${importDept}_${importMonthYear}.csv`,
+        `Template_ShiftPlan_${importDept}_${sheetName || importMonthYear}.csv`,
         'text/csv;charset=utf-8;'
       );
     } catch (err) {
@@ -1515,7 +1630,7 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
             <p className="text-xs text-slate-400">
               {!isAdmin 
                 ? `นำเข้า Shift Plan ประจำแผนก ${currentUser.department || 'GM'} (สิทธิ์ User เฉพาะตารางกะ)`
-                : 'Import Shift Plans, Shift Codes, Biometric Raw Punches, Approved OT (Power BI), and Other Allowances'
+                : 'Import Shift Plans, Shift Codes, Biometric Raw Punches, and Approved OT (Power BI)'
               }
             </p>
           </div>
@@ -1532,7 +1647,10 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
               type="month"
               aria-label="Target Period"
               value={importMonthYear}
-              onChange={e => setImportMonthYear(e.target.value)}
+              onChange={e => {
+                setImportMonthYear(e.target.value);
+                if (onSelectMonthYear) onSelectMonthYear(e.target.value);
+              }}
               className={`p-1 rounded font-mono font-bold outline-none cursor-pointer ${
                 isDark ? 'bg-[#172432] text-teal-300 border border-[#2c445c]' : 'bg-white text-slate-900 border'
               }`}
@@ -1602,6 +1720,19 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
               ))}
             </ul>
           )}
+
+          {statusMessage.type !== 'error' && onNavigateToRoster && (
+            <div className="pt-2 border-t border-inherit">
+              <button
+                type="button"
+                onClick={onNavigateToRoster}
+                className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 rounded bg-[#008b99] hover:bg-[#00a3a6] text-white font-bold text-xs shadow transition cursor-pointer"
+              >
+                <span>ดูตารางกะที่นำเข้าแล้วในหน้า Monthly Shift Roster ทันที</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -1621,7 +1752,7 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
             <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold ${
               isDark ? 'bg-[#0e1722] text-teal-400 border border-[#23384c]' : 'bg-slate-100 text-teal-700'
             }`}>
-              {!isAdmin ? '1 เมนูที่ได้รับสิทธิ์' : '5 หมวดหมู่'}
+              {!isAdmin ? '1 เมนูที่ได้รับสิทธิ์' : '4 หมวดหมู่'}
             </span>
           </div>
 
@@ -1661,15 +1792,6 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                 subtitle: 'โอทีที่อนุมัติแล้ว (Power BI)', 
                 icon: FileCheck2, 
                 badge: !isAdmin ? 'Admin Only' : (otStats.totalCount > 0 ? `${otStats.totalCount} รายการ (${otStats.totalHours.toFixed(1)}h)` : 'All Depts'), 
-                isDeptSpecific: false,
-                allowed: isAdmin,
-              },
-              { 
-                id: 'allowances' as const, 
-                title: '5. Other Allowances', 
-                subtitle: 'เบี้ยเลี้ยงและรายได้เสริม', 
-                icon: DollarSign, 
-                badge: !isAdmin ? 'Admin Only' : (monthAllowances.length > 0 ? `${monthAllowances.length} รายการ` : 'All Depts'), 
                 isDeptSpecific: false,
                 allowed: isAdmin,
               },
@@ -1743,8 +1865,11 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
             <ol className="list-decimal list-inside space-y-0.5 text-[10.5px] opacity-90">
               <li>อัปโหลด <strong>Shift Plan</strong> แต่ละแผนก</li>
               <li>นำเข้า <strong>Biometric</strong> สแกนนิ้วรวม (Admin)</li>
-              <li>นำเข้า <strong>Approved OT</strong> & <strong>Allowances</strong> (Admin)</li>
+              <li>นำเข้า <strong>Approved OT</strong> โอทีที่อนุมัติ (Admin)</li>
             </ol>
+            <div className="pt-1.5 border-t border-slate-700/50 text-[10px] text-teal-400/90 leading-tight">
+              💡 เบี้ยเลี้ยง Standby & Emergency คำนวณอัตโนมัติจากกะ <strong className="text-amber-300">-X</strong> (300฿) และ <strong className="text-rose-300">-ET</strong> (300฿)
+            </div>
           </div>
         </aside>
 
@@ -1806,7 +1931,10 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                 <select
                   aria-label="Target Department for Shift Plan"
                   value={importDept}
-                  onChange={e => setImportDept(e.target.value)}
+                  onChange={e => {
+                    setImportDept(e.target.value);
+                    if (onSelectDepartment && e.target.value !== 'ALL') onSelectDepartment(e.target.value);
+                  }}
                   className={`p-1.5 rounded font-mono font-bold text-xs outline-none cursor-pointer ${
                     isDark ? 'bg-[#0f1722] text-teal-300 border border-teal-500/40' : 'bg-white text-slate-900 border-teal-300'
                   }`}
@@ -1832,15 +1960,21 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                 <span>Step 1: Download Template (ดาวน์โหลดเทมเพลต)</span>
               </h2>
               <p className="text-slate-400 leading-relaxed">
-                สร้างเทมเพลต Excel/CSV ที่เตรียมรายชื่อพนักงานแผนก <strong>{importDept}</strong> งวด <strong>{importMonthYear}</strong> โดยใช้คอลัมน์อ้างอิง <strong>Emp No</strong>, <strong>Name</strong> และ <strong>Department</strong> เพื่อความถูกต้องในการระบุตัวตนพนักงาน
+                สร้างเทมเพลต Excel/CSV สำหรับแผนก <strong>{importDept}</strong> งวด <strong>{importMonthYear}</strong> โดยใช้ข้อมูล <strong>Emp No</strong> สำหรับใช้ Mapping และคอลัมน์ <strong>Name</strong>, <strong>Department</strong> เพื่อใช้อ้างอิง พร้อมคอลัมน์วันที่ 01-31 (ไม่มี Emp Code / GID / Function)
               </p>
 
               <div className={`p-3 rounded border text-[11px] space-y-1.5 ${
                 isDark ? 'bg-[#0b1219] border-[#1e2e3d]' : 'bg-slate-50 border-slate-200'
               }`}>
                 <div className="font-bold text-slate-300">Validation & Safety Rules (กฎความถูกต้อง):</div>
-                <div className="text-teal-400">✓ Auto Link EmpNo & GID: ดึงรหัสจากฐานข้อมูลพนักงานอัตโนมัติ</div>
+                <div className="text-teal-400">✓ Flexible 1-Value Mapping: คอลัมน์ Emp No ระบุเพียง 1 ค่า (อาจเป็น Emp No, Emp Code หรือ GID) ระบบจะตรวจสอบและ Mapping ให้อัตโนมัติ (หรือดึงสร้างพนักงานใหม่ทันทีหากไม่มีในระบบ)</div>
                 <div className="text-teal-400">✓ Department Isolation: ปรับปรุงเฉพาะพนักงานแผนก {importDept}</div>
+                <div className="text-teal-400">✓ Monthly Sheet Name: ชื่อ Sheet ตรงงวดเดือนจริง ({(() => {
+                  const [y, m] = importMonthYear.split('-');
+                  const mNum = parseInt(m, 10) || 9;
+                  const short = ANNUAL_TEMPLATE_MONTH_NAMES[mNum - 1]?.short || 'SEP';
+                  return `${short}-${y}`;
+                })()}) รูปแบบเดียวกับเทมเพลตรายปี</div>
                 <div className="text-amber-400">⚠ แจ้งเตือนทันทีหากพบพนักงานใหม่ที่ยังไม่มีในฐานข้อมูล (Employee Master)</div>
                 <div className="text-amber-400">⚠ แจ้งเตือนหากใช้ Shift Code ที่ไม่มีในระบบ</div>
               </div>
@@ -1852,7 +1986,12 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                   className="w-full flex items-center justify-center space-x-1.5 py-2.5 rounded bg-[#008b99] hover:bg-[#00a3a6] text-white font-bold text-xs shadow transition cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
-                  <span>Download Excel (.xlsx)</span>
+                  <span>Download Excel (Sheet: {(() => {
+                    const [y, m] = importMonthYear.split('-');
+                    const mNum = parseInt(m, 10) || 9;
+                    const short = ANNUAL_TEMPLATE_MONTH_NAMES[mNum - 1]?.short || 'SEP';
+                    return `${short}-${y}`;
+                  })()})</span>
                 </button>
                 <button
                   type="button"
@@ -1922,7 +2061,11 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                 {onNavigateToRoster && (
                   <button
                     type="button"
-                    onClick={onNavigateToRoster}
+                    onClick={() => {
+                      if (onSelectMonthYear) onSelectMonthYear(importMonthYear);
+                      if (onSelectDepartment && importDept !== 'ALL') onSelectDepartment(importDept);
+                      onNavigateToRoster();
+                    }}
                     className="flex items-center space-x-1.5 px-3 py-1.5 rounded font-bold text-xs bg-slate-700 hover:bg-slate-600 text-teal-300 border border-slate-600 transition cursor-pointer"
                   >
                     <span>ดูตารางกะรวม (Shift Roster)</span>
@@ -3884,326 +4027,6 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
               </table>
             </div>
             )}
-          </div>
-        </div>
-        )
-      )}
-
-      {/* TAB 5: Other Allowances (Company-Wide ALL) */}
-      {activeImportTab === 'allowances' && (
-        !isAdmin ? (
-          renderAdminOnlyRestriction('5. Other Allowances', 'เบี้ยเลี้ยงและรายได้เสริม')
-        ) : (
-        <div className="space-y-4">
-          {/* Universal Scope Card */}
-          <div className={`p-3.5 rounded border text-xs space-y-1 ${
-            isDark ? 'bg-[#152332] border-[#29425c] text-slate-300' : 'bg-teal-50 border-teal-200 text-slate-700'
-          }`}>
-            <div className="font-bold text-teal-400 flex items-center gap-1.5">
-              <DollarSign className="w-4 h-4" />
-              <span>Company-Wide Allowances (เบี้ยเลี้ยงและรายได้อื่นๆ รวมทุกแผนก)</span>
-            </div>
-            <p className="text-[11px] text-slate-400">
-              Upload Team Emergency, Shift Allowance, and Standby payments across all departments. Linked by GID/EmpNo to individual monthly Timesheets and Payroll.
-            </p>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className={`p-4 rounded border space-y-3 text-xs ${
-              isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
-            }`}>
-              <h2 className="font-bold text-sm text-[#00e5e5] flex items-center gap-2">
-                <DollarSign className="w-4 h-4" />
-                <span>Step 1: Download Template (ดาวน์โหลดเทมเพลต)</span>
-              </h2>
-              <p className="text-slate-400 leading-relaxed">
-                Download sample file covering Team Emergency, Shift Allowance, and Standby allowances.
-              </p>
-
-              <button
-                onClick={() => {
-                  const sampleCSV = '\uFEFFEmpNo,GID,MonthYear,TeamEmergency,ShiftAllowance,StandbyAllowance,Remark\n0149,Z00149TH,2026-05,800,1200,500,Emergency Team Coverage\n0950,Z00430UZ,2026-05,0,0,0,No shift allowance';
-                  downloadBlob(sampleCSV, 'Template_Other_Allowances.csv', 'text/csv;charset=utf-8;');
-                }}
-                className="w-full flex items-center justify-center space-x-1.5 py-2 rounded border border-slate-600 text-slate-300 hover:text-white text-xs"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Download Allowances Template (CSV)</span>
-              </button>
-            </div>
-
-            <div className={`md:col-span-2 p-6 rounded border flex flex-col items-center justify-center text-center space-y-4 border-dashed ${
-              isDark ? 'bg-[#121c27] border-[#2f4358]' : 'bg-white border-slate-300'
-            }`}>
-              <div className="p-4 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/30">
-                <DollarSign className="w-8 h-8" />
-              </div>
-              <div>
-                <h2 className="font-bold text-base text-slate-100">
-                  Step 2: Upload Allowances File (อัปโหลดไฟล์รายได้อื่นๆ)
-                </h2>
-                <p className="text-xs text-slate-400 mt-1">
-                  Scope: <strong>All Departments (ทุกแผนก)</strong> • Linked by GID / EmpNo
-                </p>
-              </div>
-
-              <label className="cursor-pointer px-6 py-3 rounded font-bold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-lg transition flex items-center space-x-2">
-                <Upload className="w-4 h-4" />
-                <span>Select Allowances File (.xlsx, .csv)</span>
-                <input
-                  type="file"
-                  accept=".xlsx,.xls,.csv"
-                  onChange={handleAllowancesFile}
-                  className="hidden"
-                />
-              </label>
-            </div>
-          </div>
-
-          {/* ========================================================================= */}
-          {/* IMPORTED ALLOWANCES INSPECTION & SUMMARY TABLE */}
-          {/* ========================================================================= */}
-          <div className={`p-4 rounded border text-xs space-y-3.5 ${
-            isDark ? 'bg-[#0e1722] border-[#223548]' : 'bg-white border-slate-200'
-          }`}>
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-700/60 pb-3">
-              <div>
-                <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
-                  <DollarSign className="w-4 h-4 text-[#00e5e5]" />
-                  <span>รายการเบี้ยเลี้ยงและรายได้เสริมที่บันทึกแล้วในระบบ (งวด {importMonthYear})</span>
-                </h3>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  ตรวจสอบรายการ Team Emergency, Shift Allowance, และ Standby ที่เชื่อมโยงเข้า Time Sheet และ Payroll
-                </p>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                {monthAllowances.length > 0 && (
-                  <>
-                    {confirmClearMonthAllowances ? (
-                      <div className="flex items-center space-x-1.5 p-1 rounded bg-red-950/40 border border-red-500/40">
-                        <span className="text-[11px] text-red-300 font-bold px-1">ยืนยันล้างเบี้ยเลี้ยงเดือน {importMonthYear}?</span>
-                        <button
-                          type="button"
-                          onClick={handleClearMonthAllowances}
-                          className="px-2.5 py-1 rounded bg-red-600 hover:bg-red-500 text-white font-bold text-[11px] cursor-pointer"
-                        >
-                          ใช่, ลบทั้งหมด
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmClearMonthAllowances(false)}
-                          className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 text-[11px] cursor-pointer"
-                        >
-                          ยกเลิก
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setConfirmClearMonthAllowances(true)}
-                        className="flex items-center space-x-1 px-2.5 py-1.5 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 text-[11px] cursor-pointer transition"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>ล้างเบี้ยเลี้ยงเดือนนี้ ({monthAllowances.length} รายการ)</span>
-                      </button>
-                    )}
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* KPI Summary Strip */}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
-              <div className={`p-2.5 rounded border ${
-                isDark ? 'bg-[#14202c] border-[#22364a]' : 'bg-slate-50 border-slate-200'
-              }`}>
-                <div className="text-[10px] text-slate-400">พนักงานที่มีเบี้ยเลี้ยง</div>
-                <div className="text-base font-bold font-mono text-white mt-0.5">
-                  {allowanceStats.uniqueEmployeesCount} <span className="text-xs font-normal text-slate-400">คน</span>
-                </div>
-                <div className="text-[10px] text-slate-400">
-                  รวม {allowanceStats.count} รายการ
-                </div>
-              </div>
-
-              <div className={`p-2.5 rounded border ${
-                isDark ? 'bg-teal-950/20 border-teal-800/40' : 'bg-teal-50 border-teal-200'
-              }`}>
-                <div className="text-[10px] text-teal-400 font-bold">Team Emergency</div>
-                <div className="text-base font-bold font-mono text-[#00e5e5] mt-0.5">
-                  ฿{allowanceStats.totalEmergency.toLocaleString()}
-                </div>
-                <div className="text-[10px] text-teal-400/80">
-                  เบี้ยเลี้ยงทีมฉุกเฉิน
-                </div>
-              </div>
-
-              <div className={`p-2.5 rounded border ${
-                isDark ? 'bg-blue-950/20 border-blue-800/40' : 'bg-blue-50 border-blue-200'
-              }`}>
-                <div className="text-[10px] text-blue-400 font-bold">Shift Allowance</div>
-                <div className="text-base font-bold font-mono text-blue-300 mt-0.5">
-                  ฿{allowanceStats.totalShift.toLocaleString()}
-                </div>
-                <div className="text-[10px] text-blue-400/80">
-                  ค่ากะทำงานพิเศษ
-                </div>
-              </div>
-
-              <div className={`p-2.5 rounded border ${
-                isDark ? 'bg-amber-950/20 border-amber-800/40' : 'bg-amber-50 border-amber-200'
-              }`}>
-                <div className="text-[10px] text-amber-400 font-bold">Standby Allowance</div>
-                <div className="text-base font-bold font-mono text-amber-300 mt-0.5">
-                  ฿{allowanceStats.totalStandby.toLocaleString()}
-                </div>
-                <div className="text-[10px] text-amber-400/80">
-                  ค่าเตรียมพร้อมสแตนด์บาย
-                </div>
-              </div>
-
-              <div className={`p-2.5 rounded border col-span-2 sm:col-span-1 ${
-                isDark ? 'bg-emerald-950/20 border-emerald-800/40' : 'bg-emerald-50 border-emerald-200'
-              }`}>
-                <div className="text-[10px] text-emerald-400 font-bold">ยอดรวมเบี้ยเลี้ยงทั้งสิ้น</div>
-                <div className="text-base font-bold font-mono text-emerald-300 mt-0.5">
-                  ฿{allowanceStats.grandTotal.toLocaleString()}
-                </div>
-                <div className="text-[10px] text-emerald-400/80">
-                  นำส่งคำนวณใน Payroll
-                </div>
-              </div>
-            </div>
-
-            {/* Filter and Search Bar */}
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-              <span className="text-xs text-slate-400">
-                แสดงข้อมูล {filteredMonthAllowances.length} จาก {monthAllowances.length} รายการ
-              </span>
-
-              <div className="relative w-full sm:w-72">
-                <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="ค้นหา EmpNo, GID, ชื่อ, หมายเหตุ..."
-                  value={allowanceSearchQuery}
-                  onChange={e => setAllowanceSearchQuery(e.target.value)}
-                  className={`w-full pl-8 pr-3 py-1.5 rounded border text-xs outline-none ${
-                    isDark ? 'bg-[#152332] border-[#29425c] text-white' : 'bg-slate-50 border-slate-300'
-                  }`}
-                />
-                {allowanceSearchQuery && (
-                  <button
-                    type="button"
-                    onClick={() => setAllowanceSearchQuery('')}
-                    className="absolute right-2 top-2 text-slate-400 hover:text-white"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* Allowances Table */}
-            <div className="overflow-x-auto max-h-72 overflow-y-auto border border-slate-700/50 rounded">
-              <table className="w-full text-left text-xs border-collapse">
-                <thead className={`sticky top-0 z-10 text-[11px] ${
-                  isDark ? 'bg-[#142230] text-slate-300' : 'bg-slate-100 text-slate-700'
-                }`}>
-                  <tr>
-                    <th className="p-2 border-b border-slate-700">รหัสพนักงาน / GID</th>
-                    <th className="p-2 border-b border-slate-700">ชื่อ - สกุล</th>
-                    <th className="p-2 border-b border-slate-700">แผนก</th>
-                    <th className="p-2 border-b border-slate-700 text-right">Team Emergency (฿)</th>
-                    <th className="p-2 border-b border-slate-700 text-right">Shift Allowance (฿)</th>
-                    <th className="p-2 border-b border-slate-700 text-right">Standby (฿)</th>
-                    <th className="p-2 border-b border-slate-700 text-right font-bold">รวม (฿)</th>
-                    <th className="p-2 border-b border-slate-700">หมายเหตุ (Remark)</th>
-                    <th className="p-2 border-b border-slate-700 text-center">จัดการ</th>
-                  </tr>
-                </thead>
-                <tbody className={`divide-y ${isDark ? 'divide-slate-800' : 'divide-slate-200'}`}>
-                  {filteredMonthAllowances.length === 0 ? (
-                    <tr>
-                      <td colSpan={9} className="p-6 text-center text-slate-400">
-                        {monthAllowances.length === 0
-                          ? `ยังไม่มีข้อมูลเบี้ยเลี้ยงในงวด ${importMonthYear} (ดาวน์โหลด Template และอัปโหลดไฟล์ในขั้นตอนด้านบน)`
-                          : 'ไม่พบรายการที่ตรงกับเงื่อนไขการค้นหา'}
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredMonthAllowances.map(a => {
-                      const emp = employees.find(e => e.empNo === a.empNo || e.gid === a.gid);
-                      const name = emp ? `${emp.firstName || ''} ${emp.familyName || ''}`.trim() : (a.empNo || '-');
-                      const dept = emp ? emp.department : '-';
-                      const rowTotal = (a.teamEmergency || 0) + (a.shiftAllowance || 0) + (a.standbyAllowance || 0);
-
-                      return (
-                        <tr key={a.id} className={isDark ? 'hover:bg-[#152332]' : 'hover:bg-slate-50'}>
-                          <td className="p-2 font-mono font-bold whitespace-nowrap text-teal-300">
-                            {a.empNo} {a.gid && <span className="text-slate-400 font-normal">/ {a.gid}</span>}
-                          </td>
-                          <td className="p-2 whitespace-nowrap text-slate-200 font-medium">
-                            {name}
-                          </td>
-                          <td className="p-2 whitespace-nowrap">
-                            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300">
-                              {dept}
-                            </span>
-                          </td>
-                          <td className="p-2 text-right font-mono text-teal-300">
-                            {(a.teamEmergency || 0).toLocaleString()}
-                          </td>
-                          <td className="p-2 text-right font-mono text-blue-300">
-                            {(a.shiftAllowance || 0).toLocaleString()}
-                          </td>
-                          <td className="p-2 text-right font-mono text-amber-300">
-                            {(a.standbyAllowance || 0).toLocaleString()}
-                          </td>
-                          <td className="p-2 text-right font-mono font-bold text-emerald-400 whitespace-nowrap">
-                            ฿{rowTotal.toLocaleString()}
-                          </td>
-                          <td className="p-2 text-[11px] text-slate-300 max-w-xs truncate" title={a.remark}>
-                            {a.remark || '-'}
-                          </td>
-                          <td className="p-2 text-center whitespace-nowrap">
-                            {deleteAllowanceConfirmId === a.id ? (
-                              <div className="inline-flex items-center space-x-1">
-                                <span className="text-[10px] text-red-400 font-bold">ลบ?</span>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteAllowanceRecord(a.id)}
-                                  className="px-1.5 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-bold"
-                                >
-                                  ใช่
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setDeleteAllowanceConfirmId(null)}
-                                  className="px-1.5 py-0.5 bg-slate-600 hover:bg-slate-700 text-white rounded text-[10px] font-bold"
-                                >
-                                  ยกเลิก
-                                </button>
-                              </div>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => setDeleteAllowanceConfirmId(a.id)}
-                                className="p-1 rounded text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition"
-                                title="ลบรายการเบี้ยเลี้ยงนี้"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
           </div>
         </div>
         )

@@ -15,6 +15,12 @@ import {
   isEmployeePlanMatch
 } from '../utils/timeCalc';
 import { 
+  isSameDepartment 
+} from '../utils/fileParser';
+import { 
+  storage 
+} from '../utils/storage';
+import { 
   BarChart3, 
   Clock, 
   HeartPulse, 
@@ -193,7 +199,7 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
 
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [showOnlyWithRecords, setShowOnlyWithRecords] = useState<boolean>(false);
+  const [showOnlyWithRecords, setShowOnlyWithRecords] = useState<boolean>(true);
   const [sortKey, setSortKey] = useState<'value' | 'empNo' | 'name' | 'department'>('value');
   const [sortAsc, setSortAsc] = useState<boolean>(false);
   const [expandedEmpNo, setExpandedEmpNo] = useState<string | null>(null);
@@ -253,10 +259,8 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
       return 'ALL';
     }
     if (selectedDepartment === 'ALL') return 'ALL';
-    if (availableDepartmentsForMonth.includes(selectedDepartment)) {
-      return selectedDepartment;
-    }
-    return 'ALL';
+    const found = availableDepartmentsForMonth.find(d => isSameDepartment(d, selectedDepartment));
+    return found || (availableDepartmentsForMonth.includes(selectedDepartment) ? selectedDepartment : 'ALL');
   }, [availableDepartmentsForMonth, selectedDepartment]);
 
   // Active Year for the Yearly Bar Chart Overview
@@ -543,23 +547,82 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
 
   // 3. Filter employees matching the department (which has uploaded shift plans)
   const targetEmployees = useMemo(() => {
+    const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
+    const list = [...baseEmployees];
+    const knownEmpNos = new Set<string>();
+    baseEmployees.forEach(e => {
+      if (e.empNo) {
+        const clean = e.empNo.trim().toUpperCase();
+        knownEmpNos.add(clean);
+        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          knownEmpNos.add(digits);
+          knownEmpNos.add(digits.padStart(4, '0'));
+          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
+        }
+      }
+      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
+      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
+    });
+    
+    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
+    shiftPlans.forEach(p => {
+      if (!p || !p.date || !p.date.startsWith(effectiveMonthYear)) return;
+      const eNo = (p.empNo || '').trim().toUpperCase();
+      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
+      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
+        missingEmpsFromPlans.set(eNo, p);
+      }
+    });
+
+    missingEmpsFromPlans.forEach((p, eNo) => {
+      const cleanNo = p.empNo || eNo;
+      const digits = cleanNo.replace(/\D/g, '');
+      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
+      list.push({
+        id: `synth-${paddedNo}`,
+        empNo: paddedNo,
+        empCode: digits ? `1000${paddedNo}` : cleanNo,
+        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
+        firstName: 'พนักงาน',
+        familyName: cleanNo,
+        department: p.department || (effectiveDepartment !== 'ALL' ? effectiveDepartment : 'GM'),
+        division: 'MO CS BTS',
+        functionTitle: 'Service Technician',
+        costCenter: 'C93051',
+        isShiftWorker: true,
+        isActive: true,
+      });
+    });
+
     // Collect all employee IDs/empNos who actually have shift plans in this department & month
     const empNosInMonthPlan = new Set<string>();
     shiftPlans.forEach(sp => {
       if (sp.date.startsWith(effectiveMonthYear)) {
-        if (effectiveDepartment === 'ALL' || sp.department === effectiveDepartment) {
-          if (sp.empNo) empNosInMonthPlan.add(sp.empNo);
+        if (effectiveDepartment === 'ALL' || isSameDepartment(sp.department, effectiveDepartment)) {
+          if (sp.empNo) {
+            const clean = sp.empNo.trim().toUpperCase();
+            empNosInMonthPlan.add(clean);
+            const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+            if (digits) {
+              empNosInMonthPlan.add(digits);
+              empNosInMonthPlan.add(digits.padStart(4, '0'));
+            }
+          }
         }
       }
     });
 
-    return employees.filter(emp => {
-      // Must be active and match department if specific
-      if (effectiveDepartment !== 'ALL' && emp.department !== effectiveDepartment) {
+    return list.filter(emp => {
+      // Must match department if specific
+      if (effectiveDepartment !== 'ALL' && !isSameDepartment(emp.department, effectiveDepartment)) {
         return false;
       }
       // Must have uploaded shift plan in this month
-      return empNosInMonthPlan.has(emp.empNo);
+      const clean = (emp.empNo || '').trim().toUpperCase();
+      const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+      return empNosInMonthPlan.has(clean) || (digits && (empNosInMonthPlan.has(digits) || empNosInMonthPlan.has(digits.padStart(4, '0'))));
     });
   }, [employees, shiftPlans, effectiveMonthYear, effectiveDepartment]);
 
@@ -1244,13 +1307,15 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
           <div>
             <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
               <span style={{ color: currentCategoryConfig.color }}>●</span>
-              <span>ตารางข้อมูลรายบุคคล (Individual Breakdown) — {currentCategoryConfig.nameEn}</span>
+              <span>ตารางข้อมูลรายบุคคล (Individual Breakdown) — {currentCategoryConfig.nameEn} ({currentCategoryConfig.nameTh})</span>
               <span className="text-xs font-normal text-slate-400">
-                ({filteredAndSortedRecords.length} คน)
+                ({filteredAndSortedRecords.length} คน{showOnlyWithRecords ? ` จากผู้มีสถิติตามหัวข้อนี้ทั้งหมด ${categorySummaryKPIs.affectedEmployees} คน` : ''})
               </span>
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
-              แสดงรายละเอียดการเกิดสถิติของพนักงานแต่ละคน พร้อมวันที่และรายละเอียดในงวด {effectiveMonthYear}
+              {showOnlyWithRecords 
+                ? `แสดงเฉพาะพนักงานที่มีสถิติ ${currentCategoryConfig.nameTh} (${currentCategoryConfig.nameEn}) ในงวด ${effectiveMonthYear} (ซ่อนผู้ที่ไม่มีสถิติเกี่ยวข้อง)`
+                : `แสดงพนักงานทุกคน พร้อมวันที่และรายละเอียดในงวด ${effectiveMonthYear}`}
             </p>
           </div>
 
@@ -1269,20 +1334,20 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
               />
             </div>
 
-            {/* Filter Toggle: Only with records */}
+            {/* Filter Toggle: Only with records vs Show all */}
             <button
               onClick={() => setShowOnlyWithRecords(prev => !prev)}
               className={`px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center space-x-1.5 transition cursor-pointer ${
                 showOnlyWithRecords
-                  ? 'bg-teal-500/20 border-teal-500/50 text-teal-300'
+                  ? 'bg-teal-500/20 border-teal-500/50 text-teal-300 font-semibold'
                   : isDark 
                     ? 'bg-[#162230] border-[#25384d] text-slate-400 hover:text-slate-200' 
                     : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50'
               }`}
-              title="สลับแสดงเฉพาะพนักงานที่มีสถิติในหมวดนี้"
+              title={showOnlyWithRecords ? "คลิกเพื่อแสดงพนักงานทุกคน (รวมผู้ที่ไม่มีสถิติ)" : "คลิกเพื่อซ่อนผู้ที่ไม่มีสถิติ (แสดงเฉพาะผู้มียอด > 0)"}
             >
-              <Filter className="w-3 h-3" />
-              <span>เฉพาะผู้มีสถิติ ({'> 0'})</span>
+              <Filter className="w-3.5 h-3.5 text-teal-400" />
+              <span>{showOnlyWithRecords ? 'ซ่อนผู้ไม่มีสถิติ (เฉพาะยอด > 0)' : 'แสดงทุกคน (รวม 0 รายการ)'}</span>
             </button>
 
             {/* Sort Toggle */}
@@ -1508,10 +1573,20 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
                 })
               ) : (
                 <tr>
-                  <td colSpan={activeCategory === 'late' ? 9 : 8} className="py-8 text-center text-slate-500 text-xs italic">
-                    {searchQuery 
-                      ? `ไม่พบข้อมูลพนักงานที่ตรงกับ "${searchQuery}"` 
-                      : 'ไม่มีข้อมูลพนักงานที่ตรงตามเงื่อนไขที่เลือก'}
+                  <td colSpan={activeCategory === 'late' ? 9 : 8} className="py-12 text-center text-xs">
+                    <div className="flex flex-col items-center justify-center space-y-2">
+                      <div className="p-2.5 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/20">
+                        <CheckCircle2 className="w-6 h-6" />
+                      </div>
+                      <span className="font-semibold text-slate-200 text-sm">
+                        ไม่มีพนักงานที่มีสถิติในหมวด {currentCategoryConfig.nameTh} ({currentCategoryConfig.nameEn}) ประจำงวด {effectiveMonthYear}
+                      </span>
+                      <span className="text-[11px] text-slate-400 max-w-md">
+                        {searchQuery 
+                          ? `ไม่พบข้อมูลพนักงานที่ตรงกับการค้นหา "${searchQuery}"` 
+                          : `ในงวดนี้พนักงานทุกคนใน${effectiveDepartment === 'ALL' ? 'ทุกแผนก' : `แผนก ${effectiveDepartment}`} ไม่มีสถิติเกี่ยวข้องกับหัวข้อนี้ จึงไม่มีข้อมูลแสดงผลในตาราง`}
+                      </span>
+                    </div>
                   </td>
                 </tr>
               )}

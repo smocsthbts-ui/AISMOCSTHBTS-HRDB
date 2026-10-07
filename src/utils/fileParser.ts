@@ -33,6 +33,74 @@ export async function readFileAsText(file: File): Promise<string> {
 }
 
 /**
+ * Universal Worksheet to JSON rows parser with smart header detection
+ * Finds the real header row even if there are banner titles, notes, or blank rows at the top
+ */
+export function parseWorksheetToRows(worksheet: XLSX.WorkSheet): any[] {
+  if (!worksheet) return [];
+
+  // 1. Try standard json conversion first
+  const defaultRows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+  if (defaultRows.length === 0) return [];
+
+  // Check if first row is already a valid header
+  const firstRowKeys = Object.keys(defaultRows[0] || {});
+  const isHeaderValid = firstRowKeys.some(k => {
+    const cleanK = k.trim().toLowerCase().replace(/[\s._-]/g, '');
+    return cleanK.includes('empno') || cleanK.includes('employee') || cleanK.includes('name') ||
+           cleanK.includes('ชื่อ') || cleanK.includes('รหัส') || cleanK.includes('gid') ||
+           cleanK.includes('empcode') || cleanK.includes('costcenter') ||
+           cleanK === '1' || cleanK === '01' || cleanK === 'd1' || cleanK === 'date';
+  });
+
+  if (isHeaderValid) {
+    return defaultRows;
+  }
+
+  // 2. If row 0 was a title/banner, find the real header row within the first 15 rows
+  const rawMatrix: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+  let headerRowIndex = -1;
+
+  for (let r = 0; r < Math.min(rawMatrix.length, 15); r++) {
+    const row = rawMatrix[r];
+    if (!Array.isArray(row)) continue;
+    const hasEmpHeader = row.some(cell => {
+      const s = String(cell || '').trim().toLowerCase().replace(/[\s._-]/g, '');
+      return s.includes('empno') || s.includes('employee') || s.includes('name') ||
+             s.includes('ชื่อ') || s.includes('รหัส') || s.includes('gid') ||
+             s.includes('empcode') || s.includes('costcenter') ||
+             s === 'code' || s === 'no' || s === 'no.' || s === 'id' || s.includes('staff');
+    });
+    const hasDayNumbers = row.some(cell => {
+      const s = String(cell || '').trim();
+      return s === '1' || s === '01' || s === 'D1' || s.startsWith('1 ') || s.startsWith('01 ') || s === 'd1';
+    });
+
+    if (hasEmpHeader || hasDayNumbers) {
+      headerRowIndex = r;
+      break;
+    }
+  }
+
+  if (headerRowIndex >= 0) {
+    const headers = rawMatrix[headerRowIndex].map((h, i) => String(h || '').trim() || `_COL_${i}`);
+    const rows: any[] = [];
+    for (let r = headerRowIndex + 1; r < rawMatrix.length; r++) {
+      const rowArr = rawMatrix[r];
+      if (!rowArr || rowArr.every(c => String(c || '').trim() === '')) continue;
+      const rowObj: Record<string, any> = {};
+      headers.forEach((h, colIdx) => {
+        rowObj[h] = rowArr[colIdx] !== undefined ? rowArr[colIdx] : '';
+      });
+      rows.push(rowObj);
+    }
+    return rows;
+  }
+
+  return defaultRows;
+}
+
+/**
  * Convert Excel / CSV workbook sheet into array of objects with smart header row detection
  */
 export function parseSheetToRows(data: ArrayBuffer): any[] {
@@ -79,65 +147,7 @@ export function parseSheetToRows(data: ArrayBuffer): any[] {
   const worksheet = workbook.Sheets[chosenSheetName];
   if (!worksheet) return [];
 
-  // 1. Try standard json conversion first
-  const defaultRows: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
-  if (defaultRows.length === 0) return [];
-
-  // Check if first row is already a valid header
-  const firstRowKeys = Object.keys(defaultRows[0] || {});
-  const isHeaderValid = firstRowKeys.some(k => {
-    const cleanK = k.trim().toLowerCase().replace(/[\s._-]/g, '');
-    return cleanK.includes('empno') || cleanK.includes('employee') || cleanK.includes('name') ||
-           cleanK.includes('ชื่อ') || cleanK.includes('รหัส') || cleanK.includes('gid') ||
-           cleanK.includes('empcode') || cleanK.includes('costcenter') ||
-           cleanK === '1' || cleanK === '01' || cleanK === 'd1' || cleanK === 'date';
-  });
-
-  if (isHeaderValid) {
-    return defaultRows;
-  }
-
-  // 2. If row 0 was a title/banner, find the real header row within the first 10 rows
-  const rawMatrix: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
-  let headerRowIndex = -1;
-
-  for (let r = 0; r < Math.min(rawMatrix.length, 10); r++) {
-    const row = rawMatrix[r];
-    if (!Array.isArray(row)) continue;
-    const hasEmpHeader = row.some(cell => {
-      const s = String(cell || '').trim().toLowerCase().replace(/[\s._-]/g, '');
-      return s.includes('empno') || s.includes('employee') || s.includes('name') ||
-             s.includes('ชื่อ') || s.includes('รหัส') || s.includes('gid') ||
-             s.includes('empcode') || s.includes('costcenter') ||
-             s === 'code' || s === 'no' || s === 'no.' || s === 'id';
-    });
-    const hasDayNumbers = row.some(cell => {
-      const s = String(cell || '').trim();
-      return s === '1' || s === '01' || s === 'D1' || s.startsWith('1 ') || s.startsWith('01 ');
-    });
-
-    if (hasEmpHeader || hasDayNumbers) {
-      headerRowIndex = r;
-      break;
-    }
-  }
-
-  if (headerRowIndex >= 0) {
-    const headers = rawMatrix[headerRowIndex].map((h, i) => String(h || '').trim() || `_COL_${i}`);
-    const rows: any[] = [];
-    for (let r = headerRowIndex + 1; r < rawMatrix.length; r++) {
-      const rowArr = rawMatrix[r];
-      if (!rowArr || rowArr.every(c => String(c || '').trim() === '')) continue;
-      const rowObj: Record<string, any> = {};
-      headers.forEach((h, colIdx) => {
-        rowObj[h] = rowArr[colIdx] !== undefined ? rowArr[colIdx] : '';
-      });
-      rows.push(rowObj);
-    }
-    return rows;
-  }
-
-  return defaultRows;
+  return parseWorksheetToRows(worksheet);
 }
 
 /**
@@ -238,7 +248,7 @@ export function parseCSVTextToRows(csvText: string): any[] {
 }
 
 /**
- * Flexible department comparison helper (handles TRW/TRL, TRW-TRL, TRW / TRL, trailing spaces, etc.)
+ * Flexible department comparison helper (handles BES/PSY, BES/PSY2, BES, PSY, TRW/TRL, TRW-TRL, etc.)
  */
 export function isSameDepartment(deptA?: string, deptB?: string): boolean {
   if (!deptA || !deptB) return false;
@@ -247,27 +257,40 @@ export function isSameDepartment(deptA?: string, deptB?: string): boolean {
   if (a === b) return true;
   if (a === 'ALL' || b === 'ALL') return true;
 
-  const normalizeDept = (d: string) => d.replace(/[\s\/_\\-]/g, '').toUpperCase();
+  const normalizeDept = (d: string) => d.replace(/[\s\/_\\\-+&()]/g, '').toUpperCase();
   const na = normalizeDept(a);
   const nb = normalizeDept(b);
-  if (na === nb) return true;
+  if (na && nb && na === nb) return true;
 
-  // Handle TRW and TRL shorthand matching TRW/TRL
-  if ((na === 'TRWTRL' && (nb === 'TRW' || nb === 'TRL' || nb === 'TRD')) ||
-      (nb === 'TRWTRL' && (na === 'TRW' || na === 'TRL' || na === 'TRD'))) {
-    return true;
-  }
-  if ((na === 'TRWTRD' && (nb === 'TRW' || nb === 'TRD')) ||
-      (nb === 'TRWTRD' && (na === 'TRW' || na === 'TRD'))) {
-    return true;
-  }
-  if ((na === 'ADMCMM' && (nb === 'ADM' || nb === 'CMM')) ||
-      (nb === 'ADMCMM' && (na === 'ADM' || na === 'CMM'))) {
-    return true;
-  }
-  if ((na === 'BESPSY' && (nb === 'BES' || nb === 'PSY')) ||
-      (nb === 'BESPSY' && (na === 'BES' || na === 'PSY'))) {
-    return true;
+  // Split tokens e.g. "BES/PSY" -> ["BES", "PSY"], "BES/PSY2" -> ["BES", "PSY2"]
+  const tokenize = (d: string) => d.toUpperCase().split(/[\s\/_\\\-+&(),.]+/).filter(Boolean);
+  const tokensA = tokenize(a);
+  const tokensB = tokenize(b);
+
+  // Common token match (e.g. "BES" in "BES/PSY" and "BES/PSY2" or "PSY" in "PSY" and "BES/PSY")
+  const hasCommonToken = tokensA.some(ta => tokensB.some(tb => {
+    if (ta === tb) return true;
+    const cleanTa = ta.replace(/\d+$/, '');
+    const cleanTb = tb.replace(/\d+$/, '');
+    return cleanTa && cleanTb && cleanTa === cleanTb && cleanTa.length >= 3;
+  }));
+  if (hasCommonToken) return true;
+
+  // Handle specific paired aliases
+  const pairs: [string, string][] = [
+    ['BESPSY', 'BES'], ['BESPSY', 'PSY'],
+    ['BESPSY2', 'BES'], ['BESPSY2', 'PSY'],
+    ['BESPSY', 'BESPSY2'], ['BESPSY2', 'BESPSY'],
+    ['TRWTRL', 'TRW'], ['TRWTRL', 'TRL'], ['TRWTRL', 'TRD'], ['TRWTRL', 'TRWTRD'],
+    ['TRWTRD', 'TRW'], ['TRWTRD', 'TRD'], ['TRWTRD', 'TRL'],
+    ['ADMCMM', 'ADM'], ['ADMCMM', 'CMM'],
+    ['RST', 'RST2'], ['RST2', 'RST'],
+  ];
+
+  for (const [p1, p2] of pairs) {
+    if ((na === p1 && nb === p2) || (na === p2 && nb === p1)) {
+      return true;
+    }
   }
 
   return false;
@@ -438,8 +461,76 @@ export function parseEmployeeNameParts(rawName: string): { firstName: string; fa
 }
 
 /**
+ * Robustly checks if a single identifier string (which may be Emp No, Emp Code, or GID) matches an employee.
+ * User requirement: "Emp No ที่ใช้ Mapping อาจจะเป็น Emp Code หรือ GID ก็ได้แต่จะมี 1 ค่าเท่านั้นที่ User อาจจะเพิ่มเอง"
+ */
+export function isEmployeeIdentifierMatch(
+  identifier: string,
+  e: Employee
+): boolean {
+  if (!identifier || !e) return false;
+  const rawId = String(identifier).trim().toLowerCase();
+  if (!rawId) return false;
+  const cleanId = rawId.replace(/[^a-z0-9]/gi, '');
+
+  const eNoRaw = (e.empNo || '').trim().toLowerCase();
+  const eNoClean = eNoRaw.replace(/[^a-z0-9]/gi, '');
+
+  const eCodeRaw = (e.empCode || '').trim().toLowerCase();
+  const eCodeClean = eCodeRaw.replace(/[^a-z0-9]/gi, '');
+
+  const gidRaw = (e.gid || '').trim().toLowerCase();
+  const gidClean = gidRaw.replace(/[^a-z0-9]/gi, '');
+
+  // 1. Direct equality with empNo, empCode, or GID
+  if (rawId === eNoRaw || rawId === eCodeRaw || rawId === gidRaw) return true;
+  if (cleanId && (cleanId === eNoClean || cleanId === eCodeClean || cleanId === gidClean)) return true;
+
+  // 2. GID match (case-insensitive & clean alphanumeric, e.g. "Z00430UZ", "z00430uz", "Z-00430UZ")
+  if (gidClean && cleanId && (cleanId === gidClean || gidClean === cleanId)) return true;
+
+  // 3. Digits extraction for numeric EmpNo and EmpCode
+  const idDigits = rawId.replace(/\D/g, '');
+  const idNum = idDigits.replace(/^0+/, ''); // strip leading zeros
+
+  const eNoDigits = eNoRaw.replace(/\D/g, '');
+  const eNoNum = eNoDigits.replace(/^0+/, '');
+
+  const eCodeDigits = eCodeRaw.replace(/\D/g, '');
+  const eCodeNum = eCodeDigits.replace(/^0+/, '');
+
+  if (idNum) {
+    // Numeric equality with empNo (handles leading zeros e.g. "0950" == "950")
+    if (eNoNum && idNum === eNoNum) return true;
+    // Numeric equality with empCode
+    if (eCodeNum && idNum === eCodeNum) return true;
+    // 4-digit padded matching
+    if (eNoDigits && idDigits.padStart(4, '0') === eNoDigits.padStart(4, '0')) return true;
+
+    // Cross-match 8-digit Payroll EmpCode (e.g. "10000950" or "65090950") with short EmpNo (e.g. "0950" or "950")
+    if (idDigits.length >= 7 && (idDigits.startsWith('1000') || idDigits.startsWith('6509') || idDigits.startsWith('650'))) {
+      const subDigits = idDigits.replace(/^(10000|1000|6509|650)/, '').replace(/^0+/, '');
+      if (subDigits && eNoNum && subDigits === eNoNum) return true;
+      if (subDigits && eCodeNum && subDigits === eCodeNum) return true;
+    }
+    if (eCodeDigits.length >= 7 && (eCodeDigits.startsWith('1000') || eCodeDigits.startsWith('6509') || eCodeDigits.startsWith('650'))) {
+      const subDigits = eCodeDigits.replace(/^(10000|1000|6509|650)/, '').replace(/^0+/, '');
+      if (subDigits && idNum && subDigits === idNum) return true;
+    }
+
+    // Check if GID digits match (e.g. GID "Z000950TH" or "Z0149TH" has digits "0950" / "950")
+    if (gidRaw) {
+      const gidDigits = gidRaw.replace(/\D/g, '').replace(/^0+/, '');
+      if (gidDigits && (idNum === gidDigits || (idDigits.length >= 4 && gidDigits.endsWith(idDigits)))) return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Helper to match an employee from database using Name, EmpNo, or GID.
- * Priority: ใช้รหัส Emp No. เป็นหลัก โดยบางแผนกอาจจะไม่ระบุนามสกุลในไฟล์ Excel
+ * Priority: ใช้รหัสเดี่ยวที่ผู้ใช้ระบุ (อาจเป็น Emp No, Emp Code หรือ GID) เป็นหลักในการ Mapping
  */
 function matchEmployeeFromDatabase(
   rawName: string,
@@ -448,78 +539,48 @@ function matchEmployeeFromDatabase(
   deptEmployees: Employee[],
   allEmployees: Employee[]
 ): { employee?: Employee; foreignEmployee?: Employee } {
-  let normEmpNo = rawEmpNo.trim().toLowerCase();
-  let normGid = rawGid.trim().toLowerCase();
+  let primaryId = (rawEmpNo || rawGid || '').trim();
   let normName = rawName.replace(/\s+/g, ' ').trim().toLowerCase();
   let cleanName = cleanEmployeeName(rawName);
 
-  // If rawEmpNo and rawGid are empty, check if rawName contains embedded EmpNo or GID
-  if (!normEmpNo && !normGid && rawName) {
+  // If primaryId is empty, check if rawName contains embedded EmpNo or GID
+  if (!primaryId && rawName) {
     const trimmed = rawName.trim();
     // 1. Pure numbers e.g. "0950" or "10000950"
     if (/^\d{2,8}$/.test(trimmed)) {
-      normEmpNo = trimmed.toLowerCase();
+      primaryId = trimmed;
     } else {
       // 2. Prefix format: "0950 Napassawan" or "0950 - นภัสวรรณ"
       const prefixMatch = trimmed.match(/^(\d{2,8})\s*[-:_\/]?\s+(.*)$/);
       if (prefixMatch) {
-        normEmpNo = prefixMatch[1].toLowerCase();
+        primaryId = prefixMatch[1];
         normName = prefixMatch[2].replace(/\s+/g, ' ').trim().toLowerCase();
         cleanName = cleanEmployeeName(prefixMatch[2]);
       } else {
         // 3. Parenthesis format: "Napassawan (0950)"
         const parenMatch = trimmed.match(/^(.*?)\s*[\(\[](\d{2,8})[\)\]]$/);
         if (parenMatch) {
-          normEmpNo = parenMatch[2].toLowerCase();
+          primaryId = parenMatch[2];
           normName = parenMatch[1].replace(/\s+/g, ' ').trim().toLowerCase();
           cleanName = cleanEmployeeName(parenMatch[1]);
         }
       }
 
       // 4. Check for GID format e.g. "Z00430UZ Napassawan"
-      const gidMatch = trimmed.match(/\b([A-Z]\d{6}[A-Z0-9]+)\b/i);
+      const gidMatch = trimmed.match(/\b([A-Z]\d{4,}[A-Z0-9]*)\b/i);
       if (gidMatch) {
-        normGid = gidMatch[1].toLowerCase();
+        primaryId = gidMatch[1];
       }
     }
   }
 
-  // 1. PRIMARY RULE: Match by EmpNo (หรือ Payroll EmpCode) ในแผนกเป้าหมายเป็นอันดับแรกสุด
-  // โดยไม่จำเป็นต้องตรวจสอบนามสกุล เพื่อรองรับกรณีที่บางแผนกไม่ระบุนามสกุลในไฟล์ Excel
-  if (normEmpNo) {
-    const cleanDigits = normEmpNo.replace(/\D/g, '');
-
-    const isEmpNoEqual = (e: Employee) => {
-      const eNo = (e.empNo || '').trim().toLowerCase();
-      if (eNo === normEmpNo) return true;
-
-      const eDigits = eNo.replace(/\D/g, '');
-      if (cleanDigits && eDigits && cleanDigits === eDigits) return true;
-      if (cleanDigits && cleanDigits.padStart(4, '0') === eNo) return true;
-      if (cleanDigits && eNo.padStart(4, '0') === cleanDigits) return true;
-
-      // Match with 8-digit Payroll EmpCode e.g. "10000950"
-      if (e.empCode) {
-        const cLower = e.empCode.trim().toLowerCase();
-        if (cLower === normEmpNo) return true;
-        const cDigits = cLower.replace(/\D/g, '');
-        if (cleanDigits && cDigits && cleanDigits === cDigits) return true;
-      }
-      return false;
-    };
-
-    const deptMatch = deptEmployees.find(isEmpNoEqual);
+  // 1. PRIMARY RULE: Match by single identifier (Emp No, Emp Code, or GID)
+  // Check target department first, then across all departments
+  if (primaryId) {
+    const deptMatch = deptEmployees.find(e => isEmployeeIdentifierMatch(primaryId, e));
     if (deptMatch) return { employee: deptMatch };
 
-    const foreignMatch = allEmployees.find(isEmpNoEqual);
-    if (foreignMatch) return { foreignEmployee: foreignMatch };
-  }
-
-  // 2. Try matching by GID in target department first, then across company
-  if (normGid) {
-    const deptMatch = deptEmployees.find(e => (e.gid || '').trim().toLowerCase() === normGid);
-    if (deptMatch) return { employee: deptMatch };
-    const foreignMatch = allEmployees.find(e => (e.gid || '').trim().toLowerCase() === normGid);
+    const foreignMatch = allEmployees.find(e => isEmployeeIdentifierMatch(primaryId, e));
     if (foreignMatch) return { foreignEmployee: foreignMatch };
   }
 
@@ -771,13 +832,19 @@ export function validateAndParseShiftPlan(
     const rowNum = idx + 2;
 
     // Extract identifiers from row with flexible Siemens header patterns
-    const rawEmpNo = getRowVal(row, [
-      'EmpNo', 'Emp No', 'Emp No.', 'Employee No', 'Employee No.', 'EmployeeNo',
-      'EmpCode', 'Emp Code', 'Employee Code', 'EmployeeCode',
-      'Code', 'code', 'empNo', 'รหัสพนักงาน', 'รหัส', 'No.', 'No', 'ID', 'Employee ID', 'Emp ID'
+    let rawEmpNo = getRowVal(row, [
+      'EmpNo', 'Emp No', 'Emp No.', 'Emp.No', 'Emp. No', 'Emp. No.', 'Employee No', 'Employee No.', 'EmployeeNo',
+      'Employee_No', 'Emp_No', 'EmpCode', 'Emp Code', 'Emp Code.', 'Employee Code', 'EmployeeCode', 'Employee_Code',
+      'Staff No', 'Staff No.', 'Staff ID', 'StaffCode', 'Staff Code',
+      'Personnel No', 'Personnel No.', 'Personnel Number', 'Person No',
+      'Code', 'code', 'empNo', 'emp_no', 'emp_code', 'รหัสพนักงาน', 'รหัส', 'รหัส พนักงาน', 'รหัสประจำตัว',
+      'No.', 'No', 'No .', 'ID', 'Employee ID', 'Emp ID', 'Emp_ID'
     ]);
+    if (rawEmpNo) {
+      rawEmpNo = rawEmpNo.trim().replace(/\.0+$/, '');
+    }
 
-    const rawGid = getRowVal(row, [
+    let rawGid = getRowVal(row, [
       'GID', 'gid', 'Gid', 'Global ID', 'GlobalID', 'รหัส GID', 'รหัสGID'
     ]);
 
@@ -798,6 +865,21 @@ export function validateAndParseShiftPlan(
       'CostCenter', 'Cost Center', 'Cost_Center', 'costcenter', 'cost center', 'Cost centre', 'CostCentre'
     ]);
 
+    // Smart fallback: if rawEmpNo and rawGid were not found by key, inspect first 3 columns for digits or GID
+    if (!rawEmpNo && !rawGid) {
+      const keys = Object.keys(row);
+      for (const k of keys.slice(0, 3)) {
+        const val = String(row[k] || '').trim().replace(/\.0+$/, '');
+        if (/^\d{1,8}$/.test(val)) {
+          rawEmpNo = val;
+          break;
+        } else if (/^[A-Z]\d{4,}[A-Z0-9]*$/i.test(val) || isValidGID(val)) {
+          rawGid = val;
+          break;
+        }
+      }
+    }
+
     // Skip totally empty row
     if (!rawName && !rawEmpNo && !rawGid) {
       return;
@@ -812,29 +894,25 @@ export function validateAndParseShiftPlan(
       allEmployeesWorkList
     );
 
-    let employee: Employee;
-
-    if (matchedDeptEmp) {
-      // If row has an explicitly invalid GID or employee in DB has invalid GID and row has no valid GID
-      const rowGidInvalid = Boolean(rawGid && !isValidGID(rawGid));
-      const dbGidInvalid = !isValidGID(matchedDeptEmp.gid);
-
-      if (rowGidInvalid || (dbGidInvalid && !isValidGID(rawGid))) {
-        const invalidGidDisplay = rawGid ? `"${rawGid.trim()}"` : `"${matchedDeptEmp.gid || 'ว่าง'}"`;
-        skippedRows.push({
-          row: rowNum,
-          empNo: matchedDeptEmp.empNo,
-          gid: rawGid || matchedDeptEmp.gid || '(ว่าง)',
-          name: `${matchedDeptEmp.firstName} ${matchedDeptEmp.familyName}`.trim(),
-          department: matchedDeptEmp.department,
-          reason: `พนักงานมีข้อมูล GID ไม่สมบูรณ์หรือเป็นรหัสตัวอย่าง/ไม่ถูกต้อง (${invalidGidDisplay}) — ระบบไม่อนุญาตให้นำเข้าเฉพาะรายการนี้ กรุณาระบุ GID จริง`,
-        });
-        warnings.push(
-          `แถวที่ ${rowNum}: ข้ามการนำเข้าพนักงาน "${matchedDeptEmp.firstName} ${matchedDeptEmp.familyName}" (รหัส: ${matchedDeptEmp.empNo}) เนื่องจากข้อมูล GID ไม่สมบูรณ์ (${invalidGidDisplay})`
+    // Rule: "การอัปโหลด Shift Plan ผิดแผนกจะต้องดำเนินการไม่ได้เด็ดขาด"
+    if (selectedDepartment !== 'ALL') {
+      if (rawDept && rawDept.trim() && !isSameDepartment(rawDept, selectedDepartment)) {
+        errors.push(
+          `แถวที่ ${rowNum}: อัปโหลดผิดแผนก — พนักงาน "${rawName || rawEmpNo || 'ไม่ระบุชื่อ'}" ระบุแผนก "${rawDept}" ซึ่งไม่ตรงกับแผนกเป้าหมายที่เลือก (${selectedDepartment})`
         );
         return;
       }
+      if (foreignEmployee && foreignEmployee.department && !isSameDepartment(foreignEmployee.department, selectedDepartment)) {
+        errors.push(
+          `แถวที่ ${rowNum}: อัปโหลดผิดแผนก — พนักงาน "${foreignEmployee.firstName} ${foreignEmployee.familyName}" (รหัส ${foreignEmployee.empNo}) สังกัดแผนก "${foreignEmployee.department}" ในระบบ ซึ่งไม่ตรงกับแผนกเป้าหมายที่เลือก (${selectedDepartment})`
+        );
+        return;
+      }
+    }
 
+    let employee: Employee;
+
+    if (matchedDeptEmp) {
       employee = matchedDeptEmp;
 
       // Auto-assign Function & Cost Center if missing
@@ -862,113 +940,90 @@ export function validateAndParseShiftPlan(
         empModified = true;
       }
 
+      // If template row specifies a department or target department differs (within same department family)
+      if (rawDept && rawDept.trim() && isSameDepartment(rawDept, employee.department) && rawDept.trim().toUpperCase() !== employee.department.toUpperCase()) {
+        employee.department = rawDept.trim().toUpperCase();
+        empModified = true;
+      }
+
       if (empModified) {
         employee.updatedAt = new Date().toISOString();
         newEmployeesMap.set(employee.empNo, employee);
       }
-    } else if (selectedDepartment === 'ALL' && foreignEmployee) {
-      const rowGidInvalid = Boolean(rawGid && !isValidGID(rawGid));
-      const dbGidInvalid = !isValidGID(foreignEmployee.gid);
-
-      if (rowGidInvalid || (dbGidInvalid && !isValidGID(rawGid))) {
-        const invalidGidDisplay = rawGid ? `"${rawGid.trim()}"` : `"${foreignEmployee.gid || 'ว่าง'}"`;
-        skippedRows.push({
-          row: rowNum,
-          empNo: foreignEmployee.empNo,
-          gid: rawGid || foreignEmployee.gid || '(ว่าง)',
-          name: `${foreignEmployee.firstName} ${foreignEmployee.familyName}`.trim(),
-          department: foreignEmployee.department,
-          reason: `พนักงานมีข้อมูล GID ไม่สมบูรณ์หรือเป็นรหัสตัวอย่าง/ไม่ถูกต้อง (${invalidGidDisplay}) — ระบบไม่อนุญาตให้นำเข้าเฉพาะรายการนี้ กรุณาระบุ GID จริง`,
-        });
-        warnings.push(
-          `แถวที่ ${rowNum}: ข้ามการนำเข้าพนักงาน "${foreignEmployee.firstName} ${foreignEmployee.familyName}" (รหัส: ${foreignEmployee.empNo}) เนื่องจากข้อมูล GID ไม่สมบูรณ์ (${invalidGidDisplay})`
+    } else if (foreignEmployee) {
+      if (selectedDepartment !== 'ALL' && !isSameDepartment(foreignEmployee.department, selectedDepartment)) {
+        errors.push(
+          `แถวที่ ${rowNum}: อัปโหลดผิดแผนก — พนักงาน "${foreignEmployee.firstName} ${foreignEmployee.familyName}" สังกัดแผนก "${foreignEmployee.department}" ไม่สามารถอัปโหลดเข้าสู่แผนก "${selectedDepartment}" ได้`
         );
         return;
       }
-
       employee = foreignEmployee;
-
-      let empModified = false;
-      if (!employee.functionTitle || employee.functionTitle.trim() === '' || employee.functionTitle === '-') {
-        employee.functionTitle = (rawFunction && rawFunction.trim()) ? rawFunction.trim() : 'Service Technician';
-        empModified = true;
-      }
-      if (!employee.costCenter || employee.costCenter.trim() === '' || employee.costCenter === '-') {
-        employee.costCenter = (rawCostCenter && rawCostCenter.trim())
-          ? rawCostCenter.trim()
-          : getDefaultCostCenterForDepartment(employee.department, allEmployeesWorkList);
-        empModified = true;
-      }
-      if (empModified) {
-        employee.updatedAt = new Date().toISOString();
-        newEmployeesMap.set(employee.empNo, employee);
-      }
-    } else if (foreignEmployee && selectedDepartment !== 'ALL') {
-      const rowGidInvalid = Boolean(rawGid && !isValidGID(rawGid));
-      const dbGidInvalid = !isValidGID(foreignEmployee.gid);
-
-      if (rowGidInvalid || (dbGidInvalid && !isValidGID(rawGid))) {
-        const invalidGidDisplay = rawGid ? `"${rawGid.trim()}"` : `"${foreignEmployee.gid || 'ว่าง'}"`;
-        skippedRows.push({
-          row: rowNum,
-          empNo: foreignEmployee.empNo,
-          gid: rawGid || foreignEmployee.gid || '(ว่าง)',
-          name: `${foreignEmployee.firstName} ${foreignEmployee.familyName}`.trim(),
-          department: foreignEmployee.department,
-          reason: `พนักงานมีข้อมูล GID ไม่สมบูรณ์หรือเป็นรหัสตัวอย่าง/ไม่ถูกต้อง (${invalidGidDisplay}) — ระบบไม่อนุญาตให้นำเข้าเฉพาะรายการนี้ กรุณาระบุ GID จริง`,
-        });
-        return;
-      }
-
-      const rowDeptUpper = rawDept ? rawDept.trim().toUpperCase() : '';
-      if (isSameDepartment(rowDeptUpper, selectedDepartment) || isSameDepartment(foreignEmployee.department, selectedDepartment) || rowDeptUpper === '') {
-        employee = foreignEmployee;
-      } else {
-        employee = foreignEmployee;
-        warnings.push(
-          `แถวที่ ${rowNum}: พนักงาน "${foreignEmployee.firstName} ${foreignEmployee.familyName}" (รหัส: ${foreignEmployee.empNo}) สังกัดแผนก "${foreignEmployee.department}" ในฐานข้อมูล แต่ถูกจัดกะในแผนก "${selectedDepartment}"`
-        );
-      }
-
-      let empModified = false;
-      if (!employee.functionTitle || employee.functionTitle.trim() === '' || employee.functionTitle === '-') {
-        employee.functionTitle = (rawFunction && rawFunction.trim()) ? rawFunction.trim() : 'Service Technician';
-        empModified = true;
-      }
-      if (!employee.costCenter || employee.costCenter.trim() === '' || employee.costCenter === '-') {
-        employee.costCenter = (rawCostCenter && rawCostCenter.trim())
-          ? rawCostCenter.trim()
-          : getDefaultCostCenterForDepartment(employee.department, allEmployeesWorkList);
-        empModified = true;
-      }
-      if (empModified) {
-        employee.updatedAt = new Date().toISOString();
-        newEmployeesMap.set(employee.empNo, employee);
-      }
     } else {
-      // New Employee in Shift Plan (not found in database)
-      // Strict GID validation: Must have a valid real GID (cannot be missing or placeholders like XXX, 000, N/A)
-      if (!isValidGID(rawGid)) {
-        const invalidGidDisplay = (rawGid && rawGid.trim()) ? `"${rawGid.trim()}"` : 'ไม่ได้ระบุ GID';
+      // New Employee in Shift Plan (User added a new employee with a single identifier)
+      // "Emp No ที่ใช้ Mapping อาจจะเป็น Emp Code หรือ GID ก็ได้แต่จะมี 1 ค่าเท่านั้นที่ User อาจจะเพิ่มเอง"
+      let inputId = (rawEmpNo || rawGid || '').trim().replace(/\.0+$/, '');
+      if (!inputId && rawName && rawName.trim()) {
+        const cleanDeptPrefix = (rawDept || selectedDepartment || 'EMP').replace(/[^A-Za-z0-9]/g, '').slice(0, 3) || 'EMP';
+        inputId = `${cleanDeptPrefix}${String(rowNum).padStart(3, '0')}`;
+      }
+
+      if (!inputId) {
+        const invalidIdDisplay = 'ไม่ได้ระบุรหัสพนักงาน (Emp No / Emp Code / GID)';
         skippedRows.push({
           row: rowNum,
-          empNo: rawEmpNo || '(ไม่มี)',
-          gid: rawGid || '(ว่าง)',
+          empNo: '(ไม่มี)',
+          gid: '(ว่าง)',
           name: rawName || `พนักงานแถวที่ ${rowNum}`,
           department: rawDept || selectedDepartment,
-          reason: `พนักงานใหม่ไม่มีข้อมูล GID หรือใส่ข้อมูลที่ไม่สมบูรณ์/ตัวอย่าง (${invalidGidDisplay}) — ระบบไม่อนุญาตให้นำเข้าเฉพาะรายการนี้ กรุณาระบุ GID จริง`,
+          reason: `พนักงานใหม่ไม่มีรหัสสำหรับใช้ Mapping (${invalidIdDisplay}) — กรุณาระบุรหัสพนักงาน (Emp No / Emp Code / GID)`,
         });
         warnings.push(
-          `แถวที่ ${rowNum}: ข้ามการนำเข้าพนักงานใหม่ "${rawName || rawEmpNo || `แถวที่ ${rowNum}`}" เนื่องจากข้อมูล GID ไม่สมบูรณ์/ไม่ถูกต้อง (${invalidGidDisplay})`
+          `แถวที่ ${rowNum}: ข้ามการนำเข้าพนักงานใหม่ "${rawName || `แถวที่ ${rowNum}`}" เนื่องจากไม่มีรหัสระบุตัวตนสำหรับ Mapping`
         );
-        return; // Reject and skip this row completely!
+        return; // Reject and skip this row
       }
 
-      // Valid GID confirmed -> Auto-create employee with Function 'Service Technician' & Cost Center based on Department
-      const empNoToUse = rawEmpNo ? String(rawEmpNo).trim() : String(rawGid).trim();
-      const { firstName, familyName } = parseEmployeeNameParts(rawName || `พนักงาน ${empNoToUse}`);
+      // Determine whether inputId is GID, 8-digit Payroll EmpCode, or short EmpNo
+      let finalEmpNo = inputId;
+      let finalEmpCode = inputId;
+      let finalGid = inputId;
+
+      const isGidPattern = /^[A-Z]\d{4,}[A-Z0-9]*$/i.test(inputId) || isValidGID(inputId);
+      const isEightDigitCode = /^\d{8}$/.test(inputId);
+      const isDigitsOnly = /^\d+$/.test(inputId);
+
+      if (isGidPattern) {
+        // 1. Single value is a GID (e.g. "Z00430UZ", "Z00999TH")
+        finalGid = inputId.toUpperCase();
+        const digits = inputId.replace(/\D/g, '');
+        finalEmpNo = digits ? digits.slice(-4).padStart(4, '0') : inputId;
+        finalEmpCode = digits ? `1000${finalEmpNo.padStart(4, '0')}` : inputId;
+      } else if (isEightDigitCode) {
+        // 2. Single value is 8-digit Payroll Emp Code (e.g. "10000950", "10001234")
+        finalEmpCode = inputId;
+        finalEmpNo = inputId.slice(-4);
+        finalGid = `Z${finalEmpNo}TH`;
+      } else if (isDigitsOnly) {
+        // 3. Single value is short Emp No (e.g. "0950", "950", "503", "82", "1442")
+        finalEmpNo = inputId.length <= 4 ? inputId.padStart(4, '0') : inputId;
+        finalEmpCode = `1000${finalEmpNo.padStart(4, '0')}`;
+        finalGid = `Z${finalEmpNo.padStart(4, '0')}TH`;
+      } else {
+        // 4. Other code
+        finalGid = `Z${inputId.toUpperCase()}TH`;
+        finalEmpCode = inputId;
+        finalEmpNo = inputId;
+      }
+
+      const { firstName, familyName } = parseEmployeeNameParts(rawName || `พนักงาน ${finalEmpNo}`);
       const deptToUse = (rawDept && rawDept.trim().toUpperCase()) || (selectedDepartment !== 'ALL' ? selectedDepartment : 'GM');
-      const gidToUse = String(rawGid).trim().toUpperCase();
+
+      if (selectedDepartment !== 'ALL' && !isSameDepartment(deptToUse, selectedDepartment)) {
+        errors.push(
+          `แถวที่ ${rowNum}: อัปโหลดผิดแผนก — พนักงานใหม่ "${firstName} ${familyName}" ระบุแผนก "${deptToUse}" ไม่ตรงกับแผนกที่เลือก (${selectedDepartment})`
+        );
+        return;
+      }
 
       // Auto-assign Function: default to 'Service Technician' if not provided in template
       const functionToUse = (rawFunction && rawFunction.trim()) ? rawFunction.trim() : 'Service Technician';
@@ -979,10 +1034,10 @@ export function validateAndParseShiftPlan(
         : getDefaultCostCenterForDepartment(deptToUse, allEmployeesWorkList);
 
       const newEmp: Employee = {
-        id: `emp-${empNoToUse}-${Date.now()}`,
-        empNo: empNoToUse,
-        empCode: empNoToUse.length <= 4 ? `1000${empNoToUse.padStart(4, '0')}` : empNoToUse,
-        gid: gidToUse,
+        id: `emp-${finalEmpNo}-${Date.now()}`,
+        empNo: finalEmpNo,
+        empCode: finalEmpCode,
+        gid: finalGid,
         firstName,
         familyName,
         department: deptToUse,
@@ -994,7 +1049,14 @@ export function validateAndParseShiftPlan(
         updatedAt: new Date().toISOString(),
       };
 
-      newEmployeesMap.set(empNoToUse, newEmp);
+      newEmployeesMap.set(finalEmpNo, newEmp);
+      if (inputId.toUpperCase() !== finalEmpNo.toUpperCase()) {
+        newEmployeesMap.set(inputId.toUpperCase(), newEmp);
+      }
+      const rawNumStr = inputId.replace(/^0+/, '');
+      if (rawNumStr) {
+        newEmployeesMap.set(rawNumStr, newEmp);
+      }
       allEmployeesWorkList.push(newEmp);
       if (isSameDepartment(deptToUse, selectedDepartment) || selectedDepartment === 'ALL') {
         deptEmployeesWorkList.push(newEmp);
@@ -1003,16 +1065,16 @@ export function validateAndParseShiftPlan(
       employee = newEmp;
 
       warnings.push(
-        `แถวที่ ${rowNum}: เพิ่มพนักงานใหม่ "${firstName} ${familyName}" (รหัส: ${empNoToUse}, GID: ${gidToUse}, แผนก: ${deptToUse}) เข้าสู่ระบบอัตโนมัติ — กำหนดตำแหน่งเป็น "${functionToUse}" และ Cost Center "${costCenterToUse}"`
+        `แถวที่ ${rowNum}: เพิ่มพนักงานใหม่ "${firstName} ${familyName}" (Emp No: ${finalEmpNo}, Emp Code: ${finalEmpCode}, GID: ${finalGid}, แผนก: ${deptToUse}) เข้าสู่ระบบอัตโนมัติจากรหัสที่ระบุ (${inputId})`
       );
     }
 
     matchedEmpSet.add(employee.empNo);
 
-    // Target department for parsed shift plans
-    const targetDeptForPlan = (selectedDepartment && selectedDepartment !== 'ALL')
-      ? selectedDepartment
-      : ((rawDept && rawDept.trim().toUpperCase()) || employee.department || 'GM');
+    // Target department for parsed shift plans: Priority is row's own department in the file
+    const targetDeptForPlan = (rawDept && rawDept.trim())
+      ? rawDept.trim().toUpperCase()
+      : ((selectedDepartment && selectedDepartment !== 'ALL') ? selectedDepartment : (employee.department || 'GM'));
 
     // Format A: Wide format with Day columns 1 to 31 (e.g. "1", "2", "3" ... or "01", "02")
     const daysInMonth = new Date(
@@ -1091,7 +1153,7 @@ export function validateAndParseShiftPlan(
     matchedEmployeesCount: matchedEmpSet.size,
     totalRows: rawRows.length,
     newShiftCodes: Array.from(newShiftCodesMap.values()),
-    newEmployees: Array.from(newEmployeesMap.values()),
+    newEmployees: Array.from(new Map(Array.from(newEmployeesMap.values()).map(e => [e.empNo, e])).values()),
     skippedRows,
     skippedCount: skippedRows.length,
   };
@@ -1351,8 +1413,8 @@ export function generateAnnualShiftPlanTemplate(
     const sheetName = `${mInfo.short}-${targetYear}`;
     const daysInMonth = new Date(targetYear, mInfo.monthNum, 0).getDate();
 
-    // Standard Siemens Column Headers
-    const headers = ['Emp No', 'Emp Code', 'GID', 'Name', 'Department', 'Function'];
+    // Clean Column Headers: Emp No for mapping, Name and Department for reference
+    const headers = ['Emp No', 'Name', 'Department'];
     for (let d = 1; d <= daysInMonth; d++) {
       headers.push(String(d).padStart(2, '0'));
     }
@@ -1363,11 +1425,8 @@ export function generateAnnualShiftPlanTemplate(
         const fullName = `${emp.firstName || ''} ${emp.familyName || ''}`.trim() || (emp as any).name || emp.empNo;
         const rowObj: any = {
           'Emp No': emp.empNo || '',
-          'Emp Code': emp.empCode || '',
-          'GID': emp.gid || '',
           'Name': fullName,
           'Department': emp.department || (department === 'ALL' ? 'GM' : department),
-          'Function': emp.functionTitle || '',
         };
         for (let d = 1; d <= daysInMonth; d++) {
           const dateObj = new Date(targetYear, mInfo.monthNum - 1, d);
@@ -1381,11 +1440,8 @@ export function generateAnnualShiftPlanTemplate(
       // Fallback sample row so file is ready for blank departments
       const sampleRow: any = {
         'Emp No': '1001234',
-        'Emp Code': '10001234',
-        'GID': 'Z001234TH',
         'Name': 'Sample Employee (ตัวอย่างชื่อพนักงาน)',
         'Department': department === 'ALL' ? 'GM' : department,
-        'Function': 'Staff',
       };
       for (let d = 1; d <= daysInMonth; d++) {
         const dateObj = new Date(targetYear, mInfo.monthNum - 1, d);
@@ -1399,12 +1455,9 @@ export function generateAnnualShiftPlanTemplate(
 
     // Formatting Column Widths
     const colWidths = [
-      { wch: 12 }, // Emp No
-      { wch: 14 }, // Emp Code
-      { wch: 12 }, // GID
-      { wch: 26 }, // Name
-      { wch: 14 }, // Department
-      { wch: 18 }, // Function
+      { wch: 14 }, // Emp No
+      { wch: 28 }, // Name
+      { wch: 16 }, // Department
     ];
     for (let d = 1; d <= daysInMonth; d++) {
       colWidths.push({ wch: 6 });
@@ -1614,40 +1667,49 @@ export function parseSpecificSheetToRows(buffer: ArrayBuffer, sheetNameOrIndex: 
   }
   const worksheet = workbook.Sheets[targetSheetName];
   if (!worksheet) return [];
-  return XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+  return parseWorksheetToRows(worksheet);
 }
 
 export function generateShiftPlanTemplate(
   department: string,
   monthYear: string,
-  employees: Employee[]
-): { csvContent: string; workbook: XLSX.WorkBook } {
+  employees: Employee[],
+  shiftCodes: ShiftCode[] = []
+): { csvContent: string; workbook: XLSX.WorkBook; sheetName?: string; filename?: string } {
   const deptEmployees = department === 'ALL' 
     ? employees.filter(e => e.isActive !== false) 
-    : employees.filter(e => e.department === department && e.isActive !== false);
+    : employees.filter(e => isSameDepartment(e.department, department) && e.isActive !== false);
   
-  const cleanMonthYear = monthYear && monthYear.includes('-') ? monthYear : '2026-05';
+  const cleanMonthYear = monthYear && monthYear.includes('-') ? monthYear : '2026-09';
   const [yearStr, monthStr] = cleanMonthYear.split('-');
   const yearNum = parseInt(yearStr, 10) || 2026;
-  const monthNum = parseInt(monthStr, 10) || 5;
+  const monthNum = parseInt(monthStr, 10) || 9;
   const daysInMonth = new Date(yearNum, monthNum, 0).getDate();
 
-  // Primary reference columns: Emp No, GID, Name, Department, and Function
-  const headers = ['Emp No', 'GID', 'Name', 'Department', 'Function'];
+  // Find month info to format Sheet Name identically to Annual Template (e.g. SEP-2026)
+  const monthInfo = ANNUAL_TEMPLATE_MONTH_NAMES.find(m => m.monthNum === monthNum) ||
+                    ANNUAL_TEMPLATE_MONTH_NAMES[monthNum - 1] || 
+                    { short: 'SEP' };
+  const monthlySheetName = `${monthInfo.short}-${yearNum}`; // e.g. "SEP-2026"
+
+  // Clean Column Headers: Emp No for mapping, Name and Department for reference
+  // (No Emp Code / GID / Function - matching requirements)
+  const headers = ['Emp No', 'Name', 'Department'];
   for (let d = 1; d <= daysInMonth; d++) {
     headers.push(String(d).padStart(2, '0'));
   }
 
+  // Sort employees cleanly by EmpNo
+  const sortedEmps = [...deptEmployees].sort((a, b) => (a.empNo || '').localeCompare(b.empNo || ''));
+
   const rows: any[] = [];
-  if (deptEmployees && deptEmployees.length > 0) {
-    deptEmployees.forEach(emp => {
+  if (sortedEmps.length > 0) {
+    sortedEmps.forEach(emp => {
       const fullName = `${emp.firstName || ''} ${emp.familyName || ''}`.trim() || (emp as any).name || emp.empNo;
       const rowObj: any = {
         'Emp No': emp.empNo || '',
-        'GID': emp.gid || '',
         'Name': fullName,
-        'Department': emp.department || (department === 'ALL' ? 'RST' : department),
-        'Function': emp.functionTitle || 'Service Technician',
+        'Department': emp.department || (department === 'ALL' ? 'GM' : department),
       };
       for (let d = 1; d <= daysInMonth; d++) {
         const dateObj = new Date(yearNum, monthNum - 1, d);
@@ -1659,12 +1721,11 @@ export function generateShiftPlanTemplate(
     });
   } else {
     // If no active employees in this department, provide sample rows so template is ready to use
+    const deptPrefix = department.replace(/[^A-Za-z0-9]/g, '').slice(0, 3) || 'EMP';
     const sampleRow: any = {
-      'Emp No': '1001234',
-      'GID': 'Z001234TH',
+      'Emp No': `${deptPrefix}01`,
       'Name': 'Sample Employee (ตัวอย่างชื่อพนักงาน)',
-      'Department': department === 'ALL' ? 'RST' : department,
-      'Function': 'Service Technician',
+      'Department': department === 'ALL' ? 'GM' : department,
     };
     for (let d = 1; d <= daysInMonth; d++) {
       const dateObj = new Date(yearNum, monthNum - 1, d);
@@ -1676,13 +1737,11 @@ export function generateShiftPlanTemplate(
 
   const worksheet = XLSX.utils.json_to_sheet(rows, { header: headers });
 
-  // Add column widths for a clean presentation
+  // Add standard column widths matching annual template for clean presentation
   const colWidths = [
-    { wch: 14 }, // Emp No
-    { wch: 14 }, // GID
-    { wch: 28 }, // Name
-    { wch: 15 }, // Department
-    { wch: 20 }, // Function
+    { wch: 14 }, // Emp No (Mapping)
+    { wch: 28 }, // Name (Reference)
+    { wch: 16 }, // Department (Reference)
   ];
   for (let d = 1; d <= daysInMonth; d++) {
     colWidths.push({ wch: 6 });
@@ -1690,15 +1749,31 @@ export function generateShiftPlanTemplate(
   worksheet['!cols'] = colWidths;
 
   const workbook = XLSX.utils.book_new();
-  const safeDeptSheetName = `Shift_${(department || 'ALL').replace(/[\\/*?:[\]]/g, '').slice(0, 20)}`;
-  XLSX.utils.book_append_sheet(workbook, worksheet, safeDeptSheetName);
+  // Name the primary sheet e.g. "SEP-2026", matching the annual template format exactly
+  XLSX.utils.book_append_sheet(workbook, worksheet, monthlySheetName);
+
+  // Optional Reference Guide Sheet for Shift Codes (same as Annual Template)
+  if (shiftCodes && shiftCodes.length > 0) {
+    const applicableCodes = shiftCodes.filter(sc => department === 'ALL' || sc.department === 'ALL' || sc.department === department);
+    const guideRows = (applicableCodes.length > 0 ? applicableCodes : shiftCodes).map(sc => ({
+      'Shift Code': sc.code,
+      'Shift Name': sc.name,
+      'Work Time': sc.isWorkingDay ? `${sc.startTime} - ${sc.endTime}` : 'OFF',
+      'Department': sc.department,
+      'Description': sc.description || '',
+    }));
+    const guideSheet = XLSX.utils.json_to_sheet(guideRows);
+    XLSX.utils.book_append_sheet(workbook, guideSheet, 'Shift_Codes_Guide');
+  }
 
   // Add UTF-8 BOM so Microsoft Excel correctly displays Thai employee names and headers
   const BOM = '\uFEFF';
   const rawCsv = XLSX.utils.sheet_to_csv(worksheet);
   const csvContent = BOM + rawCsv;
 
-  return { csvContent, workbook };
+  const filename = `ShiftPlan_Template_${department || 'ALL'}_${monthlySheetName}.xlsx`;
+
+  return { csvContent, workbook, sheetName: monthlySheetName, filename };
 }
 
 export function generateShiftCodeTemplate(shiftCodes: ShiftCode[]): { csvContent: string; workbook: XLSX.WorkBook } {

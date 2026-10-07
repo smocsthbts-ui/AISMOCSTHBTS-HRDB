@@ -17,6 +17,9 @@ import {
   storage 
 } from '../utils/storage';
 import { 
+  isSameDepartment 
+} from '../utils/fileParser';
+import { 
   exportTimeSheetsToPDF 
 } from '../utils/pdfExport';
 import { 
@@ -92,57 +95,122 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
     }
   }, [currentUser]);
 
-  // Department options with employee counts
-  const departmentOptions = useMemo(() => {
-    const counts: Record<string, number> = {};
-    employees.forEach(e => {
-      if (e.department) {
-        counts[e.department] = (counts[e.department] || 0) + 1;
+  // Synthesize employees from shiftPlans for current month if any missing from master employees list
+  const effectiveEmployees = useMemo(() => {
+    const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
+    const list = [...baseEmployees];
+    const knownEmpNos = new Set<string>();
+    baseEmployees.forEach(e => {
+      if (e.empNo) {
+        const clean = e.empNo.trim().toUpperCase();
+        knownEmpNos.add(clean);
+        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          knownEmpNos.add(digits);
+          knownEmpNos.add(digits.padStart(4, '0'));
+          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
+        }
+      }
+      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
+      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
+    });
+    
+    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
+    (shiftPlans || []).forEach(p => {
+      if (!p || !p.date || !p.date.startsWith(selectedMonthYear)) return;
+      const eNo = (p.empNo || '').trim().toUpperCase();
+      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
+      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
+        missingEmpsFromPlans.set(eNo, p);
       }
     });
 
+    missingEmpsFromPlans.forEach((p, eNo) => {
+      const cleanNo = p.empNo || eNo;
+      const digits = cleanNo.replace(/\D/g, '');
+      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
+      list.push({
+        id: `synth-${paddedNo}`,
+        empNo: paddedNo,
+        empCode: digits ? `1000${paddedNo}` : cleanNo,
+        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
+        firstName: 'พนักงาน',
+        familyName: cleanNo,
+        department: p.department || (selectedDepartment !== 'ALL' ? selectedDepartment : 'GM'),
+        division: 'MO CS BTS',
+        functionTitle: 'Service Technician',
+        costCenter: 'C93051',
+        isShiftWorker: true,
+        isActive: true,
+      });
+    });
+
+    return list;
+  }, [employees, shiftPlans, selectedMonthYear, selectedDepartment]);
+
+  // Department options with employee counts
+  const departmentOptions = useMemo(() => {
     const list: { code: string; name: string; count: number }[] = [];
     storage.getDepartments().forEach(d => {
+      const count = effectiveEmployees.filter(e => isSameDepartment(e.department, d.code)).length;
       list.push({
         code: d.code,
         name: d.name,
-        count: counts[d.code] || 0,
+        count,
       });
     });
 
     return {
-      allCount: employees.length,
+      allCount: effectiveEmployees.length,
       departments: list,
     };
-  }, [employees]);
+  }, [effectiveEmployees]);
 
   // Filter employees matching active department
   const selectableEmployees = useMemo(() => {
-    return employees.filter(e => {
-      if (activeDepartment !== 'ALL' && e.department !== activeDepartment) {
+    return effectiveEmployees.filter(e => {
+      if (activeDepartment !== 'ALL' && !isSameDepartment(e.department, activeDepartment)) {
         return false;
       }
       return true;
     });
-  }, [employees, activeDepartment]);
+  }, [effectiveEmployees, activeDepartment]);
 
   // Active employee for timesheet
   const [selectedEmpNo, setSelectedEmpNo] = useState<string>(() => {
-    // Default to '0950' (Napassawan) if in current selection, else first selectable
-    const napassawan = selectableEmployees.find(e => e.empNo === '0950');
-    return napassawan ? napassawan.empNo : (selectableEmployees[0]?.empNo || employees[0]?.empNo || '');
+    const napassawan = selectableEmployees.find(e => e.empNo === '0950' || e.empNo === '950');
+    return napassawan ? napassawan.empNo : (selectableEmployees[0]?.empNo || effectiveEmployees[0]?.empNo || '');
   });
 
   // Keep selectedEmpNo valid if selectableEmployees changes
   const activeEmployee = useMemo(() => {
-    const found = selectableEmployees.find(e => e.empNo === selectedEmpNo);
-    return found || selectableEmployees[0] || employees[0];
-  }, [selectableEmployees, selectedEmpNo, employees]);
+    if (!selectedEmpNo) return selectableEmployees[0] || effectiveEmployees[0];
+    const cleanSel = cleanIdentifier(selectedEmpNo).toLowerCase();
+    const selDigits = cleanSel.replace(/\D/g, '').replace(/^0+/, '');
+
+    const found = selectableEmployees.find(e => {
+      const eNo = cleanIdentifier(e.empNo).toLowerCase();
+      const eDigits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+      if (eNo === cleanSel) return true;
+      if (selDigits && eDigits && selDigits === eDigits) return true;
+      if (cleanIdentifier(e.gid).toLowerCase() === cleanSel) return true;
+      if (cleanIdentifier(e.empCode).toLowerCase() === cleanSel) return true;
+      return false;
+    });
+    return found || selectableEmployees[0] || effectiveEmployees[0];
+  }, [selectableEmployees, selectedEmpNo, effectiveEmployees]);
 
   // If current employee is not in selectableEmployees, automatically pick the first in list
   React.useEffect(() => {
     if (selectableEmployees.length > 0) {
-      const exists = selectableEmployees.some(e => e.empNo === selectedEmpNo);
+      const cleanSel = cleanIdentifier(selectedEmpNo).toLowerCase();
+      const selDigits = cleanSel.replace(/\D/g, '').replace(/^0+/, '');
+      const exists = selectableEmployees.some(e => {
+        const eNo = cleanIdentifier(e.empNo).toLowerCase();
+        const eDigits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+        return eNo === cleanSel || (selDigits && eDigits && selDigits === eDigits);
+      });
       if (!exists) {
         setSelectedEmpNo(selectableEmployees[0].empNo);
       }
@@ -153,7 +221,7 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
   const handleDepartmentChange = (dept: string) => {
     setActiveDepartment(dept);
     onSelectDepartment?.(dept);
-    const inDept = employees.filter(e => dept === 'ALL' || e.department === dept);
+    const inDept = effectiveEmployees.filter(e => dept === 'ALL' || isSameDepartment(e.department, dept));
     if (inDept.length > 0) {
       setSelectedEmpNo(inDept[0].empNo);
     }
@@ -285,6 +353,20 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
     }
 
     storage.setManualOverrides(overrides);
+
+    if (editForm.shiftCode && editForm.shiftCode.trim() !== '') {
+      storage.saveShiftPlan({
+        id: `plan-${activeEmployee.empNo}-${editingRow.date}`,
+        empNo: activeEmployee.empNo,
+        gid: activeEmployee.gid,
+        date: editingRow.date,
+        shiftCode: editForm.shiftCode.trim(),
+        department: activeEmployee.department,
+        updatedBy: currentUser.email,
+        updatedAt: new Date().toISOString(),
+      }).catch(console.warn);
+    }
+
     setDataVersion(v => v + 1);
     setEditingRow(null);
   };

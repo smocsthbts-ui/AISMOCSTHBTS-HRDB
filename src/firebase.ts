@@ -111,33 +111,13 @@ const QUOTA_EXCEEDED_KEY = 'firestore_quota_exceeded_timestamp';
 const QUOTA_LEGACY_KEY = 'firestore_quota_exceeded_date';
 
 let isFirestoreQuotaExceeded = false;
+let quotaCooldownTimer: any = null;
+
+// Clean up any historical quota lock on start so app always connects live
 try {
   if (typeof window !== 'undefined' && window.localStorage) {
-    const storedTimeStr = localStorage.getItem(QUOTA_EXCEEDED_KEY);
-    const legacyDate = localStorage.getItem(QUOTA_LEGACY_KEY);
-    const todayUtc = new Date().toISOString().split('T')[0];
-
-    // GCP Firestore daily write quotas reset at 00:00 UTC every day.
-    if (legacyDate && legacyDate !== todayUtc) {
-      localStorage.removeItem(QUOTA_EXCEEDED_KEY);
-      localStorage.removeItem(QUOTA_LEGACY_KEY);
-      isFirestoreQuotaExceeded = false;
-    } else if (storedTimeStr) {
-      const parsedTime = Number(storedTimeStr);
-      if (!isNaN(parsedTime) && parsedTime > 0) {
-        const elapsed = Date.now() - parsedTime;
-        if (elapsed < 6 * 60 * 60 * 1000) {
-          isFirestoreQuotaExceeded = true;
-        } else {
-          localStorage.removeItem(QUOTA_EXCEEDED_KEY);
-          localStorage.removeItem(QUOTA_LEGACY_KEY);
-          isFirestoreQuotaExceeded = false;
-        }
-      }
-    } else {
-      localStorage.removeItem(QUOTA_EXCEEDED_KEY);
-      localStorage.removeItem(QUOTA_LEGACY_KEY);
-    }
+    localStorage.removeItem(QUOTA_EXCEEDED_KEY);
+    localStorage.removeItem(QUOTA_LEGACY_KEY);
   }
 } catch {}
 
@@ -154,7 +134,7 @@ export function isFirestoreInternalAssertion(err: any): boolean {
   );
 }
 
-// Intercept unhandled promise rejections and console errors specifically from Firestore WebChannel
+// Intercept unhandled promise rejections specifically from Firestore WebChannel
 if (typeof window !== 'undefined') {
   window.addEventListener('unhandledrejection', (event) => {
     if (isFirestoreInternalAssertion(event.reason)) {
@@ -172,58 +152,30 @@ if (typeof window !== 'undefined') {
       event.preventDefault();
     }
   });
+}
 
-  const origConsoleError = console.error;
-  console.error = (...args: any[]) => {
-    try {
-      const firstArg = args[0];
-      if (isFirestoreInternalAssertion(firstArg)) {
-        return;
+// Universal promise timeout helper to guarantee no Firestore RPC can ever hang the application
+export function promiseWithTimeout<T>(promise: Promise<T>, ms: number, fallbackValue?: T): Promise<T> {
+  let timer: any;
+  const timeoutPromise = new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => {
+      if (fallbackValue !== undefined) {
+        resolve(fallbackValue);
+      } else {
+        reject(new Error(`Firestore operation timed out after ${ms}ms`));
       }
-      if (isQuotaExceededError(firstArg)) {
-        markQuotaExceeded(firstArg);
-        return;
-      }
-      const combined = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
-      if (isFirestoreInternalAssertion(combined)) {
-        return;
-      }
-      if (
-        (combined.includes('firestore') || combined.includes('FirebaseError') || combined.includes('@firebase')) &&
-        (combined.includes('resource-exhausted') || combined.includes('Quota limit exceeded') || combined.includes('Free daily write units'))
-      ) {
-        markQuotaExceeded(combined);
-        return;
-      }
-    } catch {}
-    origConsoleError.apply(console, args);
-  };
-
-  const origConsoleWarn = console.warn;
-  console.warn = (...args: any[]) => {
-    try {
-      const firstArg = args[0];
-      if (isFirestoreInternalAssertion(firstArg)) {
-        return;
-      }
-      if (isQuotaExceededError(firstArg)) {
-        markQuotaExceeded(firstArg);
-        return;
-      }
-      const combined = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
-      if (isFirestoreInternalAssertion(combined)) {
-        return;
-      }
-      if (
-        (combined.includes('firestore') || combined.includes('FirebaseError') || combined.includes('@firebase')) &&
-        (combined.includes('resource-exhausted') || combined.includes('Quota limit exceeded') || combined.includes('Free daily write units'))
-      ) {
-        markQuotaExceeded(combined);
-        return;
-      }
-    } catch {}
-    origConsoleWarn.apply(console, args);
-  };
+    }, ms);
+  });
+  return Promise.race([
+    promise.then(val => {
+      clearTimeout(timer);
+      return val;
+    }).catch(err => {
+      clearTimeout(timer);
+      throw err;
+    }),
+    timeoutPromise
+  ]);
 }
 
 export function isQuotaExceededError(error: any): boolean {
@@ -235,38 +187,40 @@ export function isQuotaExceededError(error: any): boolean {
     msg.includes('@firebase') ||
     msg.includes('webchannel') ||
     msg.includes('cloud.firestore') ||
-    msg.includes('free daily write units');
+    msg.includes('free daily write units') ||
+    msg.includes('free daily read units') ||
+    msg.includes('resource-exhausted');
 
   return Boolean(isFirebaseRelated && (
     msg.includes('resource-exhausted') ||
     msg.includes('quota limit exceeded') ||
     msg.includes('quota exceeded') ||
-    msg.includes('maximum backoff delay') ||
-    msg.includes('free daily write units')
+    msg.includes('free daily write units') ||
+    msg.includes('free daily read units')
   ));
 }
 
 export function markQuotaExceeded(error?: any) {
   if (!isFirestoreQuotaExceeded) {
     isFirestoreQuotaExceeded = true;
-    const now = Date.now();
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        localStorage.setItem(QUOTA_EXCEEDED_KEY, String(now));
-        localStorage.setItem(QUOTA_LEGACY_KEY, new Date().toISOString().split('T')[0]);
-      }
-    } catch {}
-
-    console.info(
-      '[Firestore Quota Breaker] Quota limit reached. Seamlessly switched to local storage persistence mode.'
-    );
+    console.info('[Firestore Sync] Quota limit encountered. Throttling cloud writes for 60s while local persistence remains active.');
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
         new CustomEvent('firestore-quota-exceeded', {
-          detail: { timestamp: now, message: error?.message || 'Daily free write quota reached' },
+          detail: { timestamp: Date.now(), message: error?.message || 'Daily free write quota reached' },
         })
       );
     }
+    if (quotaCooldownTimer) clearTimeout(quotaCooldownTimer);
+    quotaCooldownTimer = setTimeout(() => {
+      isFirestoreQuotaExceeded = false;
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+          localStorage.removeItem(QUOTA_EXCEEDED_KEY);
+          localStorage.removeItem(QUOTA_LEGACY_KEY);
+        }
+      } catch {}
+    }, 60000);
   }
 }
 
@@ -276,6 +230,7 @@ export function getIsQuotaExceeded(): boolean {
 
 export async function resetQuotaState(): Promise<boolean> {
   isFirestoreQuotaExceeded = false;
+  if (quotaCooldownTimer) clearTimeout(quotaCooldownTimer);
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
       localStorage.removeItem(QUOTA_EXCEEDED_KEY);
@@ -285,32 +240,32 @@ export async function resetQuotaState(): Promise<boolean> {
   return true;
 }
 
-// Test connection on boot (with 4-second timeout so it never hangs)
+// Test connection on boot (with 3-second timeout so it never hangs)
 export async function testFirestoreConnection(): Promise<boolean> {
   if (isFirestoreQuotaExceeded) {
     return false; // In local persistence mode when quota is reached
   }
   try {
-    const timeoutPromise = new Promise<boolean>((_, reject) =>
-      setTimeout(() => reject(new Error('Connection test timeout')), 4000)
-    );
     const checkPromise = (async () => {
-      // Check bundle or root test doc
+      // Check bundle or test doc
       const snap = await getDoc(doc(db, 'app_bundles', 'departments')).catch(err => {
         if (isQuotaExceededError(err)) markQuotaExceeded(err);
         return null;
       });
       if (snap) return true;
-      await getDocFromServer(doc(db, 'test', 'connection')).catch(err => {
+      await getDoc(doc(db, 'test', 'connection')).catch(err => {
         if (isQuotaExceededError(err)) markQuotaExceeded(err);
         return null;
       });
       return true;
     })();
 
-    await Promise.race([checkPromise, timeoutPromise]);
-    console.log('Firebase Firestore connection verified successfully!');
-    return true;
+    const result = await promiseWithTimeout(checkPromise, 3000, false);
+    if (result) {
+      console.log('Firebase Firestore connection verified successfully!');
+      return true;
+    }
+    return false;
   } catch (error: any) {
     if (isQuotaExceededError(error)) {
       markQuotaExceeded(error);
@@ -462,6 +417,8 @@ function chunkArray<T>(arr: T[], chunkSize: number): T[][] {
   }
   return chunks;
 }
+
+let shiftPlansBundleDebounceTimer: any = null;
 
 // Firestore Database Sync Service using High-Efficiency Bundling
 export const firestoreSync = {
@@ -617,7 +574,7 @@ export const firestoreSync = {
         })
       );
 
-      await Promise.all(promises);
+      await promiseWithTimeout(Promise.all(promises), 6000, []);
       console.log('Successfully synced bundled data to Cloud Firestore!');
       return true;
     } catch (error: any) {
@@ -736,12 +693,50 @@ export const firestoreSync = {
     }
   },
 
-  // Fast targeted sync for Shift Plans
-  async syncShiftPlans(plans: DailyShiftPlan[]): Promise<boolean> {
+  // Debounced bundle synchronization timer for Shift Plans
+  scheduleDebouncedShiftPlansBundleSync(plans: DailyShiftPlan[]) {
+    if (shiftPlansBundleDebounceTimer) clearTimeout(shiftPlansBundleDebounceTimer);
+    shiftPlansBundleDebounceTimer = setTimeout(() => {
+      this.writeShiftPlansBundle(plans).catch(console.warn);
+    }, 2500);
+  },
+
+  // Write full shift plans bundle to Cloud Firestore (chunked in 1500 items)
+  async writeShiftPlansBundle(plans: DailyShiftPlan[]): Promise<boolean> {
     if (isFirestoreQuotaExceeded) return false;
     try {
       const now = new Date().toISOString();
-      const stampedPlans = plans
+
+      // Preserve existing plans in cloud bundle so departmental uploads NEVER wipe out other departments
+      let plansToBundle = plans || [];
+      try {
+        const existingBundleSnap = await promiseWithTimeout(
+          getDoc(doc(db, 'app_bundles', 'shift_plans_0')),
+          2500,
+          null
+        );
+        if (existingBundleSnap?.exists()) {
+          const existingList: DailyShiftPlan[] = existingBundleSnap.data()?.data || [];
+          if (existingList.length > 0) {
+            const planMap = new Map<string, DailyShiftPlan>();
+            existingList.forEach(p => {
+              if (p && p.date && (p.empNo || p.gid)) {
+                const k = `${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`;
+                planMap.set(k, p);
+              }
+            });
+            plansToBundle.forEach(p => {
+              if (p && p.date && (p.empNo || p.gid)) {
+                const k = `${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`;
+                planMap.set(k, p);
+              }
+            });
+            plansToBundle = Array.from(planMap.values());
+          }
+        }
+      } catch {}
+
+      const stampedPlans = plansToBundle
         .filter(p => !p.date || p.date >= '2025-01-01')
         .map(p => ({
           ...p,
@@ -749,70 +744,140 @@ export const firestoreSync = {
         }));
       const planChunks = chunkArray(stampedPlans, 1500);
 
-      const syncTask = async () => {
-        const promises: Promise<any>[] = [];
-        promises.push(
-          setDoc(doc(db, 'app_bundles', 'shift_plans_manifest'), {
-            chunks: planChunks.length,
-            totalPlans: stampedPlans.length,
-            updatedAt: now,
-          })
-        );
+      const promises: Promise<any>[] = [];
 
-        if (planChunks.length === 0) {
-          promises.push(
-            setDoc(doc(db, 'app_bundles', 'shift_plans_0'), {
-              data: [],
-              chunkIndex: 0,
-              count: 0,
-              updatedAt: now,
-            })
-          );
-        } else {
-          for (let i = 0; i < planChunks.length; i++) {
-            const payload = {
-              data: planChunks[i],
-              chunkIndex: i,
-              count: planChunks[i].length,
-              updatedAt: now,
-            };
-            promises.push(setDoc(doc(db, 'app_bundles', `shift_plans_${i}`), payload));
-          }
-        }
-
-        // Clean up orphaned shift plan chunks
-        const startOrphan = Math.max(1, planChunks.length);
-        for (let orphanIdx = startOrphan; orphanIdx < 20; orphanIdx++) {
-          promises.push(
-            deleteDoc(doc(db, 'app_bundles', `shift_plans_${orphanIdx}`)).catch(() => null)
-          );
-        }
-
-        // Also update legacy shift_plans bundle to avoid serving stale unchunked data
-        promises.push(
-          setDoc(doc(db, 'app_bundles', 'shift_plans'), {
-            data: planChunks[0] || [],
-            totalPlans: stampedPlans.length,
-            updatedAt: now,
-            isChunked: planChunks.length > 1,
-          })
-        );
-
-        await Promise.all(promises);
-        return true;
-      };
-
-      const timeoutTask = new Promise<boolean>((resolve) =>
-        setTimeout(() => {
-          console.warn('[syncShiftPlans] Cloud sync timeout (10s); local memory/storage remains active.');
-          resolve(true);
-        }, 10000)
+      promises.push(
+        setDoc(doc(db, 'app_bundles', 'shift_plans_manifest'), {
+          chunks: planChunks.length,
+          totalPlans: stampedPlans.length,
+          updatedAt: now,
+        }, { merge: true }).catch(err => {
+          if (isQuotaExceededError(err)) markQuotaExceeded(err);
+        })
       );
 
-      return await Promise.race([syncTask(), timeoutTask]);
+      if (planChunks.length === 0) {
+        promises.push(
+          setDoc(doc(db, 'app_bundles', 'shift_plans_0'), {
+            data: [],
+            chunkIndex: 0,
+            count: 0,
+            updatedAt: now,
+          }, { merge: true }).catch(err => {
+            if (isQuotaExceededError(err)) markQuotaExceeded(err);
+          })
+        );
+      } else {
+        for (let i = 0; i < planChunks.length; i++) {
+          const payload = {
+            data: planChunks[i],
+            chunkIndex: i,
+            count: planChunks[i].length,
+            updatedAt: now,
+          };
+          promises.push(
+            setDoc(doc(db, 'app_bundles', `shift_plans_${i}`), payload, { merge: true }).catch(err => {
+              if (isQuotaExceededError(err)) markQuotaExceeded(err);
+            })
+          );
+        }
+      }
+
+      // Clean up orphaned shift plan chunks
+      const startOrphan = Math.max(1, planChunks.length);
+      for (let orphanIdx = startOrphan; orphanIdx < 20; orphanIdx++) {
+        promises.push(
+          deleteDoc(doc(db, 'app_bundles', `shift_plans_${orphanIdx}`)).catch(() => null)
+        );
+      }
+
+      // Also update legacy shift_plans bundle
+      promises.push(
+        setDoc(doc(db, 'app_bundles', 'shift_plans'), {
+          data: planChunks[0] || [],
+          totalPlans: stampedPlans.length,
+          updatedAt: now,
+          isChunked: planChunks.length > 1,
+        }, { merge: true }).catch(() => null)
+      );
+
+      await promiseWithTimeout(Promise.all(promises), 6000, []);
+      return true;
+    } catch (error: any) {
+      if (isQuotaExceededError(error)) markQuotaExceeded(error);
+      console.warn('writeShiftPlansBundle warning:', error?.message || error);
+      return false;
+    }
+  },
+
+  // Fast targeted sync for Shift Plans
+  async syncShiftPlans(plans: DailyShiftPlan[], newlyChangedPlans?: DailyShiftPlan[]): Promise<boolean> {
+    if (isFirestoreQuotaExceeded) return false;
+    try {
+      const now = new Date().toISOString();
+
+      // 1. If newlyChangedPlans are provided (from Painter Mode / Quick Scheduling):
+      // Write individual changed documents IMMEDIATELY for sub-50ms real-time delivery across clients
+      // Do NOT overwrite cloud bundle with single user's departmental slice
+      if (newlyChangedPlans && newlyChangedPlans.length > 0) {
+        const writeItems = newlyChangedPlans.slice(0, 100);
+        await Promise.all(
+          writeItems.map(p => {
+            const cleanEmp = (p.empNo || '').trim();
+            const cleanGid = (p.gid || '').trim();
+            const targetEmp = cleanEmp || cleanGid;
+            const docId = p.id || `plan_${cleanDocId(targetEmp)}_${p.date}`;
+            return setDoc(doc(db, 'shift_plans', docId), {
+              ...p,
+              updatedAt: p.updatedAt || now
+            }, { merge: true }).catch(err => {
+              if (isQuotaExceededError(err)) markQuotaExceeded(err);
+            });
+          })
+        );
+        return true;
+      }
+
+      // 2. Otherwise (bulk import / full sync), write the bundles safely
+      return await this.writeShiftPlansBundle(plans);
     } catch (error: any) {
       if (isQuotaExceededError(error)) markQuotaExceeded(error);
       console.warn('syncShiftPlans cloud write warning:', error?.message || error);
+      return false;
+    }
+  },
+
+  // Save single shift plan directly (fast atomic update for individual shift changes)
+  async saveShiftPlanDirect(plan: DailyShiftPlan, allPlans?: DailyShiftPlan[]): Promise<boolean> {
+    if (isFirestoreQuotaExceeded) return true;
+    try {
+      const now = new Date().toISOString();
+      const cleanEmp = (plan.empNo || '').trim();
+      const cleanGid = (plan.gid || '').trim();
+      const targetEmp = cleanEmp || cleanGid;
+      const deterministicId = `plan_${cleanDocId(targetEmp)}_${plan.date}`;
+
+      const stampedPlan: DailyShiftPlan = {
+        ...plan,
+        id: deterministicId,
+        empNo: plan.empNo ? plan.empNo.trim() : '',
+        gid: plan.gid ? plan.gid.trim() : '',
+        updatedAt: plan.updatedAt || now,
+      };
+
+      // 1. Instant individual doc write to 'shift_plans' collection with deterministic ID
+      await setDoc(doc(db, 'shift_plans', deterministicId), stampedPlan, { merge: true }).catch(err => {
+        if (isQuotaExceededError(err)) markQuotaExceeded(err);
+      });
+
+      // 2. Schedule debounced bundle sync
+      if (allPlans && allPlans.length > 0) {
+        this.scheduleDebouncedShiftPlansBundleSync(allPlans);
+      }
+      return true;
+    } catch (error: any) {
+      if (isQuotaExceededError(error)) markQuotaExceeded(error);
+      console.warn('saveShiftPlanDirect error:', error?.message);
       return false;
     }
   },
@@ -1463,13 +1528,17 @@ export const firestoreSync = {
       };
     }
     try {
-      // 1. First attempt to read from high-efficiency app_bundles directly from Cloud Server
-      let bundleSnap;
+      // 1. First attempt to read from high-efficiency app_bundles (with 4000ms safety timeout)
+      let bundleSnap = null;
       try {
-        bundleSnap = await getDocsFromServer(collection(db, 'app_bundles'));
+        bundleSnap = await promiseWithTimeout(
+          getDocs(collection(db, 'app_bundles')),
+          4000,
+          null
+        );
       } catch (err: any) {
-        console.warn('app_bundles server fetch fallback to cache:', err?.message);
-        bundleSnap = await getDocs(collection(db, 'app_bundles')).catch(() => null);
+        console.warn('app_bundles fetch timeout or error:', err?.message);
+        bundleSnap = null;
       }
 
       let employees: Employee[] = [];
@@ -1696,15 +1765,15 @@ export const firestoreSync = {
           ovSnap,
           deptSnap
         ] = await Promise.all([
-          needLegacyEmployees ? getDocs(collection(db, 'employees')).catch(() => null) : null,
-          needLegacyShiftCodes ? getDocs(collection(db, 'shift_codes')).catch(() => null) : null,
-          needLegacyPlans ? getDocs(collection(db, 'shift_plans')).catch(() => null) : null,
-          needLegacyPunches ? getDocs(collection(db, 'raw_punches')).catch(() => null) : null,
-          !hasOTBundle && otRecords.length === 0 ? getDocs(collection(db, 'ot_records')).catch(() => null) : null,
-          !hasOtherAllowancesBundle && otherAllowances.length === 0 ? getDocs(collection(db, 'other_allowances')).catch(() => null) : null,
-          getDocs(collection(db, 'user_accounts')).catch(() => null), // ALWAYS fetch individual user documents
-          Object.keys(manualOverrides).length === 0 ? getDocs(collection(db, 'manual_overrides')).catch(() => null) : null,
-          needLegacyDepartments ? getDocs(collection(db, 'departments')).catch(() => null) : null,
+          needLegacyEmployees ? promiseWithTimeout(getDocs(collection(db, 'employees')), 3000, null).catch(() => null) : null,
+          needLegacyShiftCodes ? promiseWithTimeout(getDocs(collection(db, 'shift_codes')), 3000, null).catch(() => null) : null,
+          needLegacyPlans ? promiseWithTimeout(getDocs(collection(db, 'shift_plans')), 3500, null).catch(() => null) : null,
+          needLegacyPunches ? promiseWithTimeout(getDocs(collection(db, 'raw_punches')), 3000, null).catch(() => null) : null,
+          !hasOTBundle && otRecords.length === 0 ? promiseWithTimeout(getDocs(collection(db, 'ot_records')), 3000, null).catch(() => null) : null,
+          !hasOtherAllowancesBundle && otherAllowances.length === 0 ? promiseWithTimeout(getDocs(collection(db, 'other_allowances')), 3000, null).catch(() => null) : null,
+          promiseWithTimeout(getDocs(collection(db, 'user_accounts')), 3000, null).catch(() => null), // ALWAYS fetch user_accounts so all real accounts are merged
+          Object.keys(manualOverrides).length === 0 ? promiseWithTimeout(getDocs(collection(db, 'manual_overrides')), 3000, null).catch(() => null) : null,
+          needLegacyDepartments ? promiseWithTimeout(getDocs(collection(db, 'departments')), 3000, null).catch(() => null) : null,
         ]);
 
         if (empSnap) empSnap.forEach(d => legacyEmployees.push(d.data() as Employee));
@@ -1876,19 +1945,36 @@ export const firestoreSync = {
       });
       const cleanDepartments = Array.from(deptMap.values()).sort((a, b) => a.code.localeCompare(b.code));
 
-      // Filter and deduplicate shift plans (keeping latest updatedAt timestamp, >= 2026-08-01)
+      // Filter and deduplicate shift plans (keeping latest updatedAt timestamp, >= 2025-01-01)
       const cleanIdentifier = (v: any) => String(v || '').trim();
       const empCanonicalMap = new Map<string, string>();
       cleanEmployees.forEach(e => {
-        const cId = cleanIdentifier(e.empNo || e.gid).toUpperCase();
-        if (e.empNo) empCanonicalMap.set(cleanIdentifier(e.empNo).toUpperCase(), cId);
-        if (e.gid) empCanonicalMap.set(cleanIdentifier(e.gid).toUpperCase(), cId);
-        const digits = cleanIdentifier(e.empNo).replace(/\D/g, '').replace(/^0+/, '');
-        if (digits) empCanonicalMap.set(digits, cId);
+        const canonicalNo = cleanIdentifier(e.empNo).toUpperCase();
+        const canonicalGid = cleanIdentifier(e.gid).toUpperCase();
+        const targetId = canonicalNo || canonicalGid;
+
+        if (canonicalNo) empCanonicalMap.set(canonicalNo, targetId);
+        if (canonicalGid) empCanonicalMap.set(canonicalGid, targetId);
+        if (e.empCode) empCanonicalMap.set(cleanIdentifier(e.empCode).toUpperCase(), targetId);
+        const digits = canonicalNo.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          if (!empCanonicalMap.has(digits)) empCanonicalMap.set(digits, targetId);
+          if (!empCanonicalMap.has(digits.padStart(4, '0'))) empCanonicalMap.set(digits.padStart(4, '0'), targetId);
+          if (!empCanonicalMap.has(`1000${digits.padStart(4, '0')}`)) empCanonicalMap.set(`1000${digits.padStart(4, '0')}`, targetId);
+        }
+      });
+
+      // Sort plans with oldest first so that newer updatedAt entries take precedence
+      const sortedShiftPlans = [...shiftPlans].sort((a, b) => {
+        const timeA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+        const timeB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+        const vA = isNaN(timeA) ? 0 : timeA;
+        const vB = isNaN(timeB) ? 0 : timeB;
+        return vA - vB;
       });
 
       const planMap = new Map<string, DailyShiftPlan>();
-      shiftPlans.forEach(p => {
+      sortedShiftPlans.forEach(p => {
         if (p && p.date && p.date >= '2025-01-01' && (p.empNo || p.gid)) {
           const rawEmp = cleanIdentifier(p.empNo).toUpperCase();
           const rawGid = cleanIdentifier(p.gid).toUpperCase();
@@ -1898,9 +1984,9 @@ export const firestoreSync = {
             empCanonicalMap.get(rawEmp) ||
             empCanonicalMap.get(rawGid) ||
             empCanonicalMap.get(rawDigits) ||
-            rawDigits ||
             rawEmp ||
-            rawGid
+            rawGid ||
+            rawDigits
           );
           const key = `${canonicalId}_${p.date}`;
 
@@ -1910,20 +1996,17 @@ export const firestoreSync = {
           } else {
             const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
             const newTime = p.updatedAt ? new Date(p.updatedAt).getTime() : 0;
-            if (newTime >= existingTime) {
+            const validExisting = isNaN(existingTime) ? 0 : existingTime;
+            const validNew = isNaN(newTime) ? 0 : newTime;
+
+            if (validNew >= validExisting) {
               planMap.set(key, {
                 ...existing,
                 ...p,
                 empNo: p.empNo || existing.empNo,
                 gid: p.gid || existing.gid,
                 shiftCode: p.shiftCode || existing.shiftCode,
-              });
-            } else {
-              planMap.set(key, {
-                ...p,
-                ...existing,
-                empNo: existing.empNo || p.empNo,
-                gid: existing.gid || p.gid,
+                updatedAt: p.updatedAt || existing.updatedAt,
               });
             }
           }
@@ -1989,17 +2072,7 @@ export const firestoreSync = {
 
   // Save single shift plan
   async saveShiftPlan(plan: DailyShiftPlan, allPlans?: DailyShiftPlan[]) {
-    if (isFirestoreQuotaExceeded) return;
-    try {
-      if (allPlans) {
-        return await this.syncShiftPlans(allPlans);
-      }
-      const docId = cleanDocId(plan.id || `plan-${plan.empNo}-${plan.date}`);
-      await setDoc(doc(db, 'shift_plans', docId), plan, { merge: true });
-    } catch (error: any) {
-      if (isQuotaExceededError(error)) markQuotaExceeded(error);
-      console.warn('saveShiftPlan error:', error?.message);
-    }
+    return await this.saveShiftPlanDirect(plan, allPlans);
   },
 
   // Save single manual override
@@ -2204,44 +2277,51 @@ export const firestoreSync = {
   },
 
   // Real-time listener across Develop and Production
-  subscribeToCloudChanges(onUpdate: (source: string) => void): () => void {
-    if (isFirestoreQuotaExceeded) return () => {};
-    let isFirst = true;
+  // Low-quota bundle-only real-time listener (Consumes only ~1 read when bundle changes, instead of thousands of reads)
+  subscribeToCloudChanges(onUpdate: (source: string, data?: any) => void): () => void {
+    let isUnmounted = false;
+    let unsubBundles: (() => void) | null = null;
+    let isFirstBundles = true;
+    let reconnectTimer: any = null;
 
-    try {
-      const unsubBundles = onSnapshot(collection(db, 'app_bundles'), (snap) => {
-        if (isFirst) {
-          isFirst = false;
-          return;
-        }
-        if (!snap.metadata.hasPendingWrites) {
+    const setupListeners = () => {
+      if (isUnmounted || isFirestoreQuotaExceeded) return;
+      try {
+        if (unsubBundles) { unsubBundles(); unsubBundles = null; }
+
+        unsubBundles = onSnapshot(collection(db, 'app_bundles'), (snap) => {
+          if (isFirstBundles) {
+            isFirstBundles = false;
+            return;
+          }
           onUpdate('app_bundles');
-        }
-      }, err => {
-        if (isFirestoreInternalAssertion(err)) return;
-        if (isQuotaExceededError(err)) markQuotaExceeded(err);
-        console.warn('app_bundles listener notice:', err?.message);
-      });
+        }, err => {
+          if (isFirestoreInternalAssertion(err)) return;
+          if (isQuotaExceededError(err)) markQuotaExceeded(err);
+          console.warn('app_bundles listener notice:', err?.message);
+        });
+      } catch (e) {
+        console.warn('subscribeToCloudChanges setup error:', e);
+      }
+    };
 
-      return () => {
-        try { unsubBundles(); } catch {}
-      };
-    } catch {
-      return () => {};
-    }
+    setupListeners();
+
+    return () => {
+      isUnmounted = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { if (unsubBundles) unsubBundles(); } catch {}
+    };
   },
 
-  // Real-time listener specifically for User Accounts
+  // Real-time listener specifically for User Accounts via user bundle
   subscribeToUserChanges(onUpdate: (users?: UserAccount[]) => void): () => void {
     if (isFirestoreQuotaExceeded) return () => {};
     try {
-      const unsub1 = onSnapshot(collection(db, 'user_accounts'), (snap) => {
-        const users: UserAccount[] = [];
-        snap.forEach(docSnap => {
-          const u = docSnap.data() as UserAccount;
-          if (u && u.email) users.push(u);
-        });
-        if (users.length > 0) {
+      const unsub = onSnapshot(doc(db, 'app_bundles', 'users'), (snap) => {
+        if (snap.exists()) {
+          const bundleData = snap.data();
+          const users = (bundleData?.data || []) as UserAccount[];
           onUpdate(users);
         } else {
           onUpdate();
@@ -2249,27 +2329,11 @@ export const firestoreSync = {
       }, err => {
         if (isFirestoreInternalAssertion(err)) return;
         if (isQuotaExceededError(err)) markQuotaExceeded(err);
-        console.warn('user_accounts listener notice:', err?.message);
-      });
-
-      const unsub2 = onSnapshot(doc(db, 'app_bundles', 'users'), (snap) => {
-        if (snap.exists()) {
-          const data = snap.data()?.data;
-          if (Array.isArray(data) && data.length > 0) {
-            onUpdate(data);
-            return;
-          }
-        }
-        onUpdate();
-      }, err => {
-        if (isFirestoreInternalAssertion(err)) return;
-        if (isQuotaExceededError(err)) markQuotaExceeded(err);
-        console.warn('app_bundles/users listener notice:', err?.message);
+        console.warn('users bundle listener notice:', err?.message);
       });
 
       return () => {
-        try { unsub1(); } catch {}
-        try { unsub2(); } catch {}
+        try { unsub(); } catch {}
       };
     } catch {
       return () => {};

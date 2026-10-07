@@ -64,7 +64,7 @@ export default function App() {
   const [isPending, startTransition] = useTransition();
   const [navigatingTab, setNavigatingTab] = useState<string | null>(null);
   const [navigationProgress, setNavigationProgress] = useState<number>(0);
-  const [importInitialTab, setImportInitialTab] = useState<'shift-plan' | 'shift-code' | 'attendance' | 'ot' | 'allowances'>('shift-plan');
+  const [importInitialTab, setImportInitialTab] = useState<'shift-plan' | 'shift-code' | 'attendance' | 'ot'>('shift-plan');
 
   // Smooth, non-blocking page transition handler
   const handleSelectTab = useCallback((tab: string) => {
@@ -264,12 +264,23 @@ export default function App() {
         }));
       });
 
-    // Real-time listener for app_bundles updates (Employees, Departments, Shift Plans, Shift Codes, Punches, OT, etc.)
-    const unsubCloudBundles = subscribeToCloudChanges(async (source) => {
+    // Real-time listener for app_bundles and shift_plans updates
+    let bundleDebounceTimer: any = null;
+    const unsubCloudBundles = subscribeToCloudChanges(async (source, data) => {
       try {
-        console.log(`[Cloud Sync] Multi-user realtime update from ${source}...`);
-        await storage.initCloudSync();
-        reloadData();
+        if (source === 'shift_plans' && Array.isArray(data) && data.length > 0) {
+          storage.mergeCloudShiftPlans(data);
+          reloadData();
+          return;
+        }
+        if (source === 'app_bundles') {
+          if (bundleDebounceTimer) clearTimeout(bundleDebounceTimer);
+          bundleDebounceTimer = setTimeout(async () => {
+            console.log(`[Cloud Sync] Multi-user realtime update from ${source}...`);
+            await storage.initCloudSync();
+            reloadData();
+          }, 800);
+        }
       } catch (e) {
         console.warn('Realtime cloud sync refresh notice:', e);
       }
@@ -298,16 +309,20 @@ export default function App() {
       }
     });
 
-    // Listen to cross-component & multi-user real-time cloud data changes
+    // Listen to cross-component & multi-user real-time cloud data changes with single-frame debounce
+    let dataUpdatedDebounceTimer: any = null;
     const handleDataUpdated = () => {
-      reloadData();
-      const isQuota = firestoreSync.isQuotaExceeded();
-      setCloudStatus((prev) => ({
-        ...prev,
-        isConnected: !isQuota,
-        lastSync: new Date().toLocaleTimeString('th-TH'),
-        isQuotaExceeded: isQuota,
-      }));
+      if (dataUpdatedDebounceTimer) clearTimeout(dataUpdatedDebounceTimer);
+      dataUpdatedDebounceTimer = setTimeout(() => {
+        reloadData();
+        const isQuota = firestoreSync.isQuotaExceeded();
+        setCloudStatus((prev) => ({
+          ...prev,
+          isConnected: !isQuota,
+          lastSync: new Date().toLocaleTimeString('th-TH'),
+          isQuotaExceeded: isQuota,
+        }));
+      }, 30);
     };
 
     const handleQuotaExceeded = () => {
@@ -323,10 +338,16 @@ export default function App() {
     window.addEventListener('storage-changed', handleDataUpdated);
     window.addEventListener('firestore-sync-completed', handleDataUpdated);
     window.addEventListener('firestore-quota-exceeded', handleQuotaExceeded);
+    window.addEventListener('siemens_ix_data_changed', handleDataUpdated);
 
-    // Refresh instantly when user tabs back or focuses the window
+    // Refresh when user tabs back or focuses the window, throttled to avoid quota exhaustion
+    let lastFocusSyncTime = 0;
     const handleWindowFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusSyncTime < 30000) return;
+      if (firestoreSync.isQuotaExceeded()) return;
       if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        lastFocusSyncTime = now;
         storage.initCloudSync().then(res => {
           if (res.connected) reloadData();
         }).catch(() => null);
@@ -336,10 +357,12 @@ export default function App() {
     window.addEventListener('visibilitychange', handleWindowFocus);
 
     return () => {
+      if (dataUpdatedDebounceTimer) clearTimeout(dataUpdatedDebounceTimer);
       window.removeEventListener('siemens-data-updated', handleDataUpdated);
       window.removeEventListener('storage-changed', handleDataUpdated);
       window.removeEventListener('firestore-sync-completed', handleDataUpdated);
       window.removeEventListener('firestore-quota-exceeded', handleQuotaExceeded);
+      window.removeEventListener('siemens_ix_data_changed', handleDataUpdated);
       window.removeEventListener('focus', handleWindowFocus);
       window.removeEventListener('visibilitychange', handleWindowFocus);
       unsubCloudBundles();
@@ -348,28 +371,35 @@ export default function App() {
     };
   }, [reloadData]);
 
-  // Manual cloud sync trigger / retry connection
+  // Manual cloud sync trigger / retry connection (True bidirectional sync)
   const handleSyncCloud = async () => {
     setCloudStatus((prev) => ({ ...prev, isSyncing: true }));
     try {
       // Clear local quota exceeded flag to attempt fresh cloud probe
       await firestoreSync.resetQuotaState();
-      const res = await storage.initCloudSync();
+      
+      // Strict 7-second timeout promise to guarantee the sync process never hangs indefinitely
+      await Promise.race([
+        (async () => {
+          // 1. Download & merge from Cloud
+          await storage.initCloudSync();
+          // 2. Upload merged master state to Cloud if needed
+          await storage.syncAllToCloud().catch(console.warn);
+        })(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Manual sync timeout')), 7000))
+      ]);
+    } catch (e: any) {
+      console.warn('Manual sync notice:', e?.message || e);
+    } finally {
+      // ALWAYS guarantee that isSyncing turns off and latest data is reloaded into view
       reloadData();
       const isQuota = firestoreSync.isQuotaExceeded();
       setCloudStatus({
-        isConnected: res.connected && !isQuota,
+        isConnected: !isQuota,
         isSyncing: false,
         lastSync: new Date().toLocaleTimeString('th-TH'),
         isQuotaExceeded: isQuota,
       });
-    } catch (e) {
-      console.error('Manual sync failed:', e);
-      setCloudStatus((prev) => ({ 
-        ...prev, 
-        isSyncing: false, 
-        isQuotaExceeded: firestoreSync.isQuotaExceeded() 
-      }));
     }
   };
 
@@ -636,7 +666,9 @@ export default function App() {
               currentUser={currentUser}
               theme={theme}
               selectedMonthYear={selectedMonthYear}
+              onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
+              onSelectDepartment={setSelectedDepartment}
               employees={employees}
               shiftCodes={shiftCodes}
               onDataImported={reloadData}

@@ -20,7 +20,8 @@ import {
   CheckCircle2
 } from 'lucide-react';
 import { storage } from '../utils/storage';
-import { generateShiftPlanTemplate, downloadBlob } from '../utils/fileParser';
+import { cleanDocId } from '../firebase';
+import { generateShiftPlanTemplate, downloadBlob, downloadWorkbook, isSameDepartment } from '../utils/fileParser';
 import { getShiftCategoryColor, resolveShiftInfo, parseShiftCodeTags } from '../utils/timeCalc';
 import { MonthYearFilter } from './MonthYearFilter';
 import { ShiftPickerModal } from './ShiftPickerModal';
@@ -96,14 +97,16 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   }, [isPainterActive]);
 
   // Data version listener for instantaneous reactive updates
-  const [, setDataVersion] = useState(0);
+  const [dataVersion, setDataVersion] = useState(0);
   useEffect(() => {
     const handleUpdate = () => setDataVersion(v => v + 1);
     window.addEventListener('siemens-data-updated', handleUpdate);
     window.addEventListener('storage-changed', handleUpdate);
+    window.addEventListener('siemens_ix_data_changed', handleUpdate);
     return () => {
       window.removeEventListener('siemens-data-updated', handleUpdate);
       window.removeEventListener('storage-changed', handleUpdate);
+      window.removeEventListener('siemens_ix_data_changed', handleUpdate);
     };
   }, []);
 
@@ -111,6 +114,17 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   const year = parseInt(yearStr, 10);
   const month = parseInt(monthStr, 10);
   const daysInMonth = new Date(year, month, 0).getDate();
+
+  // Fresh active shift plans combining props and local storage
+  const activeShiftPlans = useMemo(() => {
+    if (shiftPlans.length > 0) return shiftPlans;
+    return storage.getShiftPlans();
+  }, [shiftPlans, dataVersion]);
+
+  // Pre-filter plans for selected month (Dramatically accelerates all downstream computations)
+  const currentMonthPlans = useMemo(() => {
+    return activeShiftPlans.filter(p => p.date && p.date.startsWith(selectedMonthYear));
+  }, [activeShiftPlans, selectedMonthYear]);
 
   // Create array of days 1..daysInMonth
   const daysArray = useMemo(() => {
@@ -131,40 +145,155 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     });
   }, [year, month, daysInMonth, selectedMonthYear]);
 
-  // Compute department counts for dropdown
+  // High-performance O(1) index of employee identifiers to the departments they have shift plans in this month
+  const employeeMonthDeptMap = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const p of currentMonthPlans) {
+      if (!p.department) continue;
+      const dept = p.department.trim().toUpperCase();
+      const addKey = (k: string) => {
+        if (!k) return;
+        let s = map.get(k);
+        if (!s) {
+          s = new Set();
+          map.set(k, s);
+        }
+        s.add(dept);
+      };
+      if (p.empNo) {
+        const clean = p.empNo.trim().toUpperCase();
+        addKey(clean);
+        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          addKey(digits);
+          addKey(digits.padStart(4, '0'));
+          addKey(`1000${digits.padStart(4, '0')}`);
+        }
+      }
+      if (p.gid) {
+        addKey(p.gid.trim().toUpperCase());
+      }
+    }
+    return map;
+  }, [currentMonthPlans]);
+
+  // Synthesize employees from shiftPlans for current month if any missing from master employees list
+  const effectiveEmployees = useMemo(() => {
+    const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
+    const list = [...baseEmployees];
+    const knownEmpNos = new Set<string>();
+    baseEmployees.forEach(e => {
+      if (e.empNo) {
+        const clean = e.empNo.trim().toUpperCase();
+        knownEmpNos.add(clean);
+        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          knownEmpNos.add(digits);
+          knownEmpNos.add(digits.padStart(4, '0'));
+          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
+        }
+      }
+      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
+      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
+    });
+    
+    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
+    currentMonthPlans.forEach(p => {
+      const eNo = (p.empNo || '').trim().toUpperCase();
+      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
+      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
+      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
+        missingEmpsFromPlans.set(eNo, p);
+      }
+    });
+
+    missingEmpsFromPlans.forEach((p, eNo) => {
+      const cleanNo = p.empNo || eNo;
+      const digits = cleanNo.replace(/\D/g, '');
+      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
+      list.push({
+        id: `synth-${paddedNo}`,
+        empNo: paddedNo,
+        empCode: digits ? `1000${paddedNo}` : cleanNo,
+        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
+        firstName: 'พนักงาน',
+        familyName: cleanNo,
+        department: p.department || (selectedDepartment !== 'ALL' ? selectedDepartment : 'GM'),
+        division: 'MO CS BTS',
+        functionTitle: 'Service Technician',
+        costCenter: 'C93051',
+        isShiftWorker: true,
+        isActive: true,
+      });
+    });
+
+    return list;
+  }, [employees, currentMonthPlans, selectedDepartment]);
+
+  // Compute department counts for dropdown (Instant O(1) Set lookups)
   const departmentCounts = useMemo(() => {
-    const counts: Record<string, number> = { ALL: employees.length };
-    employees.forEach(emp => {
-      counts[emp.department] = (counts[emp.department] || 0) + 1;
+    const counts: Record<string, number> = { ALL: effectiveEmployees.length };
+    const deptList = storage.getDepartments();
+    deptList.forEach(d => {
+      const targetDept = d.code.toUpperCase();
+      counts[d.code] = effectiveEmployees.filter(e => {
+        if (isSameDepartment(e.department, d.code)) return true;
+        const eNo = (e.empNo || '').trim().toUpperCase();
+        const gid = (e.gid || '').trim().toUpperCase();
+        const empCode = (e.empCode || '').trim().toUpperCase();
+        const set = employeeMonthDeptMap.get(eNo) || employeeMonthDeptMap.get(gid) || employeeMonthDeptMap.get(empCode);
+        if (!set) return false;
+        for (const dept of set) {
+          if (isSameDepartment(dept, targetDept)) return true;
+        }
+        return false;
+      }).length;
     });
     return counts;
-  }, [employees]);
+  }, [effectiveEmployees, employeeMonthDeptMap]);
 
-  // Filter employees by Department, Shift Type, and Name/GID search
+  // Filter employees by Department, Shift Type, and Name/GID search (Instant 60fps)
   const filteredEmployees = useMemo(() => {
-    return employees.filter(emp => {
+    return effectiveEmployees.filter(emp => {
       // 1. Department filter (Dropdown)
-      if (selectedDepartment !== 'ALL' && emp.department !== selectedDepartment) {
-        return false;
+      if (selectedDepartment !== 'ALL') {
+        const matchesDept = isSameDepartment(emp.department, selectedDepartment);
+        if (!matchesDept) {
+          const eNo = (emp.empNo || '').trim().toUpperCase();
+          const gid = (emp.gid || '').trim().toUpperCase();
+          const empCode = (emp.empCode || '').trim().toUpperCase();
+          const set = employeeMonthDeptMap.get(eNo) || employeeMonthDeptMap.get(gid) || employeeMonthDeptMap.get(empCode);
+          let hasPlan = false;
+          if (set) {
+            for (const dept of set) {
+              if (isSameDepartment(dept, selectedDepartment)) {
+                hasPlan = true;
+                break;
+              }
+            }
+          }
+          if (!hasPlan) return false;
+        }
       }
 
       // 2. Shift worker type filter
       if (shiftFilter === 'SHIFT' && !emp.isShiftWorker) return false;
       if (shiftFilter === 'OFFICE' && emp.isShiftWorker) return false;
 
-      // 3. Search specifically by Employee Name and GID (and EmpNo)
+      // 3. Search specifically by Employee Name, EmpCode, EmpNo, and GID
       if (searchTerm.trim()) {
         const query = searchTerm.trim().toLowerCase();
         const fullName = `${emp.firstName} ${emp.familyName}`.toLowerCase();
         const reverseName = `${emp.familyName} ${emp.firstName}`.toLowerCase();
         const matchesName = fullName.includes(query) || reverseName.includes(query);
-        const matchesGid = emp.gid.toLowerCase().includes(query);
-        const matchesEmpNo = emp.empNo.toLowerCase().includes(query);
-        return matchesName || matchesGid || matchesEmpNo;
+        const matchesGid = (emp.gid || '').toLowerCase().includes(query);
+        const matchesEmpNo = (emp.empNo || '').toLowerCase().includes(query);
+        const matchesEmpCode = (emp.empCode || '').toLowerCase().includes(query);
+        return matchesName || matchesGid || matchesEmpNo || matchesEmpCode;
       }
       return true;
     });
-  }, [employees, selectedDepartment, shiftFilter, searchTerm]);
+  }, [effectiveEmployees, selectedDepartment, shiftFilter, searchTerm, employeeMonthDeptMap]);
 
   // Shift code mapping
   const shiftMap = useMemo(() => {
@@ -193,7 +322,18 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     const groupMap = new Map<string, Employee[]>();
 
     sorted.forEach(emp => {
-      const dept = emp.department || 'OTHER';
+      let dept = emp.department || 'OTHER';
+      if (selectedDepartment !== 'ALL') {
+        dept = selectedDepartment;
+      } else {
+        const eNo = (emp.empNo || '').trim().toUpperCase();
+        const gid = (emp.gid || '').trim().toUpperCase();
+        const empCode = (emp.empCode || '').trim().toUpperCase();
+        const set = employeeMonthDeptMap.get(eNo) || employeeMonthDeptMap.get(gid) || employeeMonthDeptMap.get(empCode);
+        if (set && set.size > 0) {
+          dept = Array.from(set)[0];
+        }
+      }
       if (!groupMap.has(dept)) {
         groupMap.set(dept, []);
       }
@@ -209,51 +349,108 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     });
 
     return groups;
-  }, [filteredEmployees]);
+  }, [filteredEmployees, selectedDepartment, employeeMonthDeptMap]);
 
   // Quick check if current user can edit this employee's schedule
   const canEditEmployee = (emp: Employee): boolean => {
     if (currentUser.role === 'Admin') return true;
     // Role User can ONLY edit employees belonging to their own assigned department
     if (!currentUser.department || currentUser.department === 'ALL') return false;
-    return currentUser.department === emp.department;
+    return isSameDepartment(currentUser.department, emp.department);
   };
 
-  // Fast O(1) indexed lookup map for shift plans
+  // Fast O(1) indexed lookup map for shift plans of selected month
   const shiftPlanLookupMap = useMemo(() => {
     const map = new Map<string, string>();
-    for (const p of shiftPlans) {
+    // Sort month plans by updatedAt ascending so newest plans always overwrite older plans
+    const sortedPlans = [...currentMonthPlans].sort((a, b) => {
+      const timeA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+      const timeB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+      const vA = isNaN(timeA) ? 0 : timeA;
+      const vB = isNaN(timeB) ? 0 : timeB;
+      return vA - vB;
+    });
+
+    for (const p of sortedPlans) {
       if (!p || !p.date || !p.shiftCode) continue;
       const code = p.shiftCode;
       if (p.empNo) {
         const cleanEmp = p.empNo.trim().toUpperCase();
         map.set(`${cleanEmp}_${p.date}`, code);
-        map.set(`${cleanEmp.replace(/^0+/, '')}_${p.date}`, code);
-        map.set(`${cleanEmp.padStart(4, '0')}_${p.date}`, code);
+        const digits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
+        if (digits) {
+          map.set(`${digits}_${p.date}`, code);
+          map.set(`${digits.padStart(4, '0')}_${p.date}`, code);
+          map.set(`1000${digits.padStart(4, '0')}_${p.date}`, code);
+          if (digits.length >= 7) {
+            const short4 = digits.slice(-4);
+            map.set(`${short4}_${p.date}`, code);
+            map.set(`${short4.replace(/^0+/, '')}_${p.date}`, code);
+          }
+        }
       }
       if (p.gid) {
-        map.set(`${p.gid.trim().toUpperCase()}_${p.date}`, code);
+        const cleanGid = p.gid.trim().toUpperCase();
+        map.set(`${cleanGid}_${p.date}`, code);
+        const gidNoSpecial = cleanGid.replace(/[^A-Z0-9]/g, '');
+        if (gidNoSpecial) {
+          map.set(`${gidNoSpecial}_${p.date}`, code);
+        }
+        const gidDigits = cleanGid.replace(/\D/g, '').replace(/^0+/, '');
+        if (gidDigits) {
+          map.set(`${gidDigits}_${p.date}`, code);
+          map.set(`${gidDigits.padStart(4, '0')}_${p.date}`, code);
+          map.set(`1000${gidDigits.padStart(4, '0')}_${p.date}`, code);
+        }
       }
     }
     return map;
-  }, [shiftPlans]);
+  }, [currentMonthPlans]);
 
   // Get shift code for employee on date (instant O(1))
-  const getShiftForDate = (empNo: string, gid: string, dateStr: string): string => {
-    const cleanEmpNo = (empNo || '').trim().toUpperCase();
-    const cleanGid = (gid || '').trim().toUpperCase();
+  const getShiftForDate = (emp: Employee, dateStr: string): string => {
+    const cleanEmpNo = (emp.empNo || '').trim().toUpperCase();
+    const cleanEmpCode = (emp.empCode || '').trim().toUpperCase();
+    const cleanGid = (emp.gid || '').trim().toUpperCase();
     
     let code: string | undefined;
     if (cleanEmpNo) {
       code = shiftPlanLookupMap.get(`${cleanEmpNo}_${dateStr}`);
     }
-    if (!code && cleanGid) {
-      code = shiftPlanLookupMap.get(`${cleanGid}_${dateStr}`);
+    if (!code && cleanEmpCode) {
+      code = shiftPlanLookupMap.get(`${cleanEmpCode}_${dateStr}`);
     }
+    if (!code && cleanGid) {
+      code = shiftPlanLookupMap.get(`${cleanGid}_${dateStr}`) || 
+             shiftPlanLookupMap.get(`${cleanGid.replace(/[^A-Z0-9]/g, '')}_${dateStr}`);
+    }
+
+    if (!code) {
+      const allDigits = [
+        cleanEmpNo.replace(/\D/g, '').replace(/^0+/, ''),
+        cleanEmpCode.replace(/\D/g, '').replace(/^0+/, ''),
+        cleanGid.replace(/\D/g, '').replace(/^0+/, ''),
+      ].filter(Boolean);
+
+      for (const d of allDigits) {
+        code = shiftPlanLookupMap.get(`${d}_${dateStr}`) || 
+               shiftPlanLookupMap.get(`${d.padStart(4, '0')}_${dateStr}`) ||
+               shiftPlanLookupMap.get(`1000${d.padStart(4, '0')}_${dateStr}`);
+        if (code) break;
+        if (d.length >= 7) {
+          const short4 = d.slice(-4);
+          code = shiftPlanLookupMap.get(`${short4}_${dateStr}`) || 
+                 shiftPlanLookupMap.get(`${short4.replace(/^0+/, '')}_${dateStr}`);
+          if (code) break;
+        }
+      }
+    }
+
     if (code) return code;
 
-    // Fallback: Day shift for weekday, OFF for weekend
-    const dow = new Date(dateStr).getDay();
+    // Fallback: Day shift for weekday, OFF for weekend (safe local date parse)
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const dow = new Date(y, (m || 1) - 1, d || 1).getDay();
     return dow === 0 || dow === 6 ? 'OFF' : 'D';
   };
 
@@ -323,15 +520,23 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
       const isMatch = (
         (cleanEmpNo && pEmpNo && cleanEmpNo === pEmpNo) ||
         (cleanGid && pGid && cleanGid === pGid) ||
-        (cleanDigits && pDigits && cleanDigits === pDigits)
+        (cleanDigits && pDigits && cleanDigits === pDigits) ||
+        (cleanEmpNo && pGid && cleanEmpNo === pGid) ||
+        (cleanGid && pEmpNo && cleanGid === pEmpNo)
       );
       return !isMatch;
     });
 
-    // 2. Add freshly updated plans with authoritative timestamp
+    // 2. Add freshly updated plans with authoritative timestamp and deterministic IDs
+    const newlyCreatedPlans: DailyShiftPlan[] = [];
     targetDates.forEach(dStr => {
-      updatedPlans.push({
-        id: `plan-${emp.empNo}-${dStr}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+      const cleanEmp = (emp.empNo || '').trim();
+      const cleanGid = (emp.gid || '').trim();
+      const targetEmp = cleanEmp || cleanGid;
+      const deterministicId = `plan_${cleanDocId(targetEmp)}_${dStr}`;
+
+      const newPlan: DailyShiftPlan = {
+        id: deterministicId,
         empNo: emp.empNo,
         gid: emp.gid,
         date: dStr,
@@ -339,7 +544,9 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
         department: emp.department,
         updatedBy: currentUser.email,
         updatedAt: nowIso,
-      });
+      };
+      updatedPlans.push(newPlan);
+      newlyCreatedPlans.push(newPlan);
     });
 
     const shiftInfo = resolveShiftInfo(newCode, shiftCodes, emp);
@@ -352,9 +559,9 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     const rangeName = rangeType === 'single' ? '1 วัน' : rangeType === 'weekday' ? 'ทั้งสัปดาห์ (จ.-ศ.)' : rangeType === 'next7' ? '7 วัน' : 'ถึงสิ้นเดือน';
     showToast(`เปลี่ยนกะ ${newCode} (${shiftInfo?.name || ''}${allowanceDesc ? ` [${allowanceDesc}]` : ''}) ให้ ${emp.firstName} ${rangeName} เรียบร้อยแล้ว`);
 
-    // 3. Save to local storage and sync to Firebase Cloud in background
+    // 3. Batched single write call to local storage and Firebase Cloud in background
     try {
-      await storage.setShiftPlans(updatedPlans);
+      await storage.setShiftPlans(updatedPlans, newlyCreatedPlans);
     } catch (err) {
       console.warn('Shift plan sync warning:', err);
     }
@@ -376,7 +583,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
       handleApplyShift(emp, d.dateStr, codeToApply, 'single');
     } else {
       // Open Smart Picker Modal
-      const currentCode = getShiftForDate(emp.empNo, emp.gid, d.dateStr);
+      const currentCode = getShiftForDate(emp, d.dateStr);
       setPickerModal({
         isOpen: true,
         employee: emp,
@@ -389,12 +596,10 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   // Quick download blank/pre-filled template for current department
   const handleDownloadTemplate = () => {
     const targetDept = selectedDepartment === 'ALL' ? 'GM' : selectedDepartment;
-    const { csvContent } = generateShiftPlanTemplate(targetDept, selectedMonthYear, employees);
-    downloadBlob(
-      csvContent,
-      `ShiftPlan_Template_${targetDept}_${selectedMonthYear}.csv`,
-      'text/csv;charset=utf-8;'
-    );
+    const { workbook, sheetName, filename } = generateShiftPlanTemplate(targetDept, selectedMonthYear, employees, shiftCodes);
+    const outFilename = filename || `ShiftPlan_Template_${targetDept}_${sheetName || selectedMonthYear}.xlsx`;
+    downloadWorkbook(workbook, outFilename);
+    setToastMessage(`ดาวน์โหลดเทมเพลต Excel สำเร็จ: ${outFilename} (Sheet: "${sheetName}")`);
   };
 
   const selectedPainterShift = shiftMap.get(selectedPainterCode);
@@ -506,7 +711,14 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                   return (
                     <button
                       key={code}
-                      onClick={() => setSelectedPainterCode(code)}
+                      onClick={() => {
+                        const hasX = code.includes('-X');
+                        const hasET = code.includes('-ET');
+                        const base = code.replace(/-X/gi, '').replace(/-ET/gi, '').trim();
+                        setSelectedPainterCode(base || code);
+                        setPainterStandby(hasX);
+                        setPainterEmergency(hasET);
+                      }}
                       className={`min-w-[28px] h-7 px-2 flex items-center justify-center rounded text-xs font-mono font-bold transition cursor-pointer shadow-xs ${
                         isSelected
                           ? 'ring-2 ring-white ring-offset-1 ring-offset-slate-900 scale-110 z-10 shadow-md font-extrabold'
@@ -683,7 +895,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
                 }`}
               >
                 <option value="ALL">
-                  ทุกแผนก (All Departments) ({employees.length} คน)
+                  ทุกแผนก (All Departments) ({effectiveEmployees.length} คน)
                 </option>
                 {storage.getDepartments().map(d => (
                   <option key={d.code} value={d.code}>
@@ -760,7 +972,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
             </div>
 
             <div className="text-[11px] text-slate-400 pl-2">
-              แสดง <strong className="text-[#00e5e5]">{filteredEmployees.length}</strong> จาก {employees.length} คน
+              แสดง <strong className="text-[#00e5e5]">{filteredEmployees.length}</strong> จาก {effectiveEmployees.length} คน
             </div>
           </div>
         </div>
@@ -892,7 +1104,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
                           {/* Day Shift Cells */}
                           {daysArray.map(d => {
-                            const code = getShiftForDate(emp.empNo, emp.gid, d.dateStr);
+                            const code = getShiftForDate(emp, d.dateStr);
                             const tagInfo = parseShiftCodeTags(code);
                             const shiftInfo = resolveShiftInfo(code, shiftCodes, emp);
                             if (shiftInfo?.isWorkingDay) {

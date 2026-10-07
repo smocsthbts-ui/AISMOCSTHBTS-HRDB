@@ -43,7 +43,10 @@ import {
   downloadBlob, 
   downloadWorkbook,
   parseSheetToRows, 
-  readFileAsArrayBuffer 
+  readFileAsArrayBuffer,
+  ANNUAL_TEMPLATE_MONTH_NAMES,
+  isSameDepartment,
+  isEmployeeIdentifierMatch
 } from '../utils/fileParser';
 import { firestoreSync } from '../firebase';
 
@@ -349,12 +352,12 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
   const handleDownloadExcelTemplate = () => {
     try {
       const deptToUse = !isAdmin ? userDept : targetDept;
-      const { workbook } = generateShiftPlanTemplate(deptToUse, targetMonthYear, employees);
-      const filename = `ShiftPlan_Template_${deptToUse}_${targetMonthYear}.xlsx`;
-      downloadWorkbook(workbook, filename);
+      const { workbook, sheetName, filename } = generateShiftPlanTemplate(deptToUse, targetMonthYear, employees, shiftCodes);
+      const outFilename = filename || `ShiftPlan_Template_${deptToUse}_${sheetName || targetMonthYear}.xlsx`;
+      downloadWorkbook(workbook, outFilename);
       setStatusMessage({
         type: 'success',
-        text: `ดาวน์โหลดไฟล์เทมเพลต Excel สำเร็จ: ${filename} (แผนก ${deptToUse}, งวด ${targetMonthYear})`,
+        text: `ดาวน์โหลดไฟล์เทมเพลต Excel สำเร็จ: ${outFilename} (Sheet: "${sheetName}", แผนก ${deptToUse}, งวด ${targetMonthYear})`,
       });
     } catch (err: any) {
       console.error('Error downloading Excel template:', err);
@@ -369,8 +372,8 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
   const handleDownloadCsvTemplate = () => {
     try {
       const deptToUse = !isAdmin ? userDept : targetDept;
-      const { csvContent } = generateShiftPlanTemplate(deptToUse, targetMonthYear, employees);
-      const filename = `ShiftPlan_Template_${deptToUse}_${targetMonthYear}.csv`;
+      const { csvContent, sheetName } = generateShiftPlanTemplate(deptToUse, targetMonthYear, employees, shiftCodes);
+      const filename = `ShiftPlan_Template_${deptToUse}_${sheetName || targetMonthYear}.csv`;
       downloadBlob(csvContent, filename, 'text/csv;charset=utf-8;');
       setStatusMessage({
         type: 'success',
@@ -412,7 +415,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
         const sampleRows = parseSpecificSheetToRows(buffer, initialSheetName);
         for (const row of sampleRows) {
           const rowDept = String(row['Department'] || row['department'] || row['Dept'] || row['dept'] || row['แผนก'] || '').trim().toUpperCase();
-          if (rowDept && rowDept !== 'ALL' && rowDept !== userDept) {
+          if (rowDept && rowDept !== 'ALL' && !isSameDepartment(rowDept, userDept)) {
             setStatusMessage({
               type: 'error',
               text: `สิทธิ์ไม่เพียงพอ: คุณมีสิทธิ์ Role User สามารถอัปโหลดตารางกะได้เฉพาะแผนกตนเอง (${userDept}) เท่านั้น แต่ในไฟล์พบข้อมูลระบุแผนก "${rowDept}" ระบบจึงไม่อนุญาตให้อัปโหลด`,
@@ -522,16 +525,16 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
           // Strict Security Check for Role User inside each sheet
           if (!isAdmin) {
             const foreignDeptPlans = result.plans.filter(p => {
-              const emp = employees.find(e => e.empNo.trim().toUpperCase() === p.empNo.trim().toUpperCase());
-              if (emp && emp.department && emp.department.trim().toUpperCase() !== userDept) return true;
-              if (p.department && p.department.trim().toUpperCase() !== userDept) return true;
+              const emp = employees.find(e => isEmployeeIdentifierMatch(p.empNo, e));
+              if (emp && emp.department && !isSameDepartment(emp.department, userDept)) return true;
+              if (p.department && !isSameDepartment(p.department, userDept)) return true;
               return false;
             });
             if (foreignDeptPlans.length > 0) {
               const foreignEmps = Array.from(new Set(foreignDeptPlans.map(p => p.empNo)));
               throw new Error(`สิทธิ์ไม่เพียงพอ: พบข้อมูลพนักงานสังกัดแผนกอื่นใน Sheet "${s.sheetName}" จำนวน ${foreignEmps.length} คน (รหัส: ${foreignEmps.slice(0, 3).join(', ')}) ผู้ใช้สิทธิ์ User สามารถอัปโหลดตารางกะได้เฉพาะแผนก ${userDept} เท่านั้น`);
             }
-            if (result.newEmployees && result.newEmployees.some(ne => ne.department && ne.department.trim().toUpperCase() !== userDept)) {
+            if (result.newEmployees && result.newEmployees.some(ne => ne.department && !isSameDepartment(ne.department, userDept))) {
               throw new Error(`สิทธิ์ไม่เพียงพอ: ใน Sheet "${s.sheetName}" พบพนักงานใหม่ที่ไม่ได้สังกัดแผนก ${userDept}`);
             }
           }
@@ -581,9 +584,9 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
         // Strict Security Check for Role User
         if (!isAdmin) {
           const foreignDeptPlans = result.plans.filter(p => {
-            const emp = employees.find(e => e.empNo.trim().toUpperCase() === p.empNo.trim().toUpperCase());
-            if (emp && emp.department && emp.department.trim().toUpperCase() !== userDept) return true;
-            if (p.department && p.department.trim().toUpperCase() !== userDept) return true;
+            const emp = employees.find(e => isEmployeeIdentifierMatch(p.empNo, e));
+            if (emp && emp.department && !isSameDepartment(emp.department, userDept)) return true;
+            if (p.department && !isSameDepartment(p.department, userDept)) return true;
             return false;
           });
           if (foreignDeptPlans.length > 0) {
@@ -597,7 +600,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
             setIsExecutingImport(false);
             return;
           }
-          if (result.newEmployees && result.newEmployees.some(ne => ne.department && ne.department.trim().toUpperCase() !== userDept)) {
+          if (result.newEmployees && result.newEmployees.some(ne => ne.department && !isSameDepartment(ne.department, userDept))) {
             setStatusMessage({
               type: 'error',
               text: `สิทธิ์ไม่เพียงพอ: พบพนักงานใหม่ในไฟล์ที่ไม่ได้สังกัดแผนก ${userDept}`,
@@ -617,18 +620,44 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
         if (result.newShiftCodes) aggregatedNewShiftCodes = result.newShiftCodes;
       }
 
-      // Merge into stored shift plans: overwrite matching empNo & date
+      // Normalized Employee ID helper (pads 1-4 digit numeric strings e.g. "503" -> "0503", "82" -> "0082")
+      const normalizeEmpId = (id?: string | null): string => {
+        if (!id) return '';
+        const clean = String(id).trim().toUpperCase();
+        const digits = clean.replace(/\D/g, '');
+        if (digits && digits.length <= 4) {
+          return digits.padStart(4, '0');
+        }
+        return clean;
+      };
+
+      // Shift plan deduplication key: canonical empNo + date (e.g. "0503_2026-09-01")
+      const getShiftPlanDedupeKey = (empNo: string, date: string): string => {
+        return `${normalizeEmpId(empNo)}_${(date || '').trim()}`;
+      };
+
+      // Merge into stored shift plans: strictly overwrite matching empNo & date to prevent doubling
       const currentPlans = storage.getShiftPlans();
       const newPlanMap = new Map<string, DailyShiftPlan>();
 
       currentPlans.forEach(p => {
-        const key = `${p.empNo}_${p.date}`;
-        newPlanMap.set(key, p);
+        if (!p || !p.empNo || !p.date) return;
+        const normNo = normalizeEmpId(p.empNo);
+        const key = getShiftPlanDedupeKey(normNo, p.date);
+        newPlanMap.set(key, {
+          ...p,
+          empNo: normNo,
+        });
       });
 
       aggregatedPlans.forEach(p => {
-        const key = `${p.empNo}_${p.date}`;
-        newPlanMap.set(key, p);
+        if (!p || !p.empNo || !p.date) return;
+        const normNo = normalizeEmpId(p.empNo);
+        const key = getShiftPlanDedupeKey(normNo, p.date);
+        newPlanMap.set(key, {
+          ...p,
+          empNo: normNo,
+        });
       });
 
       const updatedPlans = Array.from(newPlanMap.values());
@@ -636,15 +665,36 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
       // Sync with Firestore
       await firestoreSync.syncShiftPlans(updatedPlans);
 
-      // If new Employees were discovered, persist them into Employee Master Database
+      // If new Employees were discovered, persist them cleanly into Employee Master Database (no duplicate rows)
       if (aggregatedNewEmployees.length > 0) {
         const currentEmployees = storage.getEmployees();
         const empMap = new Map<string, Employee>();
-        currentEmployees.forEach(e => empMap.set(e.empNo, e));
+
+        currentEmployees.forEach(e => {
+          const normNo = normalizeEmpId(e.empNo);
+          empMap.set(normNo, {
+            ...e,
+            empNo: normNo,
+          });
+        });
 
         aggregatedNewEmployees.forEach(ne => {
-          if (!empMap.has(ne.empNo)) {
-            empMap.set(ne.empNo, ne);
+          const normNo = normalizeEmpId(ne.empNo);
+          const existing = empMap.get(normNo);
+          if (existing) {
+            empMap.set(normNo, {
+              ...existing,
+              ...ne,
+              id: existing.id,
+              empNo: normNo,
+              department: ne.department || existing.department,
+              updatedAt: new Date().toISOString(),
+            });
+          } else {
+            empMap.set(normNo, {
+              ...ne,
+              empNo: normNo,
+            });
           }
         });
 
@@ -974,7 +1024,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
             </div>
 
             <p className="text-xs text-slate-400 leading-relaxed">
-              เตรียมตารางกะสำหรับแผนก <strong>{targetDept}</strong> ({targetEmployees.length} คน) โดยระบุข้อมูลตามคอลัมน์ <strong>Emp No</strong>, <strong>Name</strong>, <strong>Department</strong> และวันที่ 01 ถึง 31
+              เตรียมตารางกะสำหรับแผนก <strong>{targetDept}</strong> ({targetEmployees.length} คน) โดยระบุข้อมูลตามคอลัมน์ <strong>Emp No</strong> (ใส่ 1 ค่าเท่านั้น: อาจเป็น Emp No, Emp Code หรือ GID ระบบจะ Mapping อัตโนมัติ), <strong>Name</strong>, <strong>Department</strong> และวันที่ 01 ถึง 31
             </p>
 
             {/* Annual 12-Sheet Template Section */}
@@ -1073,7 +1123,12 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
           {/* Single Month Templates */}
           <div className="space-y-2 pt-2">
             <div className="text-[11px] text-slate-300 font-semibold flex items-center justify-between">
-              <span>ดาวน์โหลดเฉพาะงวดเดือน {targetMonthYear}:</span>
+              <span>ดาวน์โหลดเฉพาะงวดเดือน {targetMonthYear} (ชื่อ Sheet: <strong className="text-teal-400 font-mono">{(() => {
+                const parts = targetMonthYear.split('-');
+                const y = parseInt(parts[0], 10) || 2026;
+                const m = parseInt(parts[1], 10) || 9;
+                return `${ANNUAL_TEMPLATE_MONTH_NAMES[m - 1]?.short || 'SEP'}-${y}`;
+              })()}</strong>):</span>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               <button
@@ -1082,7 +1137,12 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 className="w-full flex items-center justify-center space-x-2 py-2 rounded font-semibold text-xs bg-[#1a2c3d] hover:bg-[#22394f] text-teal-300 border border-teal-500/40 shadow transition cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>Download Month Excel ({targetMonthYear})</span>
+                <span>Download Month Excel (Sheet: {(() => {
+                  const parts = targetMonthYear.split('-');
+                  const y = parseInt(parts[0], 10) || 2026;
+                  const m = parseInt(parts[1], 10) || 9;
+                  return `${ANNUAL_TEMPLATE_MONTH_NAMES[m - 1]?.short || 'SEP'}-${y}`;
+                })()})</span>
               </button>
 
               <button
@@ -1743,10 +1803,10 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                     <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
                     <div>
                       <h4 className="font-bold text-sm text-amber-300">
-                        รายการที่ไม่สมบูรณ์และระบบไม่อนุญาตให้นำเข้า ({uploadSummaryModal.skippedRows.length} รายการ)
+                        รายการที่ข้ามการนำเข้า ({uploadSummaryModal.skippedRows.length} รายการ)
                       </h4>
                       <p className="text-xs opacity-90 mt-0.5">
-                        ระบบไม่อนุญาตให้นำเข้าเฉพาะรายการที่<strong>ไม่มีข้อมูล GID</strong> หรือ<strong>ระบุ GID ไม่ถูกต้อง/เป็นตัวอย่าง</strong> (เช่น <code>XXX</code>, <code>000</code>, <code>N/A</code>, <code>-</code>) โดยระบบได้นำเข้าเฉพาะพนักงานที่มีข้อมูลสมบูรณ์เรียบร้อยแล้ว
+                        ระบบข้ามเฉพาะรายการที่<strong>ไม่ได้ระบุรหัสพนักงาน (Emp No)</strong> หรือไม่สามารถระบุตัวตนสำหรับใช้ Mapping ได้ โดยระบบได้นำเข้าเฉพาะพนักงานที่มีข้อมูลสมบูรณ์เรียบร้อยแล้ว
                       </p>
                     </div>
                   </div>
@@ -1889,6 +1949,13 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    if (uploadSummaryModal) {
+                      const my = uploadSummaryModal.processedMonths[0] || targetMonthYear;
+                      if (onSelectMonthYear) onSelectMonthYear(my);
+                      if (onSelectDepartment && uploadSummaryModal.department !== 'ALL') {
+                        onSelectDepartment(uploadSummaryModal.department);
+                      }
+                    }
                     setUploadSummaryModal(null);
                     onNavigateToRoster();
                   }}

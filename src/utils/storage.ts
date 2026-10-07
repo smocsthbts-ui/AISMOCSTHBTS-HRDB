@@ -55,6 +55,76 @@ const STORAGE_KEYS = {
   DELETED_DEPARTMENTS: 'siemens_ix_deleted_departments',
 };
 
+// Resilient in-memory storage cache to completely eliminate browser localStorage QuotaExceededError crashes
+const inMemoryCache = new Map<string, string>();
+
+// Initialize inMemoryCache from localStorage on startup
+try {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('siemens_ix_') || k.startsWith('siemens_'))) {
+        inMemoryCache.set(k, localStorage.getItem(k) || '');
+      }
+    }
+  }
+} catch {}
+
+export function safeGetItem(key: string): string | null {
+  if (inMemoryCache.has(key)) {
+    const val = inMemoryCache.get(key);
+    return val !== undefined ? val : null;
+  }
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const val = localStorage.getItem(key);
+      if (val !== null) {
+        inMemoryCache.set(key, val);
+        return val;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function safeSetItem(key: string, value: string): void {
+  // 1. Immediately store into in-memory cache to guarantee synchronous state updates and zero crashes
+  inMemoryCache.set(key, value);
+
+  // 2. Persist to localStorage safely
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(key, value);
+    }
+  } catch (err: any) {
+    console.warn(`[Storage] localStorage.setItem for key "${key}" hit browser quota limit. Active data is preserved in high-capacity in-memory cache.`, err);
+    try {
+      // If quota exceeded, trim older raw punch logs from localStorage to make space for critical shift plans and master tables
+      if (key !== STORAGE_KEYS.RAW_PUNCHES) {
+        const rawPunchesStr = inMemoryCache.get(STORAGE_KEYS.RAW_PUNCHES);
+        if (rawPunchesStr) {
+          try {
+            const parsed = JSON.parse(rawPunchesStr);
+            if (Array.isArray(parsed) && parsed.length > 1000) {
+              localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(parsed.slice(-1000)));
+            }
+          } catch {}
+        }
+      }
+      localStorage.setItem(key, value);
+    } catch {}
+  }
+}
+
+export function safeRemoveItem(key: string): void {
+  inMemoryCache.delete(key);
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.removeItem(key);
+    }
+  } catch {}
+}
+
 export const HISTORY_CUTOFF_DATE = '2025-01-01';
 export const HISTORY_CUTOFF_MONTH = '2025-01';
 
@@ -63,31 +133,31 @@ const CURRENT_SCHEMA_VERSION = 'v2026_09_prune_pre_aug2026_v5';
 // Self-healing migration for all connected clients upon opening the app
 try {
   // Purge any demo users immediately from local storage cache
-  const userRaw = localStorage.getItem(STORAGE_KEYS.USERS);
+  const userRaw = safeGetItem(STORAGE_KEYS.USERS);
   if (userRaw) {
     const parsed = JSON.parse(userRaw);
     if (Array.isArray(parsed)) {
       const cleaned = parsed.filter(u => !isDemoUser(u));
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleaned));
+      safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(cleaned));
     }
   }
 
   // Purge any demo employees immediately from local storage cache
-  const empRaw = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
+  const empRaw = safeGetItem(STORAGE_KEYS.EMPLOYEES);
   if (empRaw) {
     try {
       const parsed = JSON.parse(empRaw);
       if (Array.isArray(parsed)) {
         const cleaned = parsed.filter(e => e && e.empNo && !isDemoEmployee(e));
-        localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleaned));
+        safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleaned));
       }
     } catch {}
   }
 
-  const currentVer = localStorage.getItem(STORAGE_KEYS.SCHEMA_VERSION);
+  const currentVer = safeGetItem(STORAGE_KEYS.SCHEMA_VERSION);
   if (currentVer !== CURRENT_SCHEMA_VERSION) {
     // 1. Prune punches before Aug 2026 and deduplicate
-    const punchesRaw = localStorage.getItem(STORAGE_KEYS.RAW_PUNCHES);
+    const punchesRaw = safeGetItem(STORAGE_KEYS.RAW_PUNCHES);
     if (punchesRaw) {
       try {
         const parsed = JSON.parse(punchesRaw);
@@ -99,13 +169,13 @@ try {
             const key = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
             if (!punchMap.has(key)) punchMap.set(key, p);
           });
-          localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(Array.from(punchMap.values())));
+          safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(Array.from(punchMap.values())));
         }
       } catch {}
     }
 
     // 2. Prune shift plans before Aug 2026 and deduplicate
-    const plansRaw = localStorage.getItem(STORAGE_KEYS.SHIFT_PLANS);
+    const plansRaw = safeGetItem(STORAGE_KEYS.SHIFT_PLANS);
     if (plansRaw) {
       try {
         const parsed = JSON.parse(plansRaw);
@@ -117,37 +187,37 @@ try {
             const key = `${(p.empNo || '').trim()}_${(p.gid || '').trim().toLowerCase()}_${p.date}`;
             if (!planMap.has(key)) planMap.set(key, p);
           });
-          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(Array.from(planMap.values())));
+          safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(Array.from(planMap.values())));
         }
       } catch {}
     }
 
     // 3. Prune OT records before Aug 2026
-    const otRaw = localStorage.getItem(STORAGE_KEYS.OT_RECORDS);
+    const otRaw = safeGetItem(STORAGE_KEYS.OT_RECORDS);
     if (otRaw) {
       try {
         const parsed = JSON.parse(otRaw);
         if (Array.isArray(parsed)) {
           const cleaned = parsed.filter((o: any) => !o.date || o.date >= HISTORY_CUTOFF_DATE);
-          localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleaned));
+          safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleaned));
         }
       } catch {}
     }
 
     // 4. Prune other allowances before Aug 2026
-    const allowRaw = localStorage.getItem(STORAGE_KEYS.OTHER_ALLOWANCES);
+    const allowRaw = safeGetItem(STORAGE_KEYS.OTHER_ALLOWANCES);
     if (allowRaw) {
       try {
         const parsed = JSON.parse(allowRaw);
         if (Array.isArray(parsed)) {
           const cleaned = parsed.filter((a: any) => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
-          localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleaned));
+          safeSetItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleaned));
         }
       } catch {}
     }
 
     // 5. Prune manual overrides before Aug 2026
-    const overridesRaw = localStorage.getItem(STORAGE_KEYS.MANUAL_OVERRIDES);
+    const overridesRaw = safeGetItem(STORAGE_KEYS.MANUAL_OVERRIDES);
     if (overridesRaw) {
       try {
         const parsed = JSON.parse(overridesRaw);
@@ -160,13 +230,13 @@ try {
               cleaned[k] = v;
             }
           });
-          localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cleaned));
+          safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cleaned));
         }
       } catch {}
     }
 
     // 6. Clean distorted department names
-    const deptRaw = localStorage.getItem(STORAGE_KEYS.DEPARTMENTS);
+    const deptRaw = safeGetItem(STORAGE_KEYS.DEPARTMENTS);
     if (deptRaw) {
       const parsedDepts = JSON.parse(deptRaw);
       if (Array.isArray(parsedDepts)) {
@@ -178,10 +248,10 @@ try {
           }
           return { code, name };
         });
-        localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleaned));
+        safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleaned));
       }
     }
-    localStorage.setItem(STORAGE_KEYS.SCHEMA_VERSION, CURRENT_SCHEMA_VERSION);
+    safeSetItem(STORAGE_KEYS.SCHEMA_VERSION, CURRENT_SCHEMA_VERSION);
   }
 } catch {}
 
@@ -193,6 +263,7 @@ export const notifyDataChanged = () => {
     window.dispatchEvent(new Event('siemens-data-updated'));
     window.dispatchEvent(new Event('storage-changed'));
     window.dispatchEvent(new Event('firestore-sync-completed'));
+    window.dispatchEvent(new Event('siemens_ix_data_changed'));
   }, 50);
 };
 
@@ -201,6 +272,7 @@ export const notifyDataChangedImmediate = () => {
   window.dispatchEvent(new Event('siemens-data-updated'));
   window.dispatchEvent(new Event('storage-changed'));
   window.dispatchEvent(new Event('firestore-sync-completed'));
+  window.dispatchEvent(new Event('siemens_ix_data_changed'));
 };
 
 // In-memory cache for high-volume biometric punches to eliminate synchronous JSON stringify overhead
@@ -280,7 +352,7 @@ export function parseBiometricText(text: string): BiometricRawPunch[] {
 export const storage = {
   getDeletedUserKeys(): string[] {
     try {
-      const data = localStorage.getItem(STORAGE_KEYS.DELETED_USERS);
+      const data = safeGetItem(STORAGE_KEYS.DELETED_USERS);
       return data ? JSON.parse(data) : [];
     } catch {
       return [];
@@ -299,7 +371,7 @@ export const storage = {
         }
       });
       if (changed) {
-        localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(current));
+        safeSetItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(current));
       }
     } catch (e) {
       console.warn('recordDeletedUser warning:', e);
@@ -316,14 +388,14 @@ export const storage = {
       ].filter(Boolean) as string[]);
       const updated = current.filter(k => !keysToRemove.has(k) && !keysToRemove.has(k.toLowerCase()));
       if (updated.length !== current.length) {
-        localStorage.setItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(updated));
+        safeSetItem(STORAGE_KEYS.DELETED_USERS, JSON.stringify(updated));
       }
     } catch {}
   },
 
   getUsers(): UserAccount[] {
     const deletedKeys = new Set(this.getDeletedUserKeys());
-    const data = localStorage.getItem(STORAGE_KEYS.USERS);
+    const data = safeGetItem(STORAGE_KEYS.USERS);
     let list: UserAccount[] = [];
     if (data) {
       try {
@@ -347,8 +419,11 @@ export const storage = {
       if (isDemoUser(u)) return;
       const cleanEmail = u.email.trim().toLowerCase();
       const idLower = (u.id || '').toLowerCase();
-      if (deletedKeys.has(cleanEmail)) return;
-      if (idLower && deletedKeys.has(idLower)) return;
+      const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
+      if (!isProtected) {
+        if (deletedKeys.has(cleanEmail)) return;
+        if (idLower && deletedKeys.has(idLower)) return;
+      }
 
       // Normalize status
       let status = u.status;
@@ -394,7 +469,7 @@ export const storage = {
     // Self-heal localStorage if duplicates or demo users were present
     if (deduplicated.length !== list.length) {
       try {
-        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(deduplicated));
+        safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(deduplicated));
       } catch {}
     }
     return deduplicated;
@@ -405,6 +480,15 @@ export const storage = {
     const deletedKeys = new Set(this.getDeletedUserKeys());
     const uMap = new Map<string, UserAccount>();
 
+    // 1. Seed with existing local users to prevent accidental wipeouts
+    const currentUsers = this.getUsers();
+    currentUsers.forEach(u => {
+      if (u && u.email && !isDemoUser(u)) {
+        uMap.set(u.email.trim().toLowerCase(), u);
+      }
+    });
+
+    // 2. Merge cloud users with timestamp comparison
     cloudUsers.forEach(u => {
       if (!u || !u.email) return;
       if (isDemoUser(u)) return;
@@ -427,12 +511,29 @@ export const storage = {
         status = 'Active';
       }
 
-      uMap.set(cleanEmail, { ...u, email: cleanEmail, status });
+      const existing = uMap.get(cleanEmail);
+      if (!existing) {
+        uMap.set(cleanEmail, { ...u, email: cleanEmail, status });
+      } else {
+        const existingTime = existing.updatedAt || existing.lastLogin || existing.createdAt || '';
+        const incomingTime = u.updatedAt || u.lastLogin || u.createdAt || '';
+        const isIncomingNewer = incomingTime >= existingTime;
+        const base = isIncomingNewer ? existing : u;
+        const top = isIncomingNewer ? u : existing;
+
+        uMap.set(cleanEmail, {
+          ...base,
+          ...top,
+          email: cleanEmail,
+          status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (top.status || base.status || status),
+          role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (top.role || base.role),
+        });
+      }
     });
 
     const cleanList = Array.from(uMap.values()).filter(u => !isDemoUser(u));
     try {
-      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanList));
+      safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(cleanList));
       notifyDataChanged();
     } catch (e) {
       console.warn('updateUsersFromCloud cache warning:', e);
@@ -468,7 +569,7 @@ export const storage = {
       uMap.set(cleanEmail, { ...u, email: cleanEmail, status, updatedAt: u.updatedAt || now });
     });
     const cleanUsers = Array.from(uMap.values()).filter(u => !isDemoUser(u));
-    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
+    safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
     notifyDataChanged();
     // Targeted cloud sync for users
     firestoreSync.syncUsers(cleanUsers).catch(console.warn);
@@ -508,7 +609,7 @@ export const storage = {
     uMap.set(cleanEmail, { ...(uMap.get(cleanEmail) || {}), ...normalizedUser });
 
     const cleanUsers = Array.from(uMap.values()).filter(u => !isDemoUser(u));
-    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
+    safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
     notifyDataChanged();
     return await firestoreSync.saveUserDirect(normalizedUser);
   },
@@ -522,13 +623,13 @@ export const storage = {
       if (cleanEmail && u.email?.trim().toLowerCase() === cleanEmail) return false;
       return true;
     });
-    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(updated));
+    safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(updated));
     notifyDataChanged();
     return await firestoreSync.deleteUser(userId, email, updated);
   },
 
   getCurrentUser(): UserAccount | null {
-    const data = localStorage.getItem(STORAGE_KEYS.CURRENT_USER);
+    const data = safeGetItem(STORAGE_KEYS.CURRENT_USER);
     if (!data) {
       return null;
     }
@@ -540,20 +641,20 @@ export const storage = {
   },
   setCurrentUser(user: UserAccount | null) {
     if (user) {
-      localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(user));
+      safeSetItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(user));
     } else {
-      localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+      safeRemoveItem(STORAGE_KEYS.CURRENT_USER);
     }
     notifyDataChanged();
   },
   clearCurrentUser() {
-    localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+    safeRemoveItem(STORAGE_KEYS.CURRENT_USER);
     notifyDataChanged();
   },
 
   getDeletedDepartmentCodes(): string[] {
     try {
-      const data = localStorage.getItem(STORAGE_KEYS.DELETED_DEPARTMENTS);
+      const data = safeGetItem(STORAGE_KEYS.DELETED_DEPARTMENTS);
       return data ? JSON.parse(data) : [];
     } catch {
       return [];
@@ -566,7 +667,7 @@ export const storage = {
       const current = this.getDeletedDepartmentCodes();
       if (!current.includes(clean)) {
         current.push(clean);
-        localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(current));
+        safeSetItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(current));
       }
     } catch (e) {
       console.warn('recordDeletedDepartment warning:', e);
@@ -577,7 +678,7 @@ export const storage = {
     const deletedCodes = this.getDeletedDepartmentCodes();
     const deletedSet = new Set(deletedCodes);
 
-    const data = localStorage.getItem(STORAGE_KEYS.DEPARTMENTS);
+    const data = safeGetItem(STORAGE_KEYS.DEPARTMENTS);
     let list: Department[] = [];
     if (data) {
       try {
@@ -626,11 +727,11 @@ export const storage = {
     const cleanCodesSet = new Set(clean.map(d => d.code));
     const newDeleted = deletedCodes.filter(c => !cleanCodesSet.has(c));
     if (newDeleted.length !== deletedCodes.length) {
-      localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(newDeleted));
+      safeSetItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(newDeleted));
     }
 
-    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(clean));
-    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(clean));
+    safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
     notifyDataChanged();
     return await firestoreSync.syncDepartments(clean);
   },
@@ -640,8 +741,8 @@ export const storage = {
     this.recordDeletedDepartment(clean);
     const list = this.getDepartments();
     const filtered = list.filter(d => (d.code || '').trim().toUpperCase() !== clean);
-    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(filtered));
-    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(filtered));
+    safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
 
     const fallbackDept = filtered.find(d => d.code === 'RST')?.code || filtered[0]?.code || 'GM';
 
@@ -692,7 +793,7 @@ export const storage = {
   },
 
   getEmployees(): Employee[] {
-    const data = localStorage.getItem(STORAGE_KEYS.EMPLOYEES);
+    const data = safeGetItem(STORAGE_KEYS.EMPLOYEES);
     if (!data) {
       const deletedNos = new Set(this.getDeletedEmployeeNos().map(x => x.trim().toUpperCase()));
       return INITIAL_EMPLOYEES.filter(e => {
@@ -761,15 +862,15 @@ export const storage = {
     });
     this.unrecordDeletedEmployees(identifiersToUnrecord);
 
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(uniqueEmployees));
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(uniqueEmployees));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
     notifyDataChanged();
     return await firestoreSync.syncEmployees(uniqueEmployees);
   },
 
   getDeletedEmployeeNos(): string[] {
     try {
-      const data = localStorage.getItem(STORAGE_KEYS.DELETED_EMPLOYEES);
+      const data = safeGetItem(STORAGE_KEYS.DELETED_EMPLOYEES);
       return data ? JSON.parse(data) : [];
     } catch {
       return [];
@@ -783,7 +884,7 @@ export const storage = {
       const toRemove = new Set(identifiers.map(x => String(x || '').trim().toUpperCase()).filter(Boolean));
       const filtered = current.filter(x => !toRemove.has(x.trim().toUpperCase()));
       if (filtered.length !== current.length) {
-        localStorage.setItem(STORAGE_KEYS.DELETED_EMPLOYEES, JSON.stringify(filtered));
+        safeSetItem(STORAGE_KEYS.DELETED_EMPLOYEES, JSON.stringify(filtered));
       }
     } catch (e) {
       console.warn('unrecordDeletedEmployees warning:', e);
@@ -807,7 +908,7 @@ export const storage = {
         }
       });
       if (changed) {
-        localStorage.setItem(STORAGE_KEYS.DELETED_EMPLOYEES, JSON.stringify(current));
+        safeSetItem(STORAGE_KEYS.DELETED_EMPLOYEES, JSON.stringify(current));
       }
     } catch (e) {
       console.warn('recordDeletedEmployee warning:', e);
@@ -862,8 +963,8 @@ export const storage = {
       return !matchEmpNo && !matchGid && !matchCode && !isDemoEmployee(e);
     });
 
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(filtered));
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(filtered));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
     notifyDataChanged();
     
     // Non-blocking background sync so UI never hangs or freezes
@@ -1062,34 +1163,34 @@ export const storage = {
     });
 
     // 7. Synchronously persist all changes immediately so UI updates instantaneously
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(emps));
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(emps));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
 
     if (plansChanged) {
-      localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(updatedPlans));
-      localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+      safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(updatedPlans));
+      safeSetItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
     }
 
     if (punchesChanged) {
       memoryPunchesCache = updatedPunches;
       try {
-        localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(updatedPunches));
-        localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+        safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(updatedPunches));
+        safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
       } catch (err) {
         console.warn('LocalStorage quota warning saving punches:', err);
       }
     }
 
     if (otChanged) {
-      localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(updatedOT));
+      safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(updatedOT));
     }
 
     if (allowChanged) {
-      localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(updatedAllow));
+      safeSetItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(updatedAllow));
     }
 
     if (overridesChanged) {
-      localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(newOverrides));
+      safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(newOverrides));
     }
 
     notifyDataChanged();
@@ -1128,7 +1229,7 @@ export const storage = {
   },
 
   getShiftCodes(): ShiftCode[] {
-    const data = localStorage.getItem(STORAGE_KEYS.SHIFT_CODES);
+    const data = safeGetItem(STORAGE_KEYS.SHIFT_CODES);
     if (!data) {
       return INITIAL_SHIFT_CODES;
     }
@@ -1182,8 +1283,8 @@ export const storage = {
       department: (c.department || 'ALL').trim(),
       updatedAt: c.updatedAt || nowIso,
     }));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(stamped));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(stamped));
+    safeSetItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
     notifyDataChanged();
     // Targeted sync in bundled collection (1 write)
     const res = await firestoreSync.syncShiftCodes(stamped);
@@ -1194,7 +1295,7 @@ export const storage = {
   },
 
   getShiftPlans(): DailyShiftPlan[] {
-    const data = localStorage.getItem(STORAGE_KEYS.SHIFT_PLANS);
+    const data = safeGetItem(STORAGE_KEYS.SHIFT_PLANS);
     if (!data) {
       return [];
     }
@@ -1208,19 +1309,241 @@ export const storage = {
       return [];
     }
   },
-  async setShiftPlans(plans: DailyShiftPlan[]): Promise<boolean> {
+  async setShiftPlans(plans: DailyShiftPlan[], newlyChangedPlans?: DailyShiftPlan[]): Promise<boolean> {
     const cleanPlans = (plans || []).filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
-    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+
+    // Synchronize manualOverrides so no stale override shift code conflicts with the new shift plan
+    const overrides = this.getManualOverrides();
+    let overridesChanged = false;
+
+    cleanPlans.forEach(p => {
+      if (!p.date || !p.shiftCode) return;
+      const cleanEmp = (p.empNo || '').trim().toUpperCase();
+      const cleanGid = (p.gid || '').trim().toUpperCase();
+      const cleanDigits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
+
+      const empKeys = new Set<string>();
+      if (cleanEmp) empKeys.add(`${cleanEmp}_${p.date}`);
+      if (cleanGid) empKeys.add(`${cleanGid}_${p.date}`);
+      if (cleanDigits) {
+        empKeys.add(`${cleanDigits}_${p.date}`);
+        empKeys.add(`${cleanDigits.padStart(4, '0')}_${p.date}`);
+      }
+
+      empKeys.forEach(k => {
+        if (overrides[k] && overrides[k].shiftCode && overrides[k].shiftCode !== p.shiftCode) {
+          overrides[k] = { ...overrides[k], shiftCode: p.shiftCode };
+          overridesChanged = true;
+        }
+      });
+    });
+
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+
+    if (overridesChanged) {
+      safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(overrides));
+      firestoreSync.syncManualOverrides(overrides).catch(console.warn);
+    }
+
     notifyDataChangedImmediate();
-    return await firestoreSync.syncShiftPlans(cleanPlans);
+    return await firestoreSync.syncShiftPlans(cleanPlans, newlyChangedPlans);
+  },
+  async saveShiftPlan(plan: DailyShiftPlan): Promise<boolean> {
+    const current = this.getShiftPlans();
+    const cleanEmp = (plan.empNo || '').trim().toUpperCase();
+    const cleanGid = (plan.gid || '').trim().toUpperCase();
+    const cleanDigits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
+    const nowIso = new Date().toISOString();
+
+    const stampedPlan: DailyShiftPlan = {
+      ...plan,
+      empNo: plan.empNo ? plan.empNo.trim() : '',
+      gid: plan.gid ? plan.gid.trim() : '',
+      updatedAt: nowIso,
+    };
+
+    const filtered = current.filter(p => {
+      if (p.date !== plan.date) return true;
+      const pEmp = (p.empNo || '').trim().toUpperCase();
+      const pGid = (p.gid || '').trim().toUpperCase();
+      const pDigits = pEmp.replace(/\D/g, '').replace(/^0+/, '');
+      const isMatch = (
+        (cleanEmp && pEmp && cleanEmp === pEmp) ||
+        (cleanGid && pGid && cleanGid === pGid) ||
+        (cleanDigits && pDigits && cleanDigits === pDigits) ||
+        (cleanEmp && pGid && cleanEmp === pGid) ||
+        (cleanGid && pEmp && cleanGid === pEmp)
+      );
+      return !isMatch;
+    });
+
+    filtered.push(stampedPlan);
+
+    // Synchronize manualOverrides so no stale override shift code conflicts with the new shift plan
+    const overrides = this.getManualOverrides();
+    let overridesChanged = false;
+    const empKeys = [
+      `${cleanEmp}_${plan.date}`,
+      cleanGid ? `${cleanGid}_${plan.date}` : '',
+      cleanDigits ? `${cleanDigits}_${plan.date}` : '',
+      cleanDigits ? `${cleanDigits.padStart(4, '0')}_${plan.date}` : '',
+    ].filter(Boolean);
+
+    empKeys.forEach(k => {
+      if (overrides[k] && overrides[k].shiftCode && overrides[k].shiftCode !== plan.shiftCode) {
+        overrides[k] = { ...overrides[k], shiftCode: plan.shiftCode };
+        overridesChanged = true;
+      }
+    });
+
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(filtered));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+
+    if (overridesChanged) {
+      safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(overrides));
+      firestoreSync.syncManualOverrides(overrides).catch(console.warn);
+    }
+
+    notifyDataChangedImmediate();
+    return await firestoreSync.saveShiftPlanDirect(stampedPlan, filtered);
+  },
+
+  getCanonicalEmpIdMap(): Map<string, string> {
+    const map = new Map<string, string>();
+    const employees = this.getEmployees();
+    employees.forEach(e => {
+      if (!e) return;
+      const cleanNo = (e.empNo || '').trim().toUpperCase();
+      const cleanGid = (e.gid || '').trim().toUpperCase();
+      const cleanCode = (e.empCode || '').trim().toUpperCase();
+      const targetId = cleanNo || cleanGid;
+
+      if (cleanNo) map.set(cleanNo, targetId);
+      if (cleanGid) {
+        map.set(cleanGid, targetId);
+        const gidClean = cleanGid.replace(/[^A-Z0-9]/g, '');
+        if (gidClean) map.set(gidClean, targetId);
+      }
+      if (cleanCode) map.set(cleanCode, targetId);
+      const digits = cleanNo.replace(/\D/g, '').replace(/^0+/, '');
+      if (digits) {
+        if (!map.has(digits)) map.set(digits, targetId);
+        if (!map.has(digits.padStart(4, '0'))) map.set(digits.padStart(4, '0'), targetId);
+        if (!map.has(`1000${digits.padStart(4, '0')}`)) map.set(`1000${digits.padStart(4, '0')}`, targetId);
+      }
+    });
+    return map;
+  },
+
+  mergeCloudShiftPlans(incomingPlans: DailyShiftPlan[]) {
+    if (!Array.isArray(incomingPlans) || incomingPlans.length === 0) return;
+    const currentPlans = this.getShiftPlans();
+    const overrides = this.getManualOverrides();
+    let overridesChanged = false;
+    const empCanonicalMap = this.getCanonicalEmpIdMap();
+
+    const planMap = new Map<string, DailyShiftPlan>();
+
+    // 1. Populate planMap with current local plans
+    currentPlans.forEach(p => {
+      if (!p || !p.date || !p.shiftCode) return;
+      const cleanEmp = (p.empNo || '').trim().toUpperCase();
+      const cleanGid = (p.gid || '').trim().toUpperCase();
+      const cleanDigits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
+
+      const canonicalId = (
+        empCanonicalMap.get(cleanEmp) ||
+        empCanonicalMap.get(cleanGid) ||
+        empCanonicalMap.get(cleanDigits) ||
+        cleanEmp ||
+        cleanGid ||
+        cleanDigits
+      );
+      const key = `${canonicalId}_${p.date}`;
+
+      const existing = planMap.get(key);
+      if (!existing) {
+        planMap.set(key, p);
+      } else {
+        const existingTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+        const newTime = p.updatedAt ? new Date(p.updatedAt).getTime() : 0;
+        if (isNaN(existingTime) || (newTime >= (isNaN(existingTime) ? 0 : existingTime))) {
+          planMap.set(key, p);
+        }
+      }
+    });
+
+    // 2. Merge incoming cloud plans cleanly based on timestamp
+    incomingPlans.forEach(p => {
+      if (!p || !p.date || !p.shiftCode) return;
+      const cleanEmp = (p.empNo || '').trim().toUpperCase();
+      const cleanGid = (p.gid || '').trim().toUpperCase();
+      const cleanDigits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
+
+      const canonicalId = (
+        empCanonicalMap.get(cleanEmp) ||
+        empCanonicalMap.get(cleanGid) ||
+        empCanonicalMap.get(cleanDigits) ||
+        cleanEmp ||
+        cleanGid ||
+        cleanDigits
+      );
+      const key = `${canonicalId}_${p.date}`;
+
+      const existing = planMap.get(key);
+      const existingTime = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+      const newTime = p.updatedAt ? new Date(p.updatedAt).getTime() : 0;
+
+      const validExisting = isNaN(existingTime) ? 0 : existingTime;
+      const validNew = isNaN(newTime) ? 0 : newTime;
+
+      if (!existing || validNew >= validExisting) {
+        planMap.set(key, {
+          ...(existing || {}),
+          ...p,
+          empNo: p.empNo || existing?.empNo || '',
+          gid: p.gid || existing?.gid || '',
+          department: p.department || existing?.department,
+          shiftCode: p.shiftCode,
+          updatedAt: p.updatedAt || existing?.updatedAt,
+        });
+
+        // Keep manualOverrides in sync if present
+        const empKeys = new Set<string>();
+        if (cleanEmp) empKeys.add(`${cleanEmp}_${p.date}`);
+        if (cleanGid) empKeys.add(`${cleanGid}_${p.date}`);
+        if (cleanDigits) {
+          empKeys.add(`${cleanDigits}_${p.date}`);
+          empKeys.add(`${cleanDigits.padStart(4, '0')}_${p.date}`);
+        }
+        if (canonicalId) empKeys.add(`${canonicalId}_${p.date}`);
+
+        empKeys.forEach(k => {
+          if (overrides[k] && overrides[k].shiftCode && overrides[k].shiftCode !== p.shiftCode) {
+            overrides[k] = { ...overrides[k], shiftCode: p.shiftCode };
+            overridesChanged = true;
+          }
+        });
+      }
+    });
+
+    const merged = Array.from(planMap.values());
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(merged));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+
+    if (overridesChanged) {
+      safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(overrides));
+    }
+
+    notifyDataChangedImmediate();
   },
 
   getBiometricPunches(): BiometricRawPunch[] {
     if (memoryPunchesCache !== null) {
       return memoryPunchesCache;
     }
-    const data = localStorage.getItem(STORAGE_KEYS.RAW_PUNCHES);
+    const data = safeGetItem(STORAGE_KEYS.RAW_PUNCHES);
     if (!data) {
       memoryPunchesCache = [];
       return memoryPunchesCache;
@@ -1253,15 +1576,15 @@ export const storage = {
 
     // 2. Persist to LocalStorage with quota exhaustion safety
     try {
-      localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
-      localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+      safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
+      safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
     } catch (storageErr) {
       console.warn('LocalStorage quota limit reached for full biometric dataset; falling back to memory & Firestore persistence:', storageErr);
       // Try keeping the most recent 15,000 punches in localStorage if quota exceeded
       try {
         const trimmedForLocalStorage = cleanPunches.slice(-15000);
-        localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(trimmedForLocalStorage));
-        localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+        safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(trimmedForLocalStorage));
+        safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
       } catch {}
     }
 
@@ -1281,7 +1604,7 @@ export const storage = {
   },
 
   getOTRecords(): OTRecord[] {
-    const data = localStorage.getItem(STORAGE_KEYS.OT_RECORDS);
+    const data = safeGetItem(STORAGE_KEYS.OT_RECORDS);
     if (!data) {
       return [];
     }
@@ -1298,13 +1621,13 @@ export const storage = {
   async setOTRecords(records: OTRecord[]): Promise<boolean> {
     const sanitized = sanitizeOTRecords(records || []);
     const cleanRecords = sanitized.filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
-    localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanRecords));
+    safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanRecords));
     notifyDataChanged();
     return await firestoreSync.syncOTRecords(cleanRecords);
   },
 
   getOtherAllowances(): OtherAllowance[] {
-    const data = localStorage.getItem(STORAGE_KEYS.OTHER_ALLOWANCES);
+    const data = safeGetItem(STORAGE_KEYS.OTHER_ALLOWANCES);
     if (!data) {
       return [];
     }
@@ -1320,13 +1643,13 @@ export const storage = {
   },
   async setOtherAllowances(allw: OtherAllowance[]): Promise<boolean> {
     const cleanAllowances = (allw || []).filter(a => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
-    localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleanAllowances));
+    safeSetItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleanAllowances));
     notifyDataChanged();
     return await firestoreSync.syncOtherAllowances(cleanAllowances);
   },
 
   getManualOverrides(): Record<string, Partial<TimeSheetRow>> {
-    const data = localStorage.getItem(STORAGE_KEYS.MANUAL_OVERRIDES);
+    const data = safeGetItem(STORAGE_KEYS.MANUAL_OVERRIDES);
     if (!data) return {};
     try {
       const parsed = JSON.parse(data);
@@ -1357,7 +1680,7 @@ export const storage = {
         }
       });
     }
-    localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cleanOverrides));
+    safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cleanOverrides));
     notifyDataChanged();
     return await firestoreSync.syncManualOverrides(cleanOverrides);
   },
@@ -1396,8 +1719,8 @@ export const storage = {
             department: (c.department || 'ALL').trim(),
             name: (c.name || c.code).trim(),
           }));
-          localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(cleanCodes));
-          localStorage.setItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
+          safeSetItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(cleanCodes));
+          safeSetItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
         }
 
         // 2. BIOMETRIC PUNCHES (Cloud is authoritative master)
@@ -1408,11 +1731,11 @@ export const storage = {
           );
           memoryPunchesCache = cleanPunches;
           try {
-            localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
-            localStorage.setItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
+            safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
+            safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
           } catch {
             try {
-              localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches.slice(-15000)));
+              safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches.slice(-15000)));
             } catch {}
           }
         }
@@ -1421,23 +1744,22 @@ export const storage = {
         if (cloudData.employees && cloudData.employees.length > 0) {
           const cleanCloudEmps = cloudData.employees.filter(e => e && e.empNo && !isDemoEmployee(e));
           if (cleanCloudEmps.length > 0) {
-            localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanCloudEmps));
-            localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+            safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanCloudEmps));
+            safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
           }
         }
 
-        // 4. SHIFT PLANS (Cloud is authoritative master)
+        // 4. SHIFT PLANS (Cloud is authoritative master with conflict-free timestamp merge)
         if ((cloudData as any).hasShiftPlansBundle || (cloudData.shiftPlans && cloudData.shiftPlans.length > 0)) {
           const cleanPlans = (cloudData.shiftPlans || []).filter(p => p && (!p.date || p.date >= HISTORY_CUTOFF_DATE) && (p.empNo || p.gid));
-          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
-          localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+          this.mergeCloudShiftPlans(cleanPlans);
         }
 
         // 5. DEPARTMENTS & DELETED DEPARTMENTS (Cloud is authoritative master)
         if (cloudData.deletedDepartments && Array.isArray(cloudData.deletedDepartments) && cloudData.deletedDepartments.length > 0) {
           const currentDeleted = new Set(this.getDeletedDepartmentCodes());
           cloudData.deletedDepartments.forEach(d => currentDeleted.add(d.trim().toUpperCase()));
-          localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(currentDeleted)));
+          safeSetItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(currentDeleted)));
         }
 
         if (cloudData.departments && cloudData.departments.length > 0) {
@@ -1447,43 +1769,31 @@ export const storage = {
             .map(d => ({ ...d, code: d.code.trim().toUpperCase(), name: (d.name || d.code).trim() }))
             .sort((a, b) => a.code.localeCompare(b.code));
           if (cleanDepts.length > 0) {
-            localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
-            localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+            safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
+            safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
           }
         }
 
         // 6. OT RECORDS (Cloud is authoritative master)
         if ((cloudData as any).hasOTBundle || (cloudData.otRecords && cloudData.otRecords.length > 0)) {
           const cleanOT = (cloudData.otRecords || []).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
-          localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanOT));
+          safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanOT));
         }
 
         // 7. OTHER ALLOWANCES (Cloud is authoritative master)
         if (cloudData.otherAllowances && cloudData.otherAllowances.length > 0) {
           const cleanAllw = cloudData.otherAllowances.filter(a => !a.monthYear || a.monthYear >= HISTORY_CUTOFF_MONTH);
-          localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleanAllw));
+          safeSetItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify(cleanAllw));
         }
 
-        // 8. USERS (Cloud is authoritative master)
+        // 8. USERS (Cloud is authoritative master with safe merge)
         if (cloudData.users && cloudData.users.length > 0) {
-          const deletedKeys = new Set(this.getDeletedUserKeys());
-          const cleanCloudUsers = cloudData.users.filter(u => {
-            if (!u) return false;
-            if (isDemoUser(u)) return false;
-            const cleanEmail = (u.email || '').trim().toLowerCase();
-            const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
-            if (!isProtected) {
-              if (u.id && deletedKeys.has(u.id)) return false;
-              if (u.email && deletedKeys.has(cleanEmail)) return false;
-            }
-            return true;
-          });
-          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanCloudUsers));
+          this.updateUsersFromCloud(cloudData.users);
         }
 
         // 9. MANUAL OVERRIDES (Cloud is authoritative master)
         if (cloudData.manualOverrides && Object.keys(cloudData.manualOverrides).length > 0) {
-          localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cloudData.manualOverrides));
+          safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify(cloudData.manualOverrides));
         }
 
         // Asynchronously purge any cloud demo user records in the background
@@ -1491,96 +1801,13 @@ export const storage = {
 
         notifyDataChanged();
 
-        // Setup real-time listener
-        if (!cloudListenerAttached) {
-          cloudListenerAttached = true;
-          subscribeToCloudChanges(async () => {
-            try {
-              const fresh = await firestoreSync.fetchAllFromCloud();
-              if (fresh && fresh.hasData) {
-                if (fresh.shiftCodes && fresh.shiftCodes.length > 0) {
-                  localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(fresh.shiftCodes));
-                }
-                if (fresh.employees && fresh.employees.length > 0) {
-                  const cleanFreshEmps = fresh.employees.filter(e => e && e.empNo && !isDemoEmployee(e));
-                  if (cleanFreshEmps.length > 0) {
-                    const localEmps = this.getEmployees();
-                    const localMod = parseInt(localStorage.getItem(STORAGE_KEYS.EMPLOYEES_MODIFIED) || '0', 10);
-                    const isFreshLocalEdit = localEmps.length > 0 && (Date.now() - localMod < 6000);
-                    
-                    if (!isFreshLocalEdit) {
-                      localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanFreshEmps));
-                      localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
-                    }
-                  }
-                }
-                if (fresh.deletedDepartments && Array.isArray(fresh.deletedDepartments) && fresh.deletedDepartments.length > 0) {
-                  const currentDeleted = new Set(this.getDeletedDepartmentCodes());
-                  fresh.deletedDepartments.forEach(d => currentDeleted.add(d.trim().toUpperCase()));
-                  localStorage.setItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(currentDeleted)));
-                }
-                if (fresh.departments && fresh.departments.length > 0) {
-                  const deletedCodes = new Set(this.getDeletedDepartmentCodes());
-                  const cleanFreshDepts = fresh.departments
-                    .filter(d => d && d.code && !deletedCodes.has(d.code.trim().toUpperCase()))
-                    .map(d => ({ ...d, code: d.code.trim().toUpperCase(), name: (d.name || d.code).trim() }))
-                    .sort((a, b) => a.code.localeCompare(b.code));
-                  if (cleanFreshDepts.length > 0) {
-                    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanFreshDepts));
-                    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
-                  }
-                }
-                if (fresh.shiftPlans && fresh.shiftPlans.length > 0) {
-                  localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(fresh.shiftPlans));
-                }
-                if (fresh.users && fresh.users.length > 0) {
-                  const deletedKeys = new Set(this.getDeletedUserKeys());
-                  const cleanFreshUsers = fresh.users.filter(u => {
-                    if (!u) return false;
-                    if (isDemoUser(u)) return false;
-                    const cleanEmail = (u.email || '').trim().toLowerCase();
-                    const isProtected = u.isGoogleAccount || u.status === 'Active' || u.status === 'Pending_Approval' || cleanEmail.endsWith('@siemens.com') || cleanEmail.endsWith('@gmail.com');
-                    if (!isProtected) {
-                      if (u.id && deletedKeys.has(u.id)) return false;
-                      if (u.email && deletedKeys.has(cleanEmail)) return false;
-                    }
-                    return true;
-                  });
-                  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanFreshUsers));
-                }
-                if (fresh.punches && fresh.punches.length > 0 && !isLocalSavingPunches) {
-                  const cleanFreshPunches = fresh.punches.filter(
-                    (p): p is BiometricRawPunch =>
-                      Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '')
-                  );
-                  memoryPunchesCache = cleanFreshPunches;
-                  localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanFreshPunches));
-                }
-                if ((fresh as any).hasShiftPlansBundle || (fresh.shiftPlans && fresh.shiftPlans.length > 0)) {
-                  const cleanFreshPlans = (fresh.shiftPlans || []).filter(p => p && (!p.date || p.date >= HISTORY_CUTOFF_DATE) && (p.empNo || p.gid));
-                  localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanFreshPlans));
-                  localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
-                }
-                if ((fresh as any).hasOTBundle || (fresh.otRecords && fresh.otRecords.length > 0)) {
-                  const cleanFreshOT = (fresh.otRecords || []).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
-                  localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanFreshOT));
-                }
-                if (fresh.manualOverrides && Object.keys(fresh.manualOverrides).length > 0) {
-                  const currentLocal = this.getManualOverrides();
-                  localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({ ...fresh.manualOverrides, ...currentLocal }));
-                }
-                notifyDataChanged();
-              }
-            } catch (err) {
-              console.warn('Real-time sync refresh error:', err);
-            }
-          });
-        }
-
         return { connected: true, source: 'cloud' };
       } else {
-        // Cloud is empty on first setup, seed initial dataset to Firestore
-        await this.syncAllToCloud();
+        // Cloud returned no bundled data. If local has initial data, seed once safely
+        const localEmps = this.getEmployees();
+        if (localEmps.length > 0 && isConnected) {
+          await this.syncAllToCloud().catch(console.warn);
+        }
         return { connected: true, source: 'local' };
       }
     } catch (e) {
@@ -1594,19 +1821,19 @@ export const storage = {
     // 1. Clean Shift Codes: remove all codes belonging to RS, SIG, STN, IT or demo codes
     const currentCodes = this.getShiftCodes();
     const cleanCodes = currentCodes.filter(sc => !isDemoShiftCode(sc.code, sc.department));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(cleanCodes));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(cleanCodes));
+    safeSetItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
 
     // 2. Clean Departments: remove RS, SIG, STN, IT
     const currentDepts = this.getDepartments();
     const cleanDepts = currentDepts.filter(d => !isDemoDepartment(d.code));
-    localStorage.setItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
+    safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
 
     // 3. Clean Employees: remove any demo employees & sanitize departments
     const currentEmps = this.getEmployees();
     const cleanEmps = currentEmps.filter(e => e && e.empNo && !isDemoEmployee(e)).map(sanitizeEmployeeDepartment);
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanEmps));
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanEmps));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
 
     // 4. Clean Users: remove any demo user accounts
     const users = this.getUsers();
@@ -1617,19 +1844,19 @@ export const storage = {
       }
       return u;
     });
-    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
+    safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
 
     // 5. Clean Shift Plans: remove any plans that use demo shift codes
     const plans = this.getShiftPlans();
     const cleanPlans = plans.filter(p => !isDemoShiftCode(p.shiftCode, p.department));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
-    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanPlans));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
 
     // 6. Clear operational transaction records
-    localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({}));
+    safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({}));
 
     notifyDataChanged();
 
@@ -1643,25 +1870,25 @@ export const storage = {
   },
 
   getTheme(): 'dark' | 'light' {
-    const data = localStorage.getItem(STORAGE_KEYS.THEME);
+    const data = safeGetItem(STORAGE_KEYS.THEME);
     return data === 'light' ? 'light' : 'dark'; // Default is Dark Mode
   },
   setTheme(theme: 'dark' | 'light') {
-    localStorage.setItem(STORAGE_KEYS.THEME, theme);
+    safeSetItem(STORAGE_KEYS.THEME, theme);
     notifyDataChanged();
   },
 
   resetAllToInitial() {
-    localStorage.removeItem(STORAGE_KEYS.USERS);
-    localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
-    localStorage.removeItem(STORAGE_KEYS.EMPLOYEES);
-    localStorage.removeItem(STORAGE_KEYS.SHIFT_CODES);
-    localStorage.removeItem(STORAGE_KEYS.SHIFT_PLANS);
-    localStorage.removeItem(STORAGE_KEYS.RAW_PUNCHES);
-    localStorage.removeItem(STORAGE_KEYS.OT_RECORDS);
-    localStorage.removeItem(STORAGE_KEYS.OTHER_ALLOWANCES);
-    localStorage.removeItem(STORAGE_KEYS.MANUAL_OVERRIDES);
-    localStorage.removeItem(STORAGE_KEYS.THEME);
+    safeRemoveItem(STORAGE_KEYS.USERS);
+    safeRemoveItem(STORAGE_KEYS.CURRENT_USER);
+    safeRemoveItem(STORAGE_KEYS.EMPLOYEES);
+    safeRemoveItem(STORAGE_KEYS.SHIFT_CODES);
+    safeRemoveItem(STORAGE_KEYS.SHIFT_PLANS);
+    safeRemoveItem(STORAGE_KEYS.RAW_PUNCHES);
+    safeRemoveItem(STORAGE_KEYS.OT_RECORDS);
+    safeRemoveItem(STORAGE_KEYS.OTHER_ALLOWANCES);
+    safeRemoveItem(STORAGE_KEYS.MANUAL_OVERRIDES);
+    safeRemoveItem(STORAGE_KEYS.THEME);
     notifyDataChanged();
   },
   resetToDefaults() {
@@ -1713,12 +1940,12 @@ export const storage = {
 
   // Clear entire data including employee directory if needed
   async clearAllData(): Promise<boolean> {
-    localStorage.setItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify([]));
-    localStorage.setItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({}));
-    localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.OTHER_ALLOWANCES, JSON.stringify([]));
+    safeSetItem(STORAGE_KEYS.MANUAL_OVERRIDES, JSON.stringify({}));
+    safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify([]));
     notifyDataChanged();
 
     try {

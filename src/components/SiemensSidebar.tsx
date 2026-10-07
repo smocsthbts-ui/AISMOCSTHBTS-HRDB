@@ -92,7 +92,7 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
     { 
       id: 'import', 
       label: 'Data Import Center', 
-      sublabel: 'นำเข้าข้อมูลรวม (Punches, OT, Allowances)', 
+      sublabel: 'นำเข้าตารางกะ, สแกนนิ้ว, OT', 
       icon: Upload,
       badge: pendingOTCount > 0 ? `${pendingOTCount} OT` : null,
       badgeColor: 'bg-amber-500 text-slate-950 font-bold'
