@@ -92,7 +92,7 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
     { 
       id: 'import', 
       label: 'Data Import Center', 
-      sublabel: 'นำเข้าตารางกะ, สแกนนิ้ว, OT', 
+      sublabel: 'นำเข้ารหัสกะ, สแกนเข้า-ออก, OT', 
       icon: Upload,
       badge: pendingOTCount > 0 ? `${pendingOTCount} OT` : null,
       badgeColor: 'bg-amber-500 text-slate-950 font-bold'
@@ -281,7 +281,13 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
           <div className="relative shrink-0">
             <UserCircle2 className="w-6 h-6 text-[#00e5e5]" />
             <span className={`absolute bottom-0 right-0 w-2 h-2 rounded-full ${
-              currentUser.role === 'Admin' ? 'bg-red-400' : 'bg-emerald-400'
+              currentUser.role === 'Admin' 
+                ? 'bg-red-400' 
+                : currentUser.role === 'Supervisor' 
+                  ? 'bg-blue-400' 
+                  : currentUser.role === 'General'
+                    ? 'bg-purple-400'
+                    : 'bg-emerald-400'
             }`} />
           </div>
 
@@ -292,7 +298,11 @@ export const SiemensSidebar: React.FC<SiemensSidebarProps> = ({
                 <span className={`text-[9px] px-1 py-0.2 rounded font-mono font-bold ${
                   currentUser.role === 'Admin'
                     ? 'bg-red-500/25 text-red-300 border border-red-500/30'
-                    : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
+                    : currentUser.role === 'Supervisor'
+                      ? 'bg-blue-500/25 text-blue-300 border border-blue-500/30'
+                      : currentUser.role === 'General'
+                        ? 'bg-purple-500/25 text-purple-300 border border-purple-500/30'
+                        : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
                 }`}>
                   {currentUser.role}
                 </span>

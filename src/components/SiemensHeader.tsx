@@ -184,7 +184,11 @@ export const SiemensHeader: React.FC<SiemensHeaderProps> = ({
               <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold ${
                 currentUser.role === 'Admin'
                   ? 'bg-red-500/25 text-red-300 border border-red-500/30'
-                  : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
+                  : currentUser.role === 'Supervisor'
+                    ? 'bg-blue-500/25 text-blue-300 border border-blue-500/30'
+                    : currentUser.role === 'General'
+                      ? 'bg-purple-500/25 text-purple-300 border border-purple-500/30'
+                      : 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30'
               }`}>
                 {currentUser.role}
               </span>

@@ -46,29 +46,42 @@ export function isEmployeeMatch(
   const eNoClean = eNoRaw.replace(/[^a-z0-9]/gi, '');
   const empCodeClean = empCodeRaw.replace(/[^a-z0-9]/gi, '');
 
-  // 1. GID check: If punchIdentifier is a GID (starts with 'z' followed by alphanumeric)
-  const isGIDLike = /^z[0-9a-z]{4,}$/i.test(pRaw);
-  if (isGIDLike) {
-    // A GID punch MUST ONLY match if employee.gid or employee.empNo matches this exact GID
-    return (gidClean && pClean === gidClean) || (eNoClean && pClean === eNoClean);
-  }
-
-  // If employee has a GID, and punch is a different GID
-  if (gidClean && isGIDLike && pClean !== gidClean) {
-    return false;
-  }
-
-  // 2. Direct exact or cleaned match with empNo, GID, or empCode
+  // 1. Direct exact or alphanumeric cleaned match with empNo, GID, or empCode
   if (pRaw === eNoRaw || (gidRaw && pRaw === gidRaw) || (empCodeRaw && pRaw === empCodeRaw)) return true;
   if (gidClean && pClean && pClean === gidClean) return true;
   if (eNoClean && pClean && pClean === eNoClean) return true;
   if (empCodeClean && pClean && pClean === empCodeClean) return true;
 
+  // 2. Thai GID pattern matching (e.g. "Z00149TH", "Z0149TH", "Z0149" vs "0149")
+  const pThaiGidMatch = pRaw.match(/^z0*(\d{1,4})(th)?$/i);
+  const eThaiGidMatch = gidRaw.match(/^z0*(\d{1,4})(th)?$/i);
+  const eDigits = eNoRaw.replace(/\D/g, '');
+  const eNum = eDigits.replace(/^0+/, '');
+
+  if (pThaiGidMatch && pThaiGidMatch[1]) {
+    const pNumFromGid = pThaiGidMatch[1].replace(/^0+/, '');
+    // Compare numeric core with employee empNo
+    if (eNum && pNumFromGid === eNum) return true;
+    // Compare with employee's GID numeric core
+    if (eThaiGidMatch && eThaiGidMatch[1] && pNumFromGid === eThaiGidMatch[1].replace(/^0+/, '')) return true;
+  }
+
+  if (eThaiGidMatch && eThaiGidMatch[1]) {
+    const eNumFromGid = eThaiGidMatch[1].replace(/^0+/, '');
+    const pDigits = pRaw.replace(/\D/g, '');
+    const pNum = pDigits.replace(/^0+/, '');
+    if (pNum && pNum === eNumFromGid) return true;
+  }
+
+  // If punchIdentifier is a non-Thai corporate GID (e.g. Z00430UZ, Z005ABHM), strict match required
+  const isCorporateGid = /^z[0-9a-z]{4,}$/i.test(pRaw) && !pThaiGidMatch;
+  if (isCorporateGid) {
+    return (gidClean && pClean === gidClean) || (eNoClean && pClean === eNoClean);
+  }
+
   // 3. Pure numeric match (handling leading zeros: "0005" vs "5", "0149" vs "149", "01432" vs "1432")
   const pDigits = pRaw.replace(/\D/g, '');
-  const eDigits = eNoRaw.replace(/\D/g, '');
   const pNum = pDigits.replace(/^0+/, '');
-  const eNum = eDigits.replace(/^0+/, '');
 
   if (pNum && eNum && pNum === eNum) return true;
   if (pDigits && eDigits && pDigits.padStart(4, '0') === eDigits.padStart(4, '0')) return true;
@@ -90,13 +103,155 @@ export function isEmployeeMatch(
     if (eSub && eSub === pNum) return true;
   }
 
-  // 5. Alpha-prefix match (e.g. "SM149", "SM-149" vs "149")
+  // 5. Check via getEmployeeLookupKeys for full cross-variant coverage
+  const empKeys = getEmployeeLookupKeys(employee);
+  const pUpper = cleanIdentifier(punchIdentifier).trim().toUpperCase();
+  if (empKeys.has(pUpper)) return true;
+  if (pDigits && empKeys.has(pDigits)) return true;
+  if (pNum && empKeys.has(pNum)) return true;
+
+  // 6. Alpha-prefix match (e.g. "SM149", "SM-149" vs "149")
   if (/^(sm|emp)-?\d+$/i.test(pRaw)) {
     const pAlphaStripped = pRaw.replace(/^[a-z]+-?/i, '').replace(/^0+/, '');
     if (pAlphaStripped && eNum && pAlphaStripped === eNum) return true;
   }
 
   return false;
+}
+
+/**
+ * Universal Employee Identifier Key Generator
+ * Generates all canonical aliases and search tokens for an employee:
+ * - Direct strings (empNo, empCode, gid)
+ * - Uppercase & alphanumeric cleaned (without dashes, dots, spaces)
+ * - Digits only
+ * - Stripped leading zeros ("0503" -> "503", "0082" -> "82", "01346" -> "1346")
+ * - 4-digit zero-padded ("503" -> "0503", "82" -> "0082", "1346" -> "1346")
+ * - 8-digit Payroll code ("10000503", "10000082", "10001346")
+ * - 8-digit Alternative Payroll code ("65090503", "65090082", "65091346")
+ * - Last 4 digits of 7+ digit codes ("10001346" -> "1346", "65091346" -> "1346")
+ * - Last 4 digits stripped leading zeros
+ */
+export function getEmployeeLookupKeys(
+  emp: { empNo?: string | null; gid?: string | null; empCode?: string | null } | null | undefined
+): Set<string> {
+  const keys = new Set<string>();
+  if (!emp) return keys;
+
+  const addVariant = (raw?: string | null, isGid = false) => {
+    if (!raw) return;
+    const clean = cleanIdentifier(raw).trim().toUpperCase();
+    if (!clean) return;
+    keys.add(clean);
+
+    const alphaNum = clean.replace(/[^A-Z0-9]/g, '');
+    if (alphaNum) keys.add(alphaNum);
+
+    if (isGid) {
+      // For GID: only extract numeric Thai employee number if it matches standard Thai GID pattern (e.g. "Z0950TH", "Z1426TH", "Z0149")
+      // Do NOT extract substring digits from arbitrary alphanumeric corporate GIDs like "Z004Z3KX" (which is NOT employee 43)
+      const thaiGidMatch = clean.match(/^Z0*(\d{1,4})(TH)?$/i);
+      if (thaiGidMatch && thaiGidMatch[1]) {
+        const numStr = thaiGidMatch[1];
+        keys.add(numStr);
+        const padded4 = numStr.padStart(4, '0');
+        keys.add(padded4);
+        keys.add(`1000${padded4}`);
+        keys.add(`6509${padded4}`);
+      }
+      return;
+    }
+
+    // For non-GID (empNo or empCode): process numeric variations, stripping leading zeros and padding
+    const digits = clean.replace(/\D/g, '');
+    if (digits) {
+      keys.add(digits);
+      const stripped = digits.replace(/^0+/, '');
+      if (stripped) {
+        keys.add(stripped);
+        const padded4 = stripped.padStart(4, '0');
+        keys.add(padded4);
+        keys.add(`1000${padded4}`);
+        keys.add(`6509${padded4}`);
+      }
+      if (digits.length >= 7) {
+        const last4 = digits.slice(-4);
+        keys.add(last4);
+        const last4Stripped = last4.replace(/^0+/, '');
+        if (last4Stripped) {
+          keys.add(last4Stripped);
+          keys.add(last4Stripped.padStart(4, '0'));
+        }
+      }
+    }
+  };
+
+  addVariant(emp.empNo, false);
+  addVariant(emp.gid, true);
+  addVariant(emp.empCode, false);
+
+  return keys;
+}
+
+/**
+ * Universal Record Key Generator (for Shift Plans, OT Records, Allowances)
+ */
+export function getRecordLookupKeys(
+  record: { empNo?: string | null; gid?: string | null } | null | undefined
+): Set<string> {
+  const keys = new Set<string>();
+  if (!record) return keys;
+
+  const addVariant = (raw?: string | null, isGid = false) => {
+    if (!raw) return;
+    const clean = cleanIdentifier(raw).trim().toUpperCase();
+    if (!clean) return;
+    keys.add(clean);
+
+    const alphaNum = clean.replace(/[^A-Z0-9]/g, '');
+    if (alphaNum) keys.add(alphaNum);
+
+    if (isGid) {
+      // For GID: only extract numeric Thai employee number if it matches standard Thai GID pattern (e.g. "Z0950TH", "Z1426TH", "Z0149")
+      const thaiGidMatch = clean.match(/^Z0*(\d{1,4})(TH)?$/i);
+      if (thaiGidMatch && thaiGidMatch[1]) {
+        const numStr = thaiGidMatch[1];
+        keys.add(numStr);
+        const padded4 = numStr.padStart(4, '0');
+        keys.add(padded4);
+        keys.add(`1000${padded4}`);
+        keys.add(`6509${padded4}`);
+      }
+      return;
+    }
+
+    const digits = clean.replace(/\D/g, '');
+    if (digits) {
+      keys.add(digits);
+      const stripped = digits.replace(/^0+/, '');
+      if (stripped) {
+        keys.add(stripped);
+        const padded4 = stripped.padStart(4, '0');
+        keys.add(padded4);
+        keys.add(`1000${padded4}`);
+        keys.add(`6509${padded4}`);
+      }
+      if (digits.length >= 7) {
+        const last4 = digits.slice(-4);
+        keys.add(last4);
+        const last4Stripped = last4.replace(/^0+/, '');
+        if (last4Stripped) {
+          keys.add(last4Stripped);
+          keys.add(last4Stripped.padStart(4, '0'));
+        }
+      }
+    }
+  };
+
+  addVariant(record.empNo, false);
+  addVariant(record.gid, true);
+
+  return keys;
 }
 
 /**
@@ -109,62 +264,11 @@ export function isEmployeePlanMatch(
 ): boolean {
   if (!record || !employee) return false;
 
-  const rEmpNo = cleanIdentifier(record.empNo).toLowerCase();
-  const rGid = cleanIdentifier(record.gid).toLowerCase();
-  const eEmpNo = cleanIdentifier(employee.empNo).toLowerCase();
-  const eGid = cleanIdentifier(employee.gid).toLowerCase();
-  const eEmpCode = cleanIdentifier(employee.empCode).toLowerCase();
+  const recKeys = getRecordLookupKeys(record);
+  const empKeys = getEmployeeLookupKeys(employee);
 
-  const rCleanGid = rGid.replace(/[^a-z0-9]/gi, '');
-  const eCleanGid = eGid.replace(/[^a-z0-9]/gi, '');
-  const rCleanEmpNo = rEmpNo.replace(/[^a-z0-9]/gi, '');
-  const eCleanEmpNo = eEmpNo.replace(/[^a-z0-9]/gi, '');
-
-  // 1. Direct or clean GID-to-GID match
-  if (rCleanGid && eCleanGid && rCleanGid === eCleanGid) return true;
-
-  // 2. Direct or clean EmpNo-to-EmpNo match
-  if (rCleanEmpNo && eCleanEmpNo && rCleanEmpNo === eCleanEmpNo) return true;
-
-  // 3. GID stored in record.empNo matching employee.gid (e.g. Excel column had GID)
-  if (rCleanEmpNo && eCleanGid && rCleanEmpNo === eCleanGid) return true;
-
-  // 4. EmpNo stored in record.gid matching employee.empNo
-  if (rCleanGid && eCleanEmpNo && rCleanGid === eCleanEmpNo) return true;
-
-  // 5. Numeric EmpNo match with leading zero tolerance (e.g. "0005" vs "5", "0503" vs "503", "0082" vs "82", "1157" vs "1157")
-  const rDigits = rEmpNo.replace(/\D/g, '');
-  const eDigits = eEmpNo.replace(/\D/g, '');
-  if (rDigits && eDigits) {
-    const rNum = rDigits.replace(/^0+/, '');
-    const eNum = eDigits.replace(/^0+/, '');
-    if (rNum && eNum && rNum === eNum) return true;
-    if (rDigits.padStart(4, '0') === eDigits.padStart(4, '0')) return true;
-  }
-
-  // 6. EmpCode (Payroll) match (e.g. "10000503" vs "503", "10000082" vs "82", "65091157" vs "1157")
-  if (eEmpCode) {
-    const eCodeClean = eEmpCode.replace(/[^a-z0-9]/gi, '');
-    if (rCleanEmpNo && (rCleanEmpNo === eCodeClean || rCleanGid === eCodeClean)) return true;
-    const eCodeDigits = eEmpCode.replace(/\D/g, '').replace(/^0+/, '');
-    if (rDigits) {
-      const rNum = rDigits.replace(/^0+/, '');
-      if (rNum && eCodeDigits && rNum === eCodeDigits) return true;
-    }
-  }
-
-  // 7. Check if record.empNo starts with common payroll prefix (10000 or 6509) matching employee.empNo
-  if (rDigits && eDigits) {
-    const rNum = rDigits.replace(/^0+/, '');
-    const eNum = eDigits.replace(/^0+/, '');
-    if (rNum.length >= 7 && (rNum.startsWith('1000') || rNum.startsWith('6509') || rNum.startsWith('650'))) {
-      const rStripped = rNum.replace(/^(10000|1000|6509|650)/, '').replace(/^0+/, '');
-      if (rStripped && eNum && rStripped === eNum) return true;
-    }
-    if (eNum.length >= 7 && (eNum.startsWith('1000') || eNum.startsWith('6509') || eNum.startsWith('650'))) {
-      const eStripped = eNum.replace(/^(10000|1000|6509|650)/, '').replace(/^0+/, '');
-      if (eStripped && rNum && eStripped === rNum) return true;
-    }
+  for (const k of recKeys) {
+    if (empKeys.has(k)) return true;
   }
 
   return false;
@@ -1245,66 +1349,22 @@ export function buildTimeSheetForEmployee(
   });
 
   // PRE-INDEXED LOOKUPS (O(1) per day)
-  // Shift Plan resolution: matches ShiftRosterView exactly (EmpNo primary, GID fallback)
-  const empPlanMap = new Map<string, DailyShiftPlan>();
-  const empNoClean = cleanIdentifier(employee.empNo).toUpperCase();
-  const empNoDigits = empNoClean.replace(/\D/g, '').replace(/^0+/, '');
-  const empNoPadded = empNoDigits ? empNoDigits.padStart(4, '0') : '';
-  const empGidClean = cleanIdentifier(employee.gid).toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const empCodeClean = cleanIdentifier(employee.empCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  // Shift Plan resolution: matches ShiftRosterView exactly (all canonical identifier variants)
+  const empPlanLookupMap = new Map<string, DailyShiftPlan>();
+  const empLookupKeys = getEmployeeLookupKeys(employee);
 
-  // Pre-filter candidate plans for this employee if a global array was passed, avoiding sorting thousands of irrelevant plans
-  const candidatePlans = (shiftPlans && shiftPlans.length > 60)
-    ? shiftPlans.filter(sp => sp && isEmployeePlanMatch(sp, employee))
-    : (shiftPlans || []);
-
-  // Sort candidate shift plans by updatedAt ascending so newest plans always take precedence
-  const sortedPlans = [...candidatePlans].sort((a, b) => {
+  // Filter plans for this month and sort by updatedAt ascending so newest plans overwrite older plans
+  const sortedPlans = (shiftPlans || []).filter(sp => sp && sp.date && sp.date.startsWith(monthYear)).sort((a, b) => {
     const timeA = a && a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
     const timeB = b && b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
-    const vA = isNaN(timeA) ? 0 : timeA;
-    const vB = isNaN(timeB) ? 0 : timeB;
-    return vA - vB;
+    return (isNaN(timeA) ? 0 : timeA) - (isNaN(timeB) ? 0 : timeB);
   });
 
-  // Pre-index shiftPlans by EmpNo and by GID
-  const planByEmpNo = new Map<string, DailyShiftPlan>();
-  const planByGid = new Map<string, DailyShiftPlan>();
-
   for (const sp of sortedPlans) {
-    if (!sp || !sp.date) continue;
-    const spEmp = cleanIdentifier(sp.empNo).toUpperCase();
-    const spGid = cleanIdentifier(sp.gid).toUpperCase().replace(/[^A-Z0-9]/g, '');
-
-    if (spEmp) {
-      planByEmpNo.set(`${spEmp}_${sp.date}`, sp);
-      const spDigits = spEmp.replace(/\D/g, '').replace(/^0+/, '');
-      if (spDigits) {
-        planByEmpNo.set(`${spDigits}_${sp.date}`, sp);
-        planByEmpNo.set(`${spDigits.padStart(4, '0')}_${sp.date}`, sp);
-        planByEmpNo.set(`1000${spDigits.padStart(4, '0')}_${sp.date}`, sp);
-      }
-    }
-    if (spGid) {
-      planByGid.set(`${spGid}_${sp.date}`, sp);
-    }
-  }
-
-  // Populate empPlanMap for each date (EmpNo check first, then GID fallback)
-  for (const sp of sortedPlans) {
-    if (!sp || !sp.date) continue;
-    const date = sp.date;
-
-    let matched: DailyShiftPlan | undefined;
-    if (empNoClean) matched = planByEmpNo.get(`${empNoClean}_${date}`);
-    if (!matched && empNoDigits) matched = planByEmpNo.get(`${empNoDigits}_${date}`);
-    if (!matched && empNoPadded) matched = planByEmpNo.get(`${empNoPadded}_${date}`);
-    if (!matched && empNoDigits) matched = planByEmpNo.get(`1000${empNoDigits.padStart(4, '0')}_${date}`);
-    if (!matched && empCodeClean) matched = planByEmpNo.get(`${empCodeClean}_${date}`);
-    if (!matched && empGidClean) matched = planByGid.get(`${empGidClean}_${date}`);
-
-    if (matched) {
-      empPlanMap.set(date, matched);
+    if (!sp || !sp.date || !sp.shiftCode) continue;
+    const spKeys = getRecordLookupKeys(sp);
+    for (const k of spKeys) {
+      empPlanLookupMap.set(`${k}_${sp.date}`, sp);
     }
   }
 
@@ -1372,8 +1432,12 @@ export function buildTimeSheetForEmployee(
     const dayOfWeek = dayNames[dateObj.getDay()];
     const dayString = `${dayPadded}-${mm}-${yy} ${dayOfWeek}`;
 
-    // Find shift code for this day from plan (O(1))
-    const plan = empPlanMap.get(dateStr);
+    // Find shift code for this day from plan (O(1), identically matching ShiftRosterView)
+    let plan: DailyShiftPlan | undefined;
+    for (const k of empLookupKeys) {
+      plan = empPlanLookupMap.get(`${k}_${dateStr}`);
+      if (plan) break;
+    }
     const shiftCodeVal = plan ? plan.shiftCode : (dayOfWeek === 'Sat' || dayOfWeek === 'Sun' ? 'OFF' : 'D');
 
     // Check if there are manual overrides saved for this day
@@ -1702,30 +1766,14 @@ export function buildTimeSheetsInBatch(
   const plansByEmpKey = new Map<string, DailyShiftPlan[]>();
   for (const sp of sortedPlans) {
     if (!sp || !sp.date) continue;
-    const spEmp = cleanIdentifier(sp.empNo).toUpperCase();
-    const spGid = cleanIdentifier(sp.gid).toUpperCase().replace(/[^A-Z0-9]/g, '');
-
-    const addSp = (k: string) => {
-      if (!k) return;
+    const spKeys = getRecordLookupKeys(sp);
+    for (const k of spKeys) {
       let list = plansByEmpKey.get(k);
       if (!list) {
         list = [];
         plansByEmpKey.set(k, list);
       }
       list.push(sp);
-    };
-
-    if (spEmp) {
-      addSp(spEmp);
-      const digits = spEmp.replace(/\D/g, '').replace(/^0+/, '');
-      if (digits) {
-        addSp(digits);
-        addSp(digits.padStart(4, '0'));
-        addSp(`1000${digits.padStart(4, '0')}`);
-      }
-    }
-    if (spGid) {
-      addSp(spGid);
     }
   }
 
@@ -1831,11 +1879,14 @@ export function buildTimeSheetsInBatch(
     if (empCodeClean && punchesById.has(empCodeClean)) punchesById.get(empCodeClean)!.forEach(p => empPunchesSet.add(p));
 
     // Collect shift plans for this employee from indexed pre-sorted map
+    const empLookupKeys = getEmployeeLookupKeys(employee);
     const empPlanSet = new Set<DailyShiftPlan>();
-    if (empNoClean && plansByEmpKey.has(empNoClean)) plansByEmpKey.get(empNoClean)!.forEach(p => empPlanSet.add(p));
-    if (empNoDigits && plansByEmpKey.has(empNoDigits)) plansByEmpKey.get(empNoDigits)!.forEach(p => empPlanSet.add(p));
-    if (empGidClean && plansByEmpKey.has(empGidClean)) plansByEmpKey.get(empGidClean)!.forEach(p => empPlanSet.add(p));
-    if (empCodeClean && plansByEmpKey.has(empCodeClean)) plansByEmpKey.get(empCodeClean)!.forEach(p => empPlanSet.add(p));
+    for (const k of empLookupKeys) {
+      const list = plansByEmpKey.get(k);
+      if (list) {
+        list.forEach(p => empPlanSet.add(p));
+      }
+    }
     const empShiftPlans = Array.from(empPlanSet);
 
     // Unmatched employees have 0 punches (NEVER pass global allPunches)

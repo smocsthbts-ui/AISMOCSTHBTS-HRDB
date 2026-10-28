@@ -11,7 +11,9 @@ import {
 } from '../types';
 import { 
   buildTimeSheetForEmployee,
-  cleanIdentifier
+  cleanIdentifier,
+  getEmployeeLookupKeys,
+  getRecordLookupKeys
 } from '../utils/timeCalc';
 import { 
   storage 
@@ -36,7 +38,9 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  ShieldCheck
+  ShieldCheck,
+  Info,
+  Eye
 } from 'lucide-react';
 import { MonthYearFilter } from './MonthYearFilter';
 
@@ -73,7 +77,7 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
   // Section / Department filter state
   const [activeDepartment, setActiveDepartment] = useState<string>(() => {
-    if (currentUser.role === 'User' && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
+    if ((currentUser.role === 'User' || currentUser.role === 'Supervisor' || currentUser.role === 'General') && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
       return currentUser.department;
     }
     if (selectedDepartment && selectedDepartment !== 'ALL') return selectedDepartment;
@@ -87,67 +91,41 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
     }
   }, [selectedDepartment]);
 
-  // Synchronize with currentUser department if User role
+  // Synchronize with currentUser department if User, Supervisor or General role
   React.useEffect(() => {
-    if (currentUser.role === 'User' && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
+    if ((currentUser.role === 'User' || currentUser.role === 'Supervisor' || currentUser.role === 'General') && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
       setActiveDepartment(currentUser.department);
       onSelectDepartment?.(currentUser.department);
     }
   }, [currentUser]);
 
-  // Synthesize employees from shiftPlans for current month if any missing from master employees list
+  // State to force re-render on storage or cloud sync updates
+  const [dataVersion, setDataVersion] = useState(0);
+
+  React.useEffect(() => {
+    const handleSync = () => setDataVersion(v => v + 1);
+    window.addEventListener('siemens-data-updated', handleSync);
+    window.addEventListener('storage-changed', handleSync);
+    window.addEventListener('firestore-sync-completed', handleSync);
+    return () => {
+      window.removeEventListener('siemens-data-updated', handleSync);
+      window.removeEventListener('storage-changed', handleSync);
+      window.removeEventListener('firestore-sync-completed', handleSync);
+    };
+  }, []);
+
+  // Active shift plans: authoritative storage data fallback to prevent empty state
+  const activeShiftPlans = useMemo(() => {
+    const stored = storage.getShiftPlans();
+    if (stored && stored.length > 0) return stored;
+    return shiftPlans || [];
+  }, [shiftPlans, dataVersion]);
+
+  // Authoritative employee master list for Time Sheet (strictly from Employee Master, no synthetic/phantom employees)
   const effectiveEmployees = useMemo(() => {
     const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
-    const list = [...baseEmployees];
-    const knownEmpNos = new Set<string>();
-    baseEmployees.forEach(e => {
-      if (e.empNo) {
-        const clean = e.empNo.trim().toUpperCase();
-        knownEmpNos.add(clean);
-        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
-        if (digits) {
-          knownEmpNos.add(digits);
-          knownEmpNos.add(digits.padStart(4, '0'));
-          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
-        }
-      }
-      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
-      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
-    });
-    
-    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
-    (shiftPlans || []).forEach(p => {
-      if (!p || !p.date || !p.date.startsWith(selectedMonthYear)) return;
-      const eNo = (p.empNo || '').trim().toUpperCase();
-      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
-      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
-      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
-        missingEmpsFromPlans.set(eNo, p);
-      }
-    });
-
-    missingEmpsFromPlans.forEach((p, eNo) => {
-      const cleanNo = p.empNo || eNo;
-      const digits = cleanNo.replace(/\D/g, '');
-      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
-      list.push({
-        id: `synth-${paddedNo}`,
-        empNo: paddedNo,
-        empCode: digits ? `1000${paddedNo}` : cleanNo,
-        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
-        firstName: 'พนักงาน',
-        familyName: cleanNo,
-        department: p.department || (selectedDepartment !== 'ALL' ? selectedDepartment : 'GM'),
-        division: 'MO CS BTS',
-        functionTitle: 'Service Technician',
-        costCenter: 'C93051',
-        isShiftWorker: true,
-        isActive: true,
-      });
-    });
-
-    return list;
-  }, [employees, shiftPlans, selectedMonthYear, selectedDepartment]);
+    return baseEmployees.filter(e => Boolean(e && e.empNo && e.isActive !== false));
+  }, [employees]);
 
   // Department options with employee counts
   const departmentOptions = useMemo(() => {
@@ -170,12 +148,15 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
   // Filter employees matching active department
   const selectableEmployees = useMemo(() => {
     return effectiveEmployees.filter(e => {
+      if (currentUser.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+        return isSameDepartment(e.department, currentUser.department);
+      }
       if (activeDepartment !== 'ALL' && !isSameDepartment(e.department, activeDepartment)) {
         return false;
       }
       return true;
     });
-  }, [effectiveEmployees, activeDepartment]);
+  }, [effectiveEmployees, activeDepartment, currentUser.role, currentUser.department]);
 
   // Active employee for timesheet
   const [selectedEmpNo, setSelectedEmpNo] = useState<string>(() => {
@@ -186,16 +167,13 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
   // Keep selectedEmpNo valid if selectableEmployees changes
   const activeEmployee = useMemo(() => {
     if (!selectedEmpNo) return selectableEmployees[0] || effectiveEmployees[0];
-    const cleanSel = cleanIdentifier(selectedEmpNo).toLowerCase();
-    const selDigits = cleanSel.replace(/\D/g, '').replace(/^0+/, '');
+    const selKeys = getEmployeeLookupKeys({ empNo: selectedEmpNo, gid: selectedEmpNo, empCode: selectedEmpNo });
 
     const found = selectableEmployees.find(e => {
-      const eNo = cleanIdentifier(e.empNo).toLowerCase();
-      const eDigits = eNo.replace(/\D/g, '').replace(/^0+/, '');
-      if (eNo === cleanSel) return true;
-      if (selDigits && eDigits && selDigits === eDigits) return true;
-      if (cleanIdentifier(e.gid).toLowerCase() === cleanSel) return true;
-      if (cleanIdentifier(e.empCode).toLowerCase() === cleanSel) return true;
+      const empKeys = getEmployeeLookupKeys(e);
+      for (const k of selKeys) {
+        if (empKeys.has(k)) return true;
+      }
       return false;
     });
     return found || selectableEmployees[0] || effectiveEmployees[0];
@@ -204,12 +182,13 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
   // If current employee is not in selectableEmployees, automatically pick the first in list
   React.useEffect(() => {
     if (selectableEmployees.length > 0) {
-      const cleanSel = cleanIdentifier(selectedEmpNo).toLowerCase();
-      const selDigits = cleanSel.replace(/\D/g, '').replace(/^0+/, '');
+      const selKeys = getEmployeeLookupKeys({ empNo: selectedEmpNo, gid: selectedEmpNo, empCode: selectedEmpNo });
       const exists = selectableEmployees.some(e => {
-        const eNo = cleanIdentifier(e.empNo).toLowerCase();
-        const eDigits = eNo.replace(/\D/g, '').replace(/^0+/, '');
-        return eNo === cleanSel || (selDigits && eDigits && selDigits === eDigits);
+        const empKeys = getEmployeeLookupKeys(e);
+        for (const k of selKeys) {
+          if (empKeys.has(k)) return true;
+        }
+        return false;
       });
       if (!exists) {
         setSelectedEmpNo(selectableEmployees[0].empNo);
@@ -219,6 +198,7 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
   // Department change handler
   const handleDepartmentChange = (dept: string) => {
+    if (currentUser.role === 'General') return; // Role General cannot switch away from their department
     setActiveDepartment(dept);
     onSelectDepartment?.(dept);
     const inDept = effectiveEmployees.filter(e => dept === 'ALL' || isSameDepartment(e.department, dept));
@@ -244,25 +224,19 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
     setSelectedEmpNo(selectableEmployees[nextIndex].empNo);
   };
 
-  // Check editing permission: Strictly restricted to Admin role
+  // Check editing permission:
+  // - Admin: Can edit time for all employees in all departments
+  // - Supervisor: Can edit time like Admin, but strictly restricted to employees of their affiliated department
   const canEdit = useMemo(() => {
-    return currentUser.role === 'Admin';
-  }, [currentUser]);
-
-  // State to force re-render on storage or cloud sync updates
-  const [dataVersion, setDataVersion] = useState(0);
-
-  React.useEffect(() => {
-    const handleSync = () => setDataVersion(v => v + 1);
-    window.addEventListener('siemens-data-updated', handleSync);
-    window.addEventListener('storage-changed', handleSync);
-    window.addEventListener('firestore-sync-completed', handleSync);
-    return () => {
-      window.removeEventListener('siemens-data-updated', handleSync);
-      window.removeEventListener('storage-changed', handleSync);
-      window.removeEventListener('firestore-sync-completed', handleSync);
-    };
-  }, []);
+    if (currentUser.role === 'Admin') return true;
+    if (currentUser.role === 'Supervisor') {
+      const userDept = (currentUser.department || '').trim().toUpperCase();
+      if (!userDept || userDept === 'ALL') return true;
+      const empDept = (activeEmployee?.department || '').trim().toUpperCase();
+      return isSameDepartment(userDept, empDept);
+    }
+    return false;
+  }, [currentUser, activeEmployee]);
 
   // Load manual overrides
   const manualOverrides = useMemo(() => {
@@ -276,13 +250,13 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
       activeEmployee,
       selectedMonthYear,
       shiftCodes,
-      shiftPlans,
+      activeShiftPlans,
       biometricPunches,
       otRecords,
       otherAllowances,
       manualOverrides
     );
-  }, [activeEmployee, selectedMonthYear, shiftCodes, shiftPlans, biometricPunches, otRecords, otherAllowances, manualOverrides, dataVersion]);
+  }, [activeEmployee, selectedMonthYear, shiftCodes, activeShiftPlans, biometricPunches, otRecords, otherAllowances, manualOverrides, dataVersion]);
 
   // Modal state for editing a specific row
   const [editingRow, setEditingRow] = useState<TimeSheetRow | null>(null);
@@ -325,6 +299,8 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
     const gidKey = cleanGid ? `${cleanGid}_${editingRow.date}` : null;
     const overrides = storage.getManualOverrides();
 
+    const isSupervisor = currentUser.role === 'Supervisor';
+
     // Calculate diff if in and out provided
     let customDiff = editForm.diff1 !== undefined ? editForm.diff1 : editingRow.diff1;
     if (editForm.realTime1In && editForm.realTime1Out) {
@@ -341,11 +317,21 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
       customDiff = '';
     }
 
-    const updatedOverride = {
-      ...(overrides[empKey] || {}),
-      ...editForm,
-      diff1: customDiff,
-    };
+    // Supervisor is strictly restricted to editing In / Out times and remarks
+    // OT hours and Allowance items cannot be altered by Supervisor
+    const updatedOverride = isSupervisor
+      ? {
+          ...(overrides[empKey] || {}),
+          realTime1In: editForm.realTime1In,
+          realTime1Out: editForm.realTime1Out,
+          diff1: customDiff,
+          remark: editForm.remark,
+        }
+      : {
+          ...(overrides[empKey] || {}),
+          ...editForm,
+          diff1: customDiff,
+        };
 
     overrides[empKey] = updatedOverride;
     if (gidKey) {
@@ -354,7 +340,8 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
     storage.setManualOverrides(overrides);
 
-    if (editForm.shiftCode && editForm.shiftCode.trim() !== '') {
+    // Only Admin is permitted to alter shift plans via Time Sheet
+    if (!isSupervisor && editForm.shiftCode && editForm.shiftCode.trim() !== '') {
       storage.saveShiftPlan({
         id: `plan-${activeEmployee.empNo}-${editingRow.date}`,
         empNo: activeEmployee.empNo,
@@ -418,25 +405,38 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
               <Building2 className="w-3.5 h-3.5 text-teal-400" />
               <span>แผนก:</span>
             </label>
-            <select
-              id="select-department-timesheet"
-              value={activeDepartment}
-              onChange={e => handleDepartmentChange(e.target.value)}
-              className={`px-2.5 py-1.5 rounded border text-xs font-semibold outline-none cursor-pointer transition ${
-                isDark 
-                  ? 'bg-[#0e1722] border-[#283d52] text-white focus:border-teal-400 hover:border-slate-500' 
-                  : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-teal-600 hover:border-slate-400'
-              }`}
-            >
-              <option value="ALL">
-                ทุกแผนก ({departmentOptions.allCount} คน)
-              </option>
-              {departmentOptions.departments.map(dept => (
-                <option key={dept.code} value={dept.code}>
-                  {dept.code} - {dept.name} ({dept.count} คน)
+            {currentUser.role === 'General' ? (
+              <div 
+                id="timesheet-dept-general"
+                className={`px-2.5 py-1.5 rounded border text-xs font-semibold flex items-center gap-1.5 ${
+                  isDark ? 'bg-[#0e1722] border-purple-500/40 text-purple-300' : 'bg-purple-50 border-purple-300 text-purple-800'
+                }`}
+                title={`Role General: สิทธิ์ดูเฉพาะแผนก ${currentUser.department}`}
+              >
+                <Eye className="w-3.5 h-3.5 text-purple-400" />
+                <span>แผนก {currentUser.department} (View Only)</span>
+              </div>
+            ) : (
+              <select
+                id="select-department-timesheet"
+                value={activeDepartment}
+                onChange={e => handleDepartmentChange(e.target.value)}
+                className={`px-2.5 py-1.5 rounded border text-xs font-semibold outline-none cursor-pointer transition ${
+                  isDark 
+                    ? 'bg-[#0e1722] border-[#283d52] text-white focus:border-teal-400 hover:border-slate-500' 
+                    : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-teal-600 hover:border-slate-400'
+                }`}
+              >
+                <option value="ALL">
+                  ทุกแผนก ({departmentOptions.allCount} คน)
                 </option>
-              ))}
-            </select>
+                {departmentOptions.departments.map(dept => (
+                  <option key={dept.code} value={dept.code}>
+                    {dept.code} - {dept.name} ({dept.count} คน)
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
 
           <div className="h-5 w-[1px] bg-slate-700/50 hidden md:block" />
@@ -509,14 +509,22 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
 
             {/* Edit / View status indicator */}
             {canEdit ? (
-              <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1 whitespace-nowrap font-medium">
+              <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1 whitespace-nowrap font-medium" title={currentUser.role === 'Admin' ? 'Admin: สิทธิ์แก้ไขเวลาทุกแผนก' : `Supervisor: สิทธิ์แก้ไขเวลาเฉพาะแผนกต้นสังกัด (${currentUser.department})`}>
                 <Edit3 className="w-3 h-3 text-emerald-400" />
-                <span className="hidden xl:inline">Admin: สิทธิ์แก้ไข</span>
+                <span className="hidden xl:inline">
+                  {currentUser.role === 'Admin' ? 'Admin: สิทธิ์แก้ไข' : `Supervisor (${currentUser.department}): สิทธิ์แก้ไข`}
+                </span>
               </span>
             ) : (
-              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 whitespace-nowrap font-medium" title="Role User: สิทธิ์เรียกดู (View), กรอง (Filter) และส่งออกเอกสาร (Export) เท่านั้น">
+              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 flex items-center gap-1 whitespace-nowrap font-medium" title={currentUser.role === 'General' ? `Role General: สิทธิ์เรียกดู (View Only) เฉพาะแผนก ${currentUser.department}` : currentUser.role === 'Supervisor' ? `Supervisor: แก้ไขได้เฉพาะพนักงานแผนก ${currentUser.department} (พนักงานปัจจุบันอยู่แผนก ${activeEmployee?.department || '-'})` : "Role User: สิทธิ์เรียกดู (View), กรอง (Filter) และส่งออกเอกสาร (Export) เท่านั้น"}>
                 <Lock className="w-3 h-3 text-amber-400" />
-                <span className="hidden xl:inline">Role User: View & Export Only</span>
+                <span className="hidden xl:inline">
+                  {currentUser.role === 'General'
+                    ? `Role General: View Only (แผนก ${currentUser.department})`
+                    : currentUser.role === 'Supervisor' 
+                      ? `สิทธิ์เรียกดู (แก้ไขเฉพาะแผนก ${currentUser.department})` 
+                      : 'Role User: View Only'}
+                </span>
               </span>
             )}
           </div>
@@ -889,7 +897,12 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
             <div className="flex items-center justify-between pb-3 border-b border-slate-700">
               <h3 className="font-bold text-sm flex items-center gap-2">
                 <Edit3 className="w-4 h-4 text-teal-400" />
-                แก้ไข Time Sheet แบบ Manual: {editingRow.dayString}
+                <span>
+                  {currentUser.role === 'Supervisor'
+                    ? `แก้ไขเวลา เข้า-ออก (Supervisor: แผนก ${currentUser.department})`
+                    : 'แก้ไข Time Sheet แบบ Manual'}
+                  : {editingRow.dayString}
+                </span>
               </h3>
               <button 
                 onClick={() => setEditingRow(null)}
@@ -899,12 +912,30 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
               </button>
             </div>
 
+            {/* Supervisor constraint information notice */}
+            {currentUser.role === 'Supervisor' && (
+              <div className="mt-3 p-2.5 rounded bg-blue-500/10 border border-blue-500/30 text-blue-300 text-xs flex items-center gap-2">
+                <Info className="w-4 h-4 shrink-0 text-blue-400" />
+                <span>
+                  บัญชี <strong>Supervisor</strong> สามารถแก้ไขได้เฉพาะ <strong>เวลาเข้า - ออก (In / Out)</strong> • ชั่วโมง OT และรายการ Allowance สงวนสิทธิ์สำหรับ Admin เท่านั้น
+                </span>
+              </div>
+            )}
+
             <div className="my-4 space-y-3 text-xs">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-slate-400 mb-1">Shift Code</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>Shift Code</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="text"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.shiftCode || ''}
                     onChange={e => {
                       const newCode = e.target.value.toUpperCase();
@@ -919,134 +950,209 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
                     }}
                     placeholder="เช่น D, AD1-X, E-ET, N"
                     className={`w-full p-2 rounded border font-mono uppercase ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-300'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
-                  <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        let c = (editForm.shiftCode || 'D').replace(/-X/gi, '').replace(/-ET/gi, '');
-                        c = c + '-X';
-                        setEditForm(prev => ({ ...prev, shiftCode: c, standbyAllowance: 300 }));
-                      }}
-                      className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 cursor-pointer"
-                    >
-                      + Standby (-X) [300฿]
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        let c = (editForm.shiftCode || 'E').replace(/-X/gi, '').replace(/-ET/gi, '');
-                        c = c + '-ET';
-                        setEditForm(prev => ({ ...prev, shiftCode: c, emergencyAllowance: 300 }));
-                      }}
-                      className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 cursor-pointer"
-                    >
-                      + Emergency (-ET) [300฿]
-                    </button>
-                  </div>
+                  {currentUser.role !== 'Supervisor' && (
+                    <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          let c = (editForm.shiftCode || 'D').replace(/-X/gi, '').replace(/-ET/gi, '');
+                          c = c + '-X';
+                          setEditForm(prev => ({ ...prev, shiftCode: c, standbyAllowance: 300 }));
+                        }}
+                        className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 cursor-pointer"
+                      >
+                        + Standby (-X) [300฿]
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          let c = (editForm.shiftCode || 'E').replace(/-X/gi, '').replace(/-ET/gi, '');
+                          c = c + '-ET';
+                          setEditForm(prev => ({ ...prev, shiftCode: c, emergencyAllowance: 300 }));
+                        }}
+                        className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 hover:bg-rose-500/30 cursor-pointer"
+                      >
+                        + Emergency (-ET) [300฿]
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 <div>
-                  <label className="block text-slate-400 mb-1">Code Leave (A, C, S, O, X, Y)</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>Code Leave (A, C, S, O, X, Y)</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="text"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.codeLeave || ''}
                     onChange={e => setEditForm(prev => ({ ...prev, codeLeave: e.target.value.toUpperCase() }))}
                     placeholder="e.g. A, S, C"
                     className={`w-full p-2 rounded border uppercase font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-300'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              {/* Real Time In & Out (Editable for both Supervisor and Admin) */}
+              <div className={`grid grid-cols-2 gap-3 p-2.5 rounded-lg border ${
+                currentUser.role === 'Supervisor'
+                  ? (isDark ? 'bg-teal-500/10 border-teal-500/40' : 'bg-teal-50 border-teal-400')
+                  : 'border-transparent'
+              }`}>
                 <div>
-                  <label className="block text-slate-400 mb-1">Real Time I (In) (HH:mm)</label>
+                  <label className="block font-semibold mb-1 text-teal-300 flex items-center gap-1">
+                    <Clock className="w-3.5 h-3.5" /> เวลาเข้างาน (In) (HH:mm)
+                  </label>
                   <input
                     type="text"
                     value={editForm.realTime1In || ''}
                     onChange={e => setEditForm(prev => ({ ...prev, realTime1In: e.target.value }))}
                     placeholder="08:00"
-                    className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                    className={`w-full p-2 rounded border font-mono text-sm font-bold ${
+                      isDark ? 'bg-[#0f1722] border-teal-500/50 text-teal-300 focus:border-teal-400' : 'bg-white border-teal-500 text-teal-900'
                     }`}
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Real Time I (Out) (HH:mm)</label>
+                  <label className="block font-semibold mb-1 text-teal-300 flex items-center gap-1">
+                    <Clock className="w-3.5 h-3.5" /> เวลาออกงาน (Out) (HH:mm)
+                  </label>
                   <input
                     type="text"
                     value={editForm.realTime1Out || ''}
                     onChange={e => setEditForm(prev => ({ ...prev, realTime1Out: e.target.value }))}
                     placeholder="17:00"
-                    className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                    className={`w-full p-2 rounded border font-mono text-sm font-bold ${
+                      isDark ? 'bg-[#0f1722] border-teal-500/50 text-teal-300 focus:border-teal-400' : 'bg-white border-teal-500 text-teal-900'
                     }`}
                   />
                 </div>
               </div>
 
+              {/* OT Hours (Disabled for Supervisor, Admin only) */}
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-slate-400 mb-1">OT 1.5 เท่า (ชั่วโมง)</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>OT 1.5 เท่า (ชั่วโมง)</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="number"
                     step="0.5"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.ot1_5 !== undefined ? editForm.ot1_5 : 0}
                     onChange={e => setEditForm(prev => ({ ...prev, ot1_5: parseFloat(e.target.value) || 0 }))}
                     className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-400'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">OT 3.0 เท่า (ชั่วโมง)</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>OT 3.0 เท่า (ชั่วโมง)</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="number"
                     step="0.5"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.ot3_0 !== undefined ? editForm.ot3_0 : 0}
                     onChange={e => setEditForm(prev => ({ ...prev, ot3_0: parseFloat(e.target.value) || 0 }))}
                     className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-400'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
                 </div>
               </div>
 
+              {/* Allowances (Disabled for Supervisor, Admin only) */}
               <div className="grid grid-cols-3 gap-3">
                 <div>
-                  <label className="block text-slate-400 mb-1">Team Emergency (บาท)</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>Team Emergency</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="number"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.emergencyAllowance !== undefined ? editForm.emergencyAllowance : 0}
                     onChange={e => setEditForm(prev => ({ ...prev, emergencyAllowance: parseFloat(e.target.value) || 0 }))}
                     className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-400'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Shift Allowance (บาท)</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>Shift Allowance</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="number"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.shiftAllowance !== undefined ? editForm.shiftAllowance : 0}
                     onChange={e => setEditForm(prev => ({ ...prev, shiftAllowance: parseFloat(e.target.value) || 0 }))}
                     className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-400'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Standby (บาท)</label>
+                  <label className="block text-slate-400 mb-1 flex items-center justify-between">
+                    <span>Standby</span>
+                    {currentUser.role === 'Supervisor' && (
+                      <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                        <Lock className="w-2.5 h-2.5" /> เฉพาะ Admin
+                      </span>
+                    )}
+                  </label>
                   <input
                     type="number"
+                    disabled={currentUser.role === 'Supervisor'}
                     value={editForm.standbyAllowance !== undefined ? editForm.standbyAllowance : 0}
                     onChange={e => setEditForm(prev => ({ ...prev, standbyAllowance: parseFloat(e.target.value) || 0 }))}
                     className={`w-full p-2 rounded border font-mono ${
-                      isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
+                      currentUser.role === 'Supervisor'
+                        ? 'opacity-60 cursor-not-allowed bg-slate-800/50 border-slate-700 text-slate-400'
+                        : (isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300')
                     }`}
                   />
                 </div>
@@ -1058,7 +1164,7 @@ export const TimeSheetView: React.FC<TimeSheetViewProps> = ({
                   type="text"
                   value={editForm.remark || ''}
                   onChange={e => setEditForm(prev => ({ ...prev, remark: e.target.value }))}
-                  placeholder="เช่น support for random Narcotics testing"
+                  placeholder="เช่น ปรับเวลาตามใบบันทึกเวลาจริง / สแกนนิ้วไม่ติด"
                   className={`w-full p-2 rounded border ${
                     isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
                   }`}

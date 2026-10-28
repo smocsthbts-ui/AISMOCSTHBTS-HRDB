@@ -17,12 +17,13 @@ import {
   Paintbrush,
   Sparkles,
   Info,
-  CheckCircle2
+  CheckCircle2,
+  Eye
 } from 'lucide-react';
 import { storage } from '../utils/storage';
-import { cleanDocId } from '../firebase';
-import { generateShiftPlanTemplate, downloadBlob, downloadWorkbook, isSameDepartment } from '../utils/fileParser';
-import { getShiftCategoryColor, resolveShiftInfo, parseShiftCodeTags } from '../utils/timeCalc';
+import { cleanDocId, deduplicateAndCanonicalizeEmployees, deduplicateAndCanonicalizeShiftPlans } from '../firebase';
+import { generateShiftPlanTemplate, downloadBlob, downloadWorkbook, isSameDepartment, toCanonicalDepartment } from '../utils/fileParser';
+import { getShiftCategoryColor, resolveShiftInfo, parseShiftCodeTags, getRecordLookupKeys, getEmployeeLookupKeys } from '../utils/timeCalc';
 import { MonthYearFilter } from './MonthYearFilter';
 import { ShiftPickerModal } from './ShiftPickerModal';
 
@@ -37,6 +38,7 @@ interface ShiftRosterViewProps {
   shiftCodes: ShiftCode[];
   shiftPlans: DailyShiftPlan[];
   onNavigateToImport: () => void;
+  onDataImported?: () => void;
 }
 
 export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
@@ -50,6 +52,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   shiftCodes,
   shiftPlans,
   onNavigateToImport,
+  onDataImported,
 }) => {
   const isDark = theme === 'dark';
   const [searchTerm, setSearchTerm] = useState('');
@@ -115,10 +118,10 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
   const month = parseInt(monthStr, 10);
   const daysInMonth = new Date(year, month, 0).getDate();
 
-  // Fresh active shift plans combining props and local storage
+  // Fresh active shift plans combining props and local storage with deduplication
   const activeShiftPlans = useMemo(() => {
-    if (shiftPlans.length > 0) return shiftPlans;
-    return storage.getShiftPlans();
+    const raw = shiftPlans.length > 0 ? shiftPlans : storage.getShiftPlans();
+    return deduplicateAndCanonicalizeShiftPlans(raw);
   }, [shiftPlans, dataVersion]);
 
   // Pre-filter plans for selected month (Dramatically accelerates all downstream computations)
@@ -177,103 +180,32 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     return map;
   }, [currentMonthPlans]);
 
-  // Synthesize employees from shiftPlans for current month if any missing from master employees list
+  // Authoritative employee master list for Shift Roster (strictly from Employee Master)
   const effectiveEmployees = useMemo(() => {
     const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
-    const list = [...baseEmployees];
-    const knownEmpNos = new Set<string>();
-    baseEmployees.forEach(e => {
-      if (e.empNo) {
-        const clean = e.empNo.trim().toUpperCase();
-        knownEmpNos.add(clean);
-        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
-        if (digits) {
-          knownEmpNos.add(digits);
-          knownEmpNos.add(digits.padStart(4, '0'));
-          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
-        }
-      }
-      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
-      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
-    });
-    
-    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
-    currentMonthPlans.forEach(p => {
-      const eNo = (p.empNo || '').trim().toUpperCase();
-      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
-      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
-      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
-        missingEmpsFromPlans.set(eNo, p);
-      }
-    });
+    const cleanList = deduplicateAndCanonicalizeEmployees(baseEmployees);
+    return cleanList.filter(e => Boolean(e && e.empNo && e.isActive !== false));
+  }, [employees, dataVersion]);
 
-    missingEmpsFromPlans.forEach((p, eNo) => {
-      const cleanNo = p.empNo || eNo;
-      const digits = cleanNo.replace(/\D/g, '');
-      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
-      list.push({
-        id: `synth-${paddedNo}`,
-        empNo: paddedNo,
-        empCode: digits ? `1000${paddedNo}` : cleanNo,
-        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
-        firstName: 'พนักงาน',
-        familyName: cleanNo,
-        department: p.department || (selectedDepartment !== 'ALL' ? selectedDepartment : 'GM'),
-        division: 'MO CS BTS',
-        functionTitle: 'Service Technician',
-        costCenter: 'C93051',
-        isShiftWorker: true,
-        isActive: true,
-      });
-    });
-
-    return list;
-  }, [employees, currentMonthPlans, selectedDepartment]);
-
-  // Compute department counts for dropdown (Instant O(1) Set lookups)
+  // Compute department counts for dropdown (strictly matching Employee Master)
   const departmentCounts = useMemo(() => {
     const counts: Record<string, number> = { ALL: effectiveEmployees.length };
     const deptList = storage.getDepartments();
     deptList.forEach(d => {
-      const targetDept = d.code.toUpperCase();
-      counts[d.code] = effectiveEmployees.filter(e => {
-        if (isSameDepartment(e.department, d.code)) return true;
-        const eNo = (e.empNo || '').trim().toUpperCase();
-        const gid = (e.gid || '').trim().toUpperCase();
-        const empCode = (e.empCode || '').trim().toUpperCase();
-        const set = employeeMonthDeptMap.get(eNo) || employeeMonthDeptMap.get(gid) || employeeMonthDeptMap.get(empCode);
-        if (!set) return false;
-        for (const dept of set) {
-          if (isSameDepartment(dept, targetDept)) return true;
-        }
-        return false;
-      }).length;
+      counts[d.code] = effectiveEmployees.filter(e => isSameDepartment(e.department, d.code)).length;
     });
     return counts;
-  }, [effectiveEmployees, employeeMonthDeptMap]);
+  }, [effectiveEmployees]);
 
   // Filter employees by Department, Shift Type, and Name/GID search (Instant 60fps)
   const filteredEmployees = useMemo(() => {
     return effectiveEmployees.filter(emp => {
-      // 1. Department filter (Dropdown)
-      if (selectedDepartment !== 'ALL') {
+      // 1. Department filter (Dropdown) - strictly match Employee Master department so sub-departments (e.g. BES/PSY vs BES/PSY2) never mingle
+      if (currentUser.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+        if (!isSameDepartment(emp.department, currentUser.department)) return false;
+      } else if (selectedDepartment !== 'ALL') {
         const matchesDept = isSameDepartment(emp.department, selectedDepartment);
-        if (!matchesDept) {
-          const eNo = (emp.empNo || '').trim().toUpperCase();
-          const gid = (emp.gid || '').trim().toUpperCase();
-          const empCode = (emp.empCode || '').trim().toUpperCase();
-          const set = employeeMonthDeptMap.get(eNo) || employeeMonthDeptMap.get(gid) || employeeMonthDeptMap.get(empCode);
-          let hasPlan = false;
-          if (set) {
-            for (const dept of set) {
-              if (isSameDepartment(dept, selectedDepartment)) {
-                hasPlan = true;
-                break;
-              }
-            }
-          }
-          if (!hasPlan) return false;
-        }
+        if (!matchesDept) return false;
       }
 
       // 2. Shift worker type filter
@@ -293,7 +225,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
       }
       return true;
     });
-  }, [effectiveEmployees, selectedDepartment, shiftFilter, searchTerm, employeeMonthDeptMap]);
+  }, [effectiveEmployees, selectedDepartment, shiftFilter, searchTerm]);
 
   // Shift code mapping
   const shiftMap = useMemo(() => {
@@ -302,7 +234,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     return map;
   }, [shiftCodes]);
 
-  // Group filtered employees by department
+  // Group filtered employees strictly by their master department
   const groupedEmployees = useMemo(() => {
     const deptList = storage.getDepartments();
     const deptNameMap = new Map<string, string>();
@@ -322,18 +254,8 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     const groupMap = new Map<string, Employee[]>();
 
     sorted.forEach(emp => {
-      let dept = emp.department || 'OTHER';
-      if (selectedDepartment !== 'ALL') {
-        dept = selectedDepartment;
-      } else {
-        const eNo = (emp.empNo || '').trim().toUpperCase();
-        const gid = (emp.gid || '').trim().toUpperCase();
-        const empCode = (emp.empCode || '').trim().toUpperCase();
-        const set = employeeMonthDeptMap.get(eNo) || employeeMonthDeptMap.get(gid) || employeeMonthDeptMap.get(empCode);
-        if (set && set.size > 0) {
-          dept = Array.from(set)[0];
-        }
-      }
+      // Employee's master department from Employee Master is the single source of truth (canonicalized to prevent TRW/TRD vs TRW/TRL splitting)
+      const dept = toCanonicalDepartment(emp.department) || 'OTHER';
       if (!groupMap.has(dept)) {
         groupMap.set(dept, []);
       }
@@ -349,11 +271,12 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     });
 
     return groups;
-  }, [filteredEmployees, selectedDepartment, employeeMonthDeptMap]);
+  }, [filteredEmployees]);
 
   // Quick check if current user can edit this employee's schedule
   const canEditEmployee = (emp: Employee): boolean => {
     if (currentUser.role === 'Admin') return true;
+    if (currentUser.role === 'General') return false; // Role General can ONLY view, never edit
     // Role User can ONLY edit employees belonging to their own assigned department
     if (!currentUser.department || currentUser.department === 'ALL') return false;
     return isSameDepartment(currentUser.department, emp.department);
@@ -373,35 +296,9 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
     for (const p of sortedPlans) {
       if (!p || !p.date || !p.shiftCode) continue;
-      const code = p.shiftCode;
-      if (p.empNo) {
-        const cleanEmp = p.empNo.trim().toUpperCase();
-        map.set(`${cleanEmp}_${p.date}`, code);
-        const digits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
-        if (digits) {
-          map.set(`${digits}_${p.date}`, code);
-          map.set(`${digits.padStart(4, '0')}_${p.date}`, code);
-          map.set(`1000${digits.padStart(4, '0')}_${p.date}`, code);
-          if (digits.length >= 7) {
-            const short4 = digits.slice(-4);
-            map.set(`${short4}_${p.date}`, code);
-            map.set(`${short4.replace(/^0+/, '')}_${p.date}`, code);
-          }
-        }
-      }
-      if (p.gid) {
-        const cleanGid = p.gid.trim().toUpperCase();
-        map.set(`${cleanGid}_${p.date}`, code);
-        const gidNoSpecial = cleanGid.replace(/[^A-Z0-9]/g, '');
-        if (gidNoSpecial) {
-          map.set(`${gidNoSpecial}_${p.date}`, code);
-        }
-        const gidDigits = cleanGid.replace(/\D/g, '').replace(/^0+/, '');
-        if (gidDigits) {
-          map.set(`${gidDigits}_${p.date}`, code);
-          map.set(`${gidDigits.padStart(4, '0')}_${p.date}`, code);
-          map.set(`1000${gidDigits.padStart(4, '0')}_${p.date}`, code);
-        }
+      const keys = getRecordLookupKeys(p);
+      for (const k of keys) {
+        map.set(`${k}_${p.date}`, p.shiftCode);
       }
     }
     return map;
@@ -409,44 +306,11 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
   // Get shift code for employee on date (instant O(1))
   const getShiftForDate = (emp: Employee, dateStr: string): string => {
-    const cleanEmpNo = (emp.empNo || '').trim().toUpperCase();
-    const cleanEmpCode = (emp.empCode || '').trim().toUpperCase();
-    const cleanGid = (emp.gid || '').trim().toUpperCase();
-    
-    let code: string | undefined;
-    if (cleanEmpNo) {
-      code = shiftPlanLookupMap.get(`${cleanEmpNo}_${dateStr}`);
+    const empKeys = getEmployeeLookupKeys(emp);
+    for (const k of empKeys) {
+      const code = shiftPlanLookupMap.get(`${k}_${dateStr}`);
+      if (code) return code;
     }
-    if (!code && cleanEmpCode) {
-      code = shiftPlanLookupMap.get(`${cleanEmpCode}_${dateStr}`);
-    }
-    if (!code && cleanGid) {
-      code = shiftPlanLookupMap.get(`${cleanGid}_${dateStr}`) || 
-             shiftPlanLookupMap.get(`${cleanGid.replace(/[^A-Z0-9]/g, '')}_${dateStr}`);
-    }
-
-    if (!code) {
-      const allDigits = [
-        cleanEmpNo.replace(/\D/g, '').replace(/^0+/, ''),
-        cleanEmpCode.replace(/\D/g, '').replace(/^0+/, ''),
-        cleanGid.replace(/\D/g, '').replace(/^0+/, ''),
-      ].filter(Boolean);
-
-      for (const d of allDigits) {
-        code = shiftPlanLookupMap.get(`${d}_${dateStr}`) || 
-               shiftPlanLookupMap.get(`${d.padStart(4, '0')}_${dateStr}`) ||
-               shiftPlanLookupMap.get(`1000${d.padStart(4, '0')}_${dateStr}`);
-        if (code) break;
-        if (d.length >= 7) {
-          const short4 = d.slice(-4);
-          code = shiftPlanLookupMap.get(`${short4}_${dateStr}`) || 
-                 shiftPlanLookupMap.get(`${short4.replace(/^0+/, '')}_${dateStr}`);
-          if (code) break;
-        }
-      }
-    }
-
-    if (code) return code;
 
     // Fallback: Day shift for weekday, OFF for weekend (safe local date parse)
     const [y, m, d] = dateStr.split('-').map(Number);
@@ -562,6 +426,7 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
     // 3. Batched single write call to local storage and Firebase Cloud in background
     try {
       await storage.setShiftPlans(updatedPlans, newlyCreatedPlans);
+      onDataImported?.();
     } catch (err) {
       console.warn('Shift plan sync warning:', err);
     }
@@ -569,6 +434,11 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
   // Handle cell click: painter vs modal
   const handleCellClick = (emp: Employee, d: { dateStr: string; day: number }) => {
+    if (currentUser.role === 'General') {
+      showToast(`Role General: สิทธิ์เรียกดูเฉพาะแผนก ${currentUser.department} เท่านั้น ไม่สามารถจัดกะด่วนหรือแก้ไขข้อมูลได้`);
+      return;
+    }
+
     if (!canEditEmployee(emp)) {
       showToast(`สิทธิ์แก้ไขเฉพาะแผนก ${currentUser.department} เท่านั้น (พนักงานสังกัด ${emp.department} - View Only)`);
       return;
@@ -632,7 +502,9 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
             <p className="text-xs text-slate-400">
               {currentUser.role === 'Admin' 
                 ? 'ผู้ดูแลระบบ (Admin): มีสิทธิ์แก้ไขและจัดตารางกะได้ทุกแผนก • คลิกช่องวันที่เพื่อเปิดหน้าต่างเลือกกะแบบละเอียด หรือใช้โหมดจัดกะด่วน' 
-                : `ผู้ใช้งาน (${currentUser.name}): สิทธิ์แก้ไขเฉพาะแผนก ${currentUser.department} เท่านั้น (แผนกอื่นเป็นแบบ View Only)`
+                : currentUser.role === 'General'
+                  ? `General (${currentUser.name}): สิทธิ์เรียกดูเฉพาะแผนก ${currentUser.department} เท่านั้น (View Only - ไม่สามารถจัดกะด่วนหรือแก้ไขข้อมูลได้)`
+                  : `${currentUser.role === 'Supervisor' ? 'Supervisor (หัวหน้างาน)' : 'ผู้ใช้งาน'} (${currentUser.name}): สิทธิ์แก้ไขเฉพาะแผนก ${currentUser.department} เท่านั้น (แผนกอื่นเป็นแบบ View Only)`
               }
             </p>
           </div>
@@ -640,27 +512,36 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
 
         {/* Action buttons */}
         <div className="flex items-center space-x-2 flex-wrap gap-2">
-          {/* Quick Shift Painter Mode Toggle */}
-          <button
-            id="btn-toggle-shift-painter"
-            onClick={() => {
-              setIsPainterActive(prev => !prev);
-              if (!isPainterActive) {
-                showToast(`เปิดโหมดจัดกะด่วน: กะ ${selectedPainterCode}`);
-              }
-            }}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs border font-semibold transition cursor-pointer ${
-              isPainterActive
-                ? 'bg-amber-500 text-slate-950 border-amber-400 shadow-md ring-2 ring-amber-400/50'
-                : isDark
-                  ? 'bg-[#1a2838] border-[#2e4257] text-amber-400 hover:bg-[#233549]'
-                  : 'bg-amber-50 border-amber-300 text-amber-800 hover:bg-amber-100'
-            }`}
-            title="คลิกช่องในตารางเพื่อเปลี่ยนเป็นกะที่เลือกทันทีโดยไม่ต้องเปิดหน้าต่าง"
-          >
-            <Paintbrush className="w-3.5 h-3.5" />
-            <span>{isPainterActive ? 'กำลังแต้มกะ (คลิกเพื่อปิด)' : 'โหมดจัดกะด่วน (Painter)'}</span>
-          </button>
+          {/* Quick Shift Painter Mode Toggle (Disabled / Hidden for General) */}
+          {currentUser.role === 'General' ? (
+            <div className={`flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs border font-medium ${
+              isDark ? 'bg-purple-950/30 border-purple-500/40 text-purple-300' : 'bg-purple-50 border-purple-200 text-purple-700'
+            }`} title="Role General: สิทธิ์เรียกดูอย่างเดียว ไม่สามารถจัดกะด่วนได้">
+              <Eye className="w-3.5 h-3.5 text-purple-400" />
+              <span>สิทธิ์เรียกดู (View Only)</span>
+            </div>
+          ) : (
+            <button
+              id="btn-toggle-shift-painter"
+              onClick={() => {
+                setIsPainterActive(prev => !prev);
+                if (!isPainterActive) {
+                  showToast(`เปิดโหมดจัดกะด่วน: กะ ${selectedPainterCode}`);
+                }
+              }}
+              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs border font-semibold transition cursor-pointer ${
+                isPainterActive
+                  ? 'bg-amber-500 text-slate-950 border-amber-400 shadow-md ring-2 ring-amber-400/50'
+                  : isDark
+                    ? 'bg-[#1a2838] border-[#2e4257] text-amber-400 hover:bg-[#233549]'
+                    : 'bg-amber-50 border-amber-300 text-amber-800 hover:bg-amber-100'
+              }`}
+              title="คลิกช่องในตารางเพื่อเปลี่ยนเป็นกะที่เลือกทันทีโดยไม่ต้องเปิดหน้าต่าง"
+            >
+              <Paintbrush className="w-3.5 h-3.5" />
+              <span>{isPainterActive ? 'กำลังแต้มกะ (คลิกเพื่อปิด)' : 'โหมดจัดกะด่วน (Painter)'}</span>
+            </button>
+          )}
 
           <button
             id="btn-download-shift-template"
@@ -675,15 +556,17 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
             <span>ดาวน์โหลดเทมเพลต</span>
           </button>
 
-          <button
-            id="btn-goto-upload-plan"
-            onClick={onNavigateToImport}
-            className="flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-sm transition cursor-pointer"
-            title="Upload Department Shift Plan (อัปโหลดตารางกะรายแผนก)"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            <span>Upload Shift Plan (อัปโหลดกะ)</span>
-          </button>
+          {currentUser.role !== 'General' && (
+            <button
+              id="btn-goto-upload-plan"
+              onClick={onNavigateToImport}
+              className="flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs font-semibold bg-[#008b99] hover:bg-[#00a3a6] text-white shadow-sm transition cursor-pointer"
+              title="Upload Department Shift Plan (อัปโหลดตารางกะรายแผนก)"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>Upload Shift Plan (อัปโหลดกะ)</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -883,26 +766,39 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
               <label htmlFor="dept-filter-select" className="text-xs font-semibold text-slate-300 whitespace-nowrap">
                 แผนก:
               </label>
-              <select
-                id="dept-filter-select"
-                aria-label="เลือกแผนก"
-                value={selectedDepartment}
-                onChange={e => onSelectDepartment(e.target.value)}
-                className={`px-2.5 py-1.5 rounded border text-xs font-medium cursor-pointer outline-none transition min-w-[170px] ${
-                  isDark 
-                    ? 'bg-[#14202c] border-[#273a4e] text-white focus:border-[#00e5e5]' 
-                    : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-[#008b99]'
-                }`}
-              >
-                <option value="ALL">
-                  ทุกแผนก (All Departments) ({effectiveEmployees.length} คน)
-                </option>
-                {storage.getDepartments().map(d => (
-                  <option key={d.code} value={d.code}>
-                    {d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code} ({departmentCounts[d.code] || 0} คน)
+              {currentUser.role === 'General' ? (
+                <div 
+                  id="dept-filter-general"
+                  className={`px-2.5 py-1.5 rounded border text-xs font-semibold flex items-center gap-1.5 ${
+                    isDark ? 'bg-[#14202c] border-purple-500/40 text-purple-300' : 'bg-purple-50 border-purple-300 text-purple-800'
+                  }`}
+                  title={`Role General: สิทธิ์ดูเฉพาะแผนก ${currentUser.department}`}
+                >
+                  <Eye className="w-3.5 h-3.5 text-purple-400" />
+                  <span>แผนก {currentUser.department} (View Only)</span>
+                </div>
+              ) : (
+                <select
+                  id="dept-filter-select"
+                  aria-label="เลือกแผนก"
+                  value={selectedDepartment}
+                  onChange={e => onSelectDepartment(e.target.value)}
+                  className={`px-2.5 py-1.5 rounded border text-xs font-medium cursor-pointer outline-none transition min-w-[170px] ${
+                    isDark 
+                      ? 'bg-[#14202c] border-[#273a4e] text-white focus:border-[#00e5e5]' 
+                      : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-[#008b99]'
+                  }`}
+                >
+                  <option value="ALL">
+                    ทุกแผนก (All Departments) ({effectiveEmployees.length} คน)
                   </option>
-                ))}
-              </select>
+                  {storage.getDepartments().map(d => (
+                    <option key={d.code} value={d.code}>
+                      {d.name && d.name !== d.code ? `${d.code} - ${d.name}` : d.code} ({departmentCounts[d.code] || 0} คน)
+                    </option>
+                  ))}
+                </select>
+              )}
             </div>
 
             {/* 3. Search by Employee Name and GID */}

@@ -24,10 +24,14 @@ import {
   AlertTriangle,
   FileSpreadsheet,
   FileCheck,
-  ShieldCheck
+  ShieldCheck,
+  Eye,
+  AlertCircle,
+  RefreshCw
 } from 'lucide-react';
-import { readFileAsArrayBuffer, parseSheetToRows, downloadBlob, downloadWorkbook, generateEmployeeMasterTemplate, parseEmployeeNameParts } from '../utils/fileParser';
-import { isDemoDepartment, isDemoEmployee, firestoreSync } from '../firebase';
+import { readFileAsArrayBuffer, parseSheetToRows, downloadBlob, downloadWorkbook, generateEmployeeMasterTemplate, parseEmployeeNameParts, toCanonicalDepartment, isSameDepartment } from '../utils/fileParser';
+import { resolveDepartmentFullName, getCanonicalDepartmentFullName } from '../data/initialData';
+import { isDemoDepartment, isDemoEmployee, sanitizeEmployeeDepartment, firestoreSync } from '../firebase';
 import * as XLSX from 'xlsx';
 
 // Models for batch upload change tracking
@@ -189,7 +193,12 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
   const isAdmin = currentUser.role === 'Admin';
 
   const [searchTerm, setSearchTerm] = useState('');
-  const [selectedSection, setSelectedSection] = useState<string>(selectedDepartment || 'ALL');
+  const [selectedSection, setSelectedSection] = useState<string>(() => {
+    if (currentUser.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+      return currentUser.department;
+    }
+    return selectedDepartment || 'ALL';
+  });
   const [shiftTypeFilter, setShiftTypeFilter] = useState<'ALL' | 'SHIFT' | 'OFFICE'>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL');
 
@@ -200,6 +209,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncToast, setSyncToast] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
   const [uploadSummary, setUploadSummary] = useState<BatchUploadSummary | null>(null);
+  const [uploadError, setUploadError] = useState<{ title: string; message: string; details?: string[] } | null>(null);
   const [duplicateNotice, setDuplicateNotice] = useState<{ text: string; matchedEmp: Employee; fieldLabel: string } | null>(null);
 
   const showToast = (text: string, type: 'info' | 'success' | 'error' = 'success') => {
@@ -245,13 +255,18 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
   // Synchronize when selectedDepartment changes from props
   useEffect(() => {
+    if (currentUser.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+      setSelectedSection(currentUser.department);
+      return;
+    }
     if (selectedDepartment) {
       setSelectedSection(selectedDepartment);
     }
-  }, [selectedDepartment]);
+  }, [selectedDepartment, currentUser.role, currentUser.department]);
 
   // Handle section filter selection
   const handleSectionChange = (section: string) => {
+    if (currentUser.role === 'General') return; // Cannot change section
     setSelectedSection(section);
     if (onSelectDepartment) {
       onSelectDepartment(section);
@@ -273,11 +288,11 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
   const availableSections = useMemo(() => {
     const map = new Map<string, { code: string; name: string }>();
 
-    // 1. From departments list (excluding demo departments)
+    // 1. From departments list (excluding demo departments and non-displayed codes TRW/TRD, TRD, OVH, MRL)
     departments.forEach(d => {
       const code = (d.code || '').trim().toUpperCase();
-      if (code && code !== 'ALL' && !isDemoDepartment(code)) {
-        map.set(code, { code, name: d.name || code });
+      if (code && code !== 'ALL' && code !== 'TRW/TRD' && code !== 'TRD' && code !== 'OVH' && code !== 'MRL' && !isDemoDepartment(code)) {
+        map.set(code, { code, name: resolveDepartmentFullName(code, d.name) });
       }
     });
 
@@ -286,8 +301,8 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
       const storedDepts = storage.getDepartments();
       storedDepts.forEach(d => {
         const code = (d.code || '').trim().toUpperCase();
-        if (code && code !== 'ALL' && !isDemoDepartment(code) && !map.has(code)) {
-          map.set(code, { code, name: d.name || code });
+        if (code && code !== 'ALL' && code !== 'TRW/TRD' && code !== 'TRD' && code !== 'OVH' && code !== 'MRL' && !isDemoDepartment(code) && !map.has(code)) {
+          map.set(code, { code, name: resolveDepartmentFullName(code, d.name) });
         }
       });
     } catch {}
@@ -295,16 +310,20 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     return Array.from(map.values()).sort((a, b) => a.code.localeCompare(b.code));
   }, [departments]);
 
-  // Employee counts per section
+  // Authoritative displayed departments list (strictly excludes TRW/TRD as TRW/TRL is the displayed department)
+  const visibleDepartments = useMemo(() => {
+    return availableSections;
+  }, [availableSections]);
+
+  // Employee counts per section (using isSameDepartment to unify formatting, slashes, and aliases)
   const sectionCounts = useMemo(() => {
     const validEmps = employees.filter(e => !isDemoEmployee(e));
     const counts: Record<string, number> = { ALL: validEmps.length };
-    validEmps.forEach(emp => {
-      const dept = (emp.department || '').trim().toUpperCase();
-      counts[dept] = (counts[dept] || 0) + 1;
+    availableSections.forEach(d => {
+      counts[d.code] = validEmps.filter(e => isSameDepartment(e.department, d.code)).length;
     });
     return counts;
-  }, [employees]);
+  }, [employees, availableSections]);
 
   // Form state
   const [empForm, setEmpForm] = useState<Partial<Employee>>({
@@ -349,10 +368,13 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
   const filteredEmployees = useMemo(() => {
     return employees.filter(e => {
       if (isDemoEmployee(e)) return false;
-      // 1. Section Filter
-      if (selectedSection !== 'ALL') {
-        const empDept = (e.department || '').trim().toUpperCase();
-        if (empDept !== selectedSection.toUpperCase()) {
+      // 1. Section Filter (supports canonical department and alias matching)
+      if (currentUser.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+        if (!isSameDepartment(e.department, currentUser.department)) {
+          return false;
+        }
+      } else if (selectedSection !== 'ALL') {
+        if (!isSameDepartment(e.department, selectedSection)) {
           return false;
         }
       }
@@ -411,7 +433,11 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     setIsEmpNoUnlocked(false);
     setDuplicateNotice(null);
     setEditingEmp(emp);
-    setEmpForm({ ...emp, empCode: emp.empCode || '' });
+    setEmpForm({
+      ...emp,
+      empCode: emp.empCode || '',
+      isActive: emp.isActive !== false,
+    });
   };
 
   // Toggle Shift Worker (Direct 1-Click Toggle for Admins with instant cloud sync)
@@ -421,15 +447,17 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     const idx = list.findIndex(e => e.empNo === emp.empNo);
     if (idx >= 0) {
       const nextVal = !list[idx].isShiftWorker;
+      const nowIso = new Date().toISOString();
       list[idx].isShiftWorker = nextVal;
+      list[idx].updatedAt = nowIso;
       setIsSyncing(true);
       showToast(`กำลังบันทึกสถานะ ${nextVal ? 'Shift Worker (เข้ากะ)' : 'Office (ทำงานปกติ)'} ของ ${emp.firstName}...`, 'info');
-      const ok = await storage.setEmployees(list);
+      const ok = await storage.setEmployees(list, 30000);
       setIsSyncing(false);
       if (ok) {
         showToast(`บันทึกและซิงค์คลาวด์: ${emp.firstName} (${emp.empNo}) เป็น ${nextVal ? 'Shift Worker (เข้ากะ)' : 'Office (ทำงานปกติ)'} เรียบร้อยแล้ว`, 'success');
       } else {
-        showToast(`บันทึกในเครื่องแล้ว (คลาวด์จะซิงค์ให้อัตโนมัติเมื่อออนไลน์)`, 'info');
+        showToast(`บันทึกในเครื่องแล้ว (คลาวด์ใช้เวลานาน ระบบจะซิงค์ให้อัตโนมัติในเบื้องหลัง)`, 'info');
       }
       onDataChanged();
     }
@@ -441,12 +469,20 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     const list = storage.getEmployees();
     const idx = list.findIndex(e => e.empNo === emp.empNo);
     if (idx >= 0) {
-      const nextVal = !list[idx].isActive;
+      const currentActive = list[idx].isActive !== false;
+      const nextVal = !currentActive;
+      const nowIso = new Date().toISOString();
       list[idx].isActive = nextVal;
+      list[idx].updatedAt = nowIso;
       setIsSyncing(true);
-      await storage.setEmployees(list);
+      showToast(`กำลังบันทึกสถานะ ${nextVal ? 'เปิดใช้งาน (Active)' : 'ระงับชั่วคราว (Deactivated)'} ของ ${emp.firstName}...`, 'info');
+      const ok = await storage.setEmployees(list, 30000);
       setIsSyncing(false);
-      showToast(`อัปเดตสถานะ ${nextVal ? 'Active' : 'Deactivated'} ของ ${emp.firstName} เรียบร้อยแล้ว`, 'success');
+      if (ok) {
+        showToast(`อัปเดตและซิงค์คลาวด์สถานะ ${nextVal ? 'เปิดใช้งาน (Active)' : 'ระงับชั่วคราว (Deactivated)'} ของ ${emp.firstName} เรียบร้อยแล้ว`, 'success');
+      } else {
+        showToast(`อัปเดตสถานะในเครื่องแล้ว (ระบบจะซิงค์คลาวด์ให้อัตโนมัติในเบื้องหลัง)`, 'info');
+      }
       onDataChanged();
     }
   };
@@ -508,7 +544,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
             functionTitle: empForm.functionTitle?.trim() || list[existingIdx].functionTitle || '',
             costCenter: empForm.costCenter?.trim() || list[existingIdx].costCenter || 'C93056',
             isShiftWorker: Boolean(empForm.isShiftWorker),
-            isActive: empForm.isActive !== undefined ? empForm.isActive : true,
+            isActive: empForm.isActive !== false,
             updatedAt: nowIso,
           };
         }
@@ -526,7 +562,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
           functionTitle: empForm.functionTitle?.trim() || '',
           costCenter: empForm.costCenter?.trim() || 'C93056',
           isShiftWorker: Boolean(empForm.isShiftWorker),
-          isActive: empForm.isActive !== undefined ? empForm.isActive : true,
+          isActive: empForm.isActive !== false,
           updatedAt: nowIso,
         });
       }
@@ -607,7 +643,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
             functionTitle: empForm.functionTitle?.trim() ?? freshList[idx].functionTitle ?? '',
             costCenter: empForm.costCenter?.trim() || freshList[idx].costCenter || 'C93056',
             isShiftWorker: Boolean(empForm.isShiftWorker),
-            isActive: empForm.isActive !== undefined ? empForm.isActive : freshList[idx].isActive,
+            isActive: empForm.isActive !== false,
             updatedAt: nowIso,
           };
         }
@@ -615,7 +651,8 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
         list.push(...freshList);
       }
 
-      const ok = await storage.setEmployees(list);
+      showToast(`กำลังบันทึกข้อมูลและซิงค์พนักงาน ${empFirstName} (${empEmpNo}) ขึ้นคลาวด์...`, 'info');
+      const ok = await storage.setEmployees(list, 45000);
 
       // Also synchronize corresponding User account if exists
       try {
@@ -644,9 +681,9 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
       }
 
       if (ok) {
-        showToast(`บันทึกข้อมูลพนักงาน ${empFirstName} (${empEmpNo}) เรียบร้อยแล้ว`, 'success');
+        showToast(`บันทึกและซิงค์ข้อมูลพนักงาน ${empFirstName} (${empEmpNo}) ขึ้นคลาวด์เรียบร้อยแล้ว`, 'success');
       } else {
-        showToast(`บันทึกข้อมูลในเครื่องเรียบร้อยแล้ว`, 'info');
+        showToast(`บันทึกข้อมูลในเครื่องเรียบร้อยแล้ว (ระบบจะซิงค์คลาวด์ให้อัตโนมัติในเบื้องหลัง)`, 'info');
       }
       onDataChanged();
     } catch (err: any) {
@@ -698,8 +735,8 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     e.preventDefault();
     if (!isAdmin || !deptForm.code || !deptForm.name) return;
 
-    const deptNameClean = deptForm.name.trim();
     const deptCodeClean = deptForm.code.trim().toUpperCase();
+    const deptNameClean = resolveDepartmentFullName(deptCodeClean, deptForm.name.trim());
     const nowIso = new Date().toISOString();
 
     const list = storage.getDepartments();
@@ -790,16 +827,44 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     }
   };
 
+  // Calculate unused departments with 0 employees
+  const zeroEmpDeptsCount = useMemo(() => {
+    return departments.filter(d => {
+      const code = (d.code || '').trim().toUpperCase();
+      const count = employees.filter(e => !isDemoEmployee(e) && (e.department || '').trim().toUpperCase() === code).length;
+      return count === 0;
+    }).length;
+  }, [departments, employees]);
+
+  // Purge all 0-employee unused departments in one click
+  const handlePurgeZeroEmployeeDepts = async () => {
+    if (!isAdmin) return;
+    if (confirm(`คุณต้องการลบแผนกที่ไม่มีพนักงานสังกัด (0 คน) ทั้งหมด ${zeroEmpDeptsCount} แผนก ออกจากระบบและคลาวด์อย่างถาวรหรือไม่?`)) {
+      setIsSyncing(true);
+      try {
+        const res = await storage.purgeUnusedZeroPersonDepartments();
+        onDataChanged();
+        showToast(`ลบแผนกที่ไม่มีพนักงานออกเรียบร้อยแล้ว (${res.purgedCount} แผนก)`, 'success');
+      } catch (err: any) {
+        showToast(`เกิดข้อผิดพลาดในการลบแผนก: ${err?.message || 'โปรดลองใหม่'}`, 'error');
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+  };
+
   const handleDeleteDept = async (code: string) => {
     if (!isAdmin) return;
     const upper = code.trim().toUpperCase();
-    const affectedEmployees = employees.filter(e => (e.department || '').trim().toUpperCase() === upper);
+    const affectedEmployees = employees.filter(e => !isDemoEmployee(e) && (e.department || '').trim().toUpperCase() === upper);
     const remainingDepts = departments.filter(d => (d.code || '').trim().toUpperCase() !== upper);
     const fallbackDept = remainingDepts.find(d => d.code === 'RST')?.code || remainingDepts[0]?.code || 'GM';
 
     let promptMsg = `คุณต้องการลบแผนก ${code} หรือไม่?`;
     if (affectedEmployees.length > 0) {
       promptMsg += `\n(มีพนักงาน ${affectedEmployees.length} คนสังกัดแผนกนี้ ระบบจะช่วยย้ายพนักงานไปสังกัดแผนก ${fallbackDept} อัตโนมัติเพื่อไม่ให้ข้อมูลสูญหาย)`;
+    } else {
+      promptMsg += `\n(แผนกนี้ไม่มีพนักงานสังกัด 0 คน ระบบจะลบออกจากระบบและคลาวด์อย่างถาวร)`;
     }
     if (confirm(promptMsg)) {
       setIsSyncing(true);
@@ -842,18 +907,64 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
     }
   };
 
+  // Manual sync with Cloud Firestore (using robust 45-second timeout)
+  const handleManualSync = async () => {
+    if (isSyncing) return;
+    try {
+      setIsSyncing(true);
+      showToast('กำลังซิงค์ฐานข้อมูลพนักงานกับคลาวด์ (Time Out สูงสุด 45 วินาที)...', 'info');
+      const currentEmps = storage.getEmployees();
+      const ok = await storage.setEmployees(currentEmps, 45000);
+      setIsSyncing(false);
+      if (ok) {
+        showToast(`ซิงค์ข้อมูลพนักงาน (${currentEmps.length} คน) ขึ้นคลาวด์สำเร็จเรียบร้อยแล้ว`, 'success');
+      } else {
+        showToast(`ข้อมูลพนักงานบันทึกในเครื่องเรียบร้อยแล้ว (${currentEmps.length} คน) ระบบจะพยายามซิงค์คลาวด์ในเบื้องหลัง`, 'info');
+      }
+      onDataChanged();
+    } catch (e: any) {
+      setIsSyncing(false);
+      showToast('เกิดข้อผิดพลาดในการซิงค์: ' + (e?.message || 'โปรดลองใหม่อีกครั้ง'), 'error');
+    }
+  };
+
   // Column Aliases for Flexible Spreadsheet Matching
-  const EMP_NO_ALIASES = ['EmpNo', 'Emp No', 'Emp No.', 'Employee No', 'Employee No.', 'EmployeeNo', 'Staff ID', 'Employee ID', 'EmpID', 'ID', 'No.', 'รหัสพนักงาน', 'รหัส', 'No'];
-  const EMP_CODE_ALIASES = ['EmpCode', 'Emp Code', 'empCode', 'EmployeeCode', 'Employee Code', 'รหัสพนักงาน8หลัก', 'รหัส 8 หลัก', 'PayrollCode', 'Payroll Code', 'รหัส Payroll', 'Payroll ID', 'Payroll', 'RefCode', 'Ref Code'];
-  const GID_ALIASES = ['GID', 'gid', 'Global ID', 'GlobalID', 'Global Id', 'Z-ID', 'ZID', 'รหัส GID', 'Siemens GID', 'GID Code'];
-  const FIRST_NAME_ALIASES = ['FirstName', 'First Name', 'Firstname', 'ชื่อจริง', 'ชื่อ', 'Name', 'Employee Name', 'EmployeeName', 'ชื่อพนักงาน'];
-  const FAMILY_NAME_ALIASES = ['FamilyName', 'Family Name', 'Familyname', 'LastName', 'Last Name', 'Lastname', 'Surname', 'นามสกุล'];
-  const DEPT_ALIASES = ['Department', 'Dept', 'Dept.', 'Department Code', 'แผนก', 'สังกัด', 'ฝ่าย'];
-  const DIVISION_ALIASES = ['Division', 'Div', 'Div.', 'Division Code', 'ส่วนงาน', 'ฝ่ายงาน'];
-  const FUNCTION_ALIASES = ['Function', 'FunctionTitle', 'Function Title', 'Position', 'Role', 'ตำแหน่ง', 'ตำแหน่งงาน', 'หน้าที่', 'Job Title'];
-  const COST_CENTER_ALIASES = ['CostCenter', 'Cost Center', 'Cost Centre', 'CostCentre', 'Cost_Center', 'CC', 'Cost Center Code', 'ศูนย์ต้นทุน', 'รหัสศูนย์ต้นทุน'];
-  const SHIFT_WORKER_ALIASES = ['IsShiftWorker', 'ShiftWorker', 'Shift Worker', 'Shift', 'Is Shift Worker', 'พนักงานกะ', 'เข้ากะ', 'กะ', 'Shift / Normal', 'Work Type'];
-  const ACTIVE_ALIASES = ['IsActive', 'Active', 'Status', 'สถานะ', 'การทำงาน'];
+  const EMP_NO_ALIASES = [
+    'รหัสพนักงาน', 'EmpNo', 'Emp No', 'Emp No.', 'Employee No', 'Employee No.', 'EmployeeNo',
+    'StaffID', 'Staff ID', 'EmployeeID', 'Employee ID', 'EmpID', 'เลขประจำตัว', 'รหัส'
+  ];
+  const EMP_CODE_ALIASES = [
+    'EmpCode', 'Emp Code', 'empCode', 'EmployeeCode', 'Employee Code',
+    'รหัสพนักงาน8หลัก', 'รหัส 8 หลัก', 'รหัส8หลัก', 'PayrollCode', 'Payroll Code', 'รหัส Payroll', 'Payroll ID', 'Payroll', 'RefCode', 'Ref Code', 'Payroll No', 'PayrollNo'
+  ];
+  const GID_ALIASES = [
+    'GID', 'gid', 'Global ID', 'GlobalID', 'Global Id', 'Z-ID', 'ZID', 'รหัส GID', 'Siemens GID', 'GID Code', 'Global-ID', 'Siemens ID'
+  ];
+  const FIRST_NAME_ALIASES = [
+    'FirstName', 'First Name', 'Firstname', 'ชื่อจริง', 'ชื่อ', 'Name', 'Employee Name', 'EmployeeName', 'ชื่อพนักงาน',
+    'FullName', 'Full Name', 'ชื่อนามสกุล', 'ชื่อ-นามสกุล', 'ชื่อ - นามสกุล', 'ชื่อ-สกุล', 'ชื่อ - สกุล', 'Staff Name', 'StaffName', 'Employee'
+  ];
+  const FAMILY_NAME_ALIASES = [
+    'FamilyName', 'Family Name', 'Familyname', 'LastName', 'Last Name', 'Lastname', 'Surname', 'นามสกุล', 'สกุล'
+  ];
+  const DEPT_ALIASES = [
+    'Department', 'Dept', 'Dept.', 'Department Code', 'แผนก', 'สังกัด', 'ฝ่าย', 'Dept Name', 'DepartmentName', 'ฝ่าย/แผนก', 'แผนก/ฝ่าย', 'หน่วยงาน'
+  ];
+  const DIVISION_ALIASES = [
+    'Division', 'Div', 'Div.', 'Division Code', 'ส่วนงาน', 'ฝ่ายงาน', 'สายงาน'
+  ];
+  const FUNCTION_ALIASES = [
+    'Function', 'FunctionTitle', 'Function Title', 'Position', 'Role', 'ตำแหน่ง', 'ตำแหน่งงาน', 'หน้าที่', 'Job Title', 'JobTitle', 'Title'
+  ];
+  const COST_CENTER_ALIASES = [
+    'CostCenter', 'Cost Center', 'Cost Centre', 'CostCentre', 'Cost_Center', 'CC', 'Cost Center Code', 'ศูนย์ต้นทุน', 'รหัสศูนย์ต้นทุน', 'CostCenterCode'
+  ];
+  const SHIFT_WORKER_ALIASES = [
+    'IsShiftWorker', 'ShiftWorker', 'Shift Worker', 'Shift', 'Is Shift Worker', 'พนักงานกะ', 'เข้ากะ', 'กะ', 'Shift / Normal', 'Work Type', 'WorkType', 'ประเภทการทำงาน', 'รูปแบบการทำงาน'
+  ];
+  const ACTIVE_ALIASES = [
+    'IsActive', 'Active', 'Status', 'สถานะ', 'การทำงาน', 'สถานะการทำงาน', 'สถานะพนักงาน'
+  ];
 
   const getRowValue = (r: Record<string, any>, aliases: string[]): string | undefined => {
     const keys = Object.keys(r);
@@ -881,13 +992,14 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
     try {
       setIsSyncing(true);
+      setUploadError(null);
       showToast('กำลังอ่านและวิเคราะห์ข้อมูลไฟล์พนักงาน...', 'info');
 
       const buffer = await readFileAsArrayBuffer(file);
-      const rows = parseSheetToRows(buffer);
+      const rows = parseSheetToRows(buffer, 'employee');
 
       if (!rows || rows.length === 0) {
-        throw new Error('ไม่พบแถวข้อมูลในไฟล์ กรุณาตรวจสอบไฟล์ที่อัปโหลด');
+        throw new Error('ไม่พบแถวข้อมูลในไฟล์ หรือไม่พบชีตข้อมูลพนักงาน กรุณาตรวจสอบไฟล์ที่อัปโหลด (สามารถดาวน์โหลด Template จากระบบเพื่อเปรียบเทียบโครงสร้างคอลัมน์ได้)');
       }
 
       // Load fresh copy of current employees
@@ -914,8 +1026,8 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
         const rawEmpNo = getRowValue(r, EMP_NO_ALIASES);
         const rawEmpCode = getRowValue(r, EMP_CODE_ALIASES);
         const rawGid = getRowValue(r, GID_ALIASES);
-        const rawFirstName = getRowValue(r, FIRST_NAME_ALIASES);
-        const rawFamilyName = getRowValue(r, FAMILY_NAME_ALIASES);
+        let rawFirstName = getRowValue(r, FIRST_NAME_ALIASES);
+        let rawFamilyName = getRowValue(r, FAMILY_NAME_ALIASES);
         const rawDept = getRowValue(r, DEPT_ALIASES);
         const rawDivision = getRowValue(r, DIVISION_ALIASES);
         const rawFunction = getRowValue(r, FUNCTION_ALIASES);
@@ -933,17 +1045,30 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
           return; // Ignore empty rows
         }
 
+        // Auto split full name if first name contains both first and family name
+        if (rawFirstName && !rawFamilyName && rawFirstName.includes(' ')) {
+          const parts = parseEmployeeNameParts(rawFirstName);
+          rawFirstName = parts.firstName;
+          if (parts.familyName && parts.familyName !== '-') {
+            rawFamilyName = parts.familyName;
+          }
+        }
+
         // 1. Try to match existing employee in current database via Strict Uniqueness (EmpNo, EmpCode, GID)
         let existingIndex = -1;
         let matchType = '';
 
         const dupMatch = findDuplicateEmployee(rawEmpNo, rawEmpCode, rawGid, currentList);
         if (dupMatch) {
-          existingIndex = currentList.findIndex(
-            e =>
-              (e.empNo && e.empNo.trim().toUpperCase() === dupMatch.employee.empNo.trim().toUpperCase()) ||
-              (dupMatch.employee.gid && e.gid && e.gid.trim().toUpperCase() === dupMatch.employee.gid.trim().toUpperCase())
-          );
+          existingIndex = currentList.indexOf(dupMatch.employee);
+          if (existingIndex < 0) {
+            existingIndex = currentList.findIndex(
+              e =>
+                (e.id && dupMatch.employee.id && e.id === dupMatch.employee.id) ||
+                (e.empNo && dupMatch.employee.empNo && e.empNo.trim().toUpperCase() === dupMatch.employee.empNo.trim().toUpperCase()) ||
+                (dupMatch.employee.gid && e.gid && e.gid.trim().toUpperCase() === dupMatch.employee.gid.trim().toUpperCase())
+            );
+          }
           if (existingIndex >= 0) {
             matchType = `${dupMatch.fieldLabel} (${dupMatch.matchedValue})`;
           }
@@ -951,18 +1076,18 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
         // Secondary fallback: Match by First & Last Name if identifier did not match
         if (existingIndex < 0 && rawFirstName) {
-          const cleanFn = rawFirstName.toLowerCase();
-          const cleanLn = (rawFamilyName || '').toLowerCase();
+          const cleanFn = rawFirstName.trim().toLowerCase();
+          const cleanLn = (rawFamilyName || '').trim().toLowerCase();
           existingIndex = currentList.findIndex(e => {
             const eFn = (e.firstName || '').trim().toLowerCase();
             const eLn = (e.familyName || '').trim().toLowerCase();
             if (cleanLn) {
               return (eFn === cleanFn && eLn === cleanLn) || (eFn === cleanLn && eLn === cleanFn);
             }
-            return eFn === cleanFn && eFn.length >= 4;
+            return (eFn === cleanFn && eFn.length >= 3) || (`${eFn} ${eLn}`.trim() === cleanFn);
           });
           if (existingIndex >= 0) {
-            matchType = `ชื่อ (${rawFirstName})`;
+            matchType = `ชื่อ (${rawFirstName}${rawFamilyName ? ` ${rawFamilyName}` : ''})`;
           }
         }
 
@@ -973,7 +1098,16 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
           // 0. EmpNo (if provided and different)
           if (rawEmpNo !== undefined) {
-            const cleanEmpNo = String(rawEmpNo).trim().replace(/\.0+$/, '');
+            let cleanEmpNo = String(rawEmpNo).trim().replace(/\.0+$/, '');
+            // Preserve padded 4-digit format from database if Excel stripped leading zero (e.g. 149 vs 0149)
+            if (/^\d+$/.test(cleanEmpNo) && /^\d+$/.test(existing.empNo)) {
+              if (parseInt(cleanEmpNo, 10) === parseInt(existing.empNo, 10)) {
+                cleanEmpNo = existing.empNo;
+              } else if (cleanEmpNo.length < 4 && existing.empNo.length === 4) {
+                cleanEmpNo = cleanEmpNo.padStart(4, '0');
+              }
+            }
+
             if (cleanEmpNo && cleanEmpNo !== existing.empNo) {
               const oldEmpNo = existing.empNo;
               changes.push({
@@ -992,7 +1126,10 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
           // 1. CostCenter (Update or Add)
           if (rawCostCenter !== undefined) {
-            const newCostCenter = rawCostCenter.trim();
+            let newCostCenter = rawCostCenter.trim();
+            if (/^\d{5}$/.test(newCostCenter)) {
+              newCostCenter = `C${newCostCenter}`;
+            }
             if (newCostCenter && newCostCenter !== existing.costCenter) {
               changes.push({
                 field: 'costCenter',
@@ -1007,7 +1144,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
           // 2. EmpCode (Update or Add 8-digit Payroll code)
           if (rawEmpCode !== undefined) {
-            const cleanEmpCode = rawEmpCode.replace(/\.0+$/, '').replace(/\s+/g, '');
+            const cleanEmpCode = rawEmpCode.replace(/\.0+$/, '').replace(/\D/g, '');
             if (cleanEmpCode && cleanEmpCode !== (existing.empCode || '')) {
               changes.push({
                 field: 'empCode',
@@ -1021,19 +1158,28 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
           }
 
           // 3. Department
-          if (rawDept !== undefined) {
-            const newDept = rawDept.trim().toUpperCase();
-            if (newDept && newDept !== existing.department) {
-              changes.push({
-                field: 'department',
-                label: 'แผนก (Department)',
-                from: existing.department || '(ไม่มี)',
-                to: newDept,
-              });
-              existing.department = newDept;
-              deptUpdated++;
-              deptChangedEmployees.push({ empNo: existing.empNo, gid: existing.gid, newDept });
+          let newDept: string | undefined = undefined;
+          if (rawDept !== undefined && rawDept.trim() !== '') {
+            newDept = toCanonicalDepartment(rawDept);
+            if (isDemoDepartment(newDept) && selectedSection !== 'ALL') {
+              newDept = selectedSection;
             }
+          } else if (selectedSection !== 'ALL' && isDemoDepartment(existing.department)) {
+            newDept = selectedSection;
+          } else if (isDemoDepartment(existing.department)) {
+            newDept = sanitizeEmployeeDepartment(existing).department;
+          }
+
+          if (newDept && newDept !== existing.department) {
+            changes.push({
+              field: 'department',
+              label: 'แผนก (Department)',
+              from: existing.department || '(ไม่มี)',
+              to: newDept,
+            });
+            existing.department = newDept;
+            deptUpdated++;
+            deptChangedEmployees.push({ empNo: existing.empNo, gid: existing.gid, newDept });
           }
 
           // 4. Division
@@ -1108,10 +1254,10 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
           // 8. IsShiftWorker
           if (rawShiftWorker !== undefined) {
             const lower = rawShiftWorker.toLowerCase();
-            const isShift = ['true', 'yes', 'y', '1', 'shift', 'กะ', 'เข้ากะ', 'เข้ากะทำงาน'].includes(lower);
-            const isOffice = ['false', 'no', 'n', '0', 'normal', 'office', 'ปกติ', 'ออฟฟิศ', 'ไม่เข้ากะ'].includes(lower);
+            const isShift = lower.includes('shift') || lower.includes('กะ') || ['true', 'yes', 'y', '1'].includes(lower);
+            const isOffice = lower.includes('office') || lower.includes('normal') || lower.includes('ปกติ') || lower.includes('ไม่เข้ากะ') || ['false', 'no', 'n', '0'].includes(lower);
             if (isShift || isOffice) {
-              const targetShift = isShift;
+              const targetShift = isShift && !isOffice;
               if (targetShift !== Boolean(existing.isShiftWorker)) {
                 changes.push({
                   field: 'isShiftWorker',
@@ -1125,19 +1271,30 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
             }
           }
 
-          // 9. IsActive
-          if (rawActive !== undefined) {
-            const lower = rawActive.toLowerCase();
-            const isActive = ['true', 'yes', 'y', '1', 'active', 'ปกติ', 'เปิด', 'ทำงาน'].includes(lower);
-            const isInactive = ['false', 'no', 'n', '0', 'inactive', 'ลาออก', 'ปิด', 'ระงับ'].includes(lower);
-            if (isActive || isInactive) {
-              const targetActive = isActive;
+          // 9. IsActive (Strictly supports Deactivate, De-activate, Inactive, Active, etc.)
+          if (rawActive !== undefined && String(rawActive).trim() !== '') {
+            const lower = String(rawActive).trim().toLowerCase();
+            const hasDeactWord = lower.includes('deact') || lower.includes('de-act') || lower.includes('inactive') || lower.includes('disab');
+            const hasThaiDeact = (lower.includes('ปิด') && !lower.includes('เปิด')) || lower.includes('ระงับ') || lower.includes('ลาออก') || lower.includes('ยกเลิก') || (lower.includes('ไม่') && !lower.includes('ไม่มี'));
+            const hasExplicitFalse = ['false', 'no', 'n', '0', 'off'].includes(lower);
+
+            const isInactive = hasDeactWord || hasThaiDeact || hasExplicitFalse;
+            const isActive = !isInactive && (
+              lower.includes('active') || 
+              lower.includes('เปิด') || 
+              lower.includes('ปกติ') || 
+              lower.includes('ทำงาน') || 
+              ['true', 'yes', 'y', '1', 'on'].includes(lower)
+            );
+
+            if (isInactive || isActive) {
+              const targetActive = !isInactive;
               if (targetActive !== (existing.isActive !== false)) {
                 changes.push({
                   field: 'isActive',
-                  label: 'สถานะการทำงาน',
-                  from: existing.isActive !== false ? 'เปิดใช้งาน' : 'ระงับ',
-                  to: targetActive ? 'เปิดใช้งาน' : 'ระงับ',
+                  label: 'สถานะการทำงาน (Active / Deactivate)',
+                  from: existing.isActive !== false ? 'เปิดใช้งาน (Active)' : 'ระงับ (Deactivated)',
+                  to: targetActive ? 'เปิดใช้งาน (Active)' : 'ระงับ (Deactivated)',
                 });
                 existing.isActive = targetActive;
               }
@@ -1195,18 +1352,25 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
             const finalEmpNo = cleanEmpNo || cleanGid.replace(/^Z/i, '').slice(0, 4) || `E${Date.now().toString().slice(-4)}`;
             const finalGid = cleanGid || `Z${finalEmpNo}TH`;
             const finalEmpCode = cleanEmpCode || undefined;
-            const newDept = (rawDept && rawDept.trim().toUpperCase()) || (selectedSection !== 'ALL' ? selectedSection : 'GM');
+            let newDept = rawDept ? toCanonicalDepartment(rawDept) : (selectedSection !== 'ALL' ? selectedSection : 'GM');
+            if (isDemoDepartment(newDept) && selectedSection !== 'ALL') {
+              newDept = selectedSection;
+            }
             const lowerShift = (rawShiftWorker || '').toLowerCase();
-            const isShift = ['true', 'yes', 'y', '1', 'shift', 'กะ', 'เข้ากะ'].includes(lowerShift);
+            const isShift = lowerShift.includes('shift') || lowerShift.includes('กะ') || ['true', 'yes', 'y', '1'].includes(lowerShift);
 
             // Double check if final identifiers collide with any employee in currentList (preventing duplicates within file or derived IDs)
             const secondMatch = findDuplicateEmployee(finalEmpNo, finalEmpCode, finalGid, currentList);
             if (secondMatch) {
-              const secIdx = currentList.findIndex(
-                e =>
-                  (e.empNo && e.empNo.trim().toUpperCase() === secondMatch.employee.empNo.trim().toUpperCase()) ||
-                  (secondMatch.employee.gid && e.gid && e.gid.trim().toUpperCase() === secondMatch.employee.gid.trim().toUpperCase())
-              );
+              let secIdx = currentList.indexOf(secondMatch.employee);
+              if (secIdx < 0) {
+                secIdx = currentList.findIndex(
+                  e =>
+                    (e.id && secondMatch.employee.id && e.id === secondMatch.employee.id) ||
+                    (e.empNo && e.empNo.trim().toUpperCase() === secondMatch.employee.empNo.trim().toUpperCase()) ||
+                    (secondMatch.employee.gid && e.gid && e.gid.trim().toUpperCase() === secondMatch.employee.gid.trim().toUpperCase())
+                );
+              }
               if (secIdx >= 0) {
                 const existing = currentList[secIdx];
                 const changes: EmployeeFieldChange[] = [];
@@ -1216,8 +1380,10 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                   empCodeUpdated++;
                 }
                 if (rawCostCenter && rawCostCenter.trim() !== (existing.costCenter || '')) {
-                  changes.push({ field: 'costCenter', label: 'Cost Center', from: existing.costCenter || '(ว่าง)', to: rawCostCenter.trim() });
-                  existing.costCenter = rawCostCenter.trim();
+                  let cc = rawCostCenter.trim();
+                  if (/^\d{5}$/.test(cc)) cc = `C${cc}`;
+                  changes.push({ field: 'costCenter', label: 'Cost Center', from: existing.costCenter || '(ว่าง)', to: cc });
+                  existing.costCenter = cc;
                   costCenterUpdated++;
                 }
                 if (newDept && newDept !== existing.department) {
@@ -1243,6 +1409,24 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                 }
                 return;
               }
+              // If collision found but not in index, skip to avoid duplicates
+              unchangedCount++;
+              return;
+            }
+
+            let ccToUse = rawCostCenter ? rawCostCenter.trim() : 'C93056';
+            if (/^\d{5}$/.test(ccToUse)) ccToUse = `C${ccToUse}`;
+
+            let newIsActive = true;
+            if (rawActive !== undefined && String(rawActive).trim() !== '') {
+              const lower = String(rawActive).trim().toLowerCase();
+              const hasDeactWord = lower.includes('deact') || lower.includes('de-act') || lower.includes('inactive') || lower.includes('disab');
+              const hasThaiDeact = (lower.includes('ปิด') && !lower.includes('เปิด')) || lower.includes('ระงับ') || lower.includes('ลาออก') || lower.includes('ยกเลิก') || (lower.includes('ไม่') && !lower.includes('ไม่มี'));
+              const hasExplicitFalse = ['false', 'no', 'n', '0', 'off'].includes(lower);
+
+              if (hasDeactWord || hasThaiDeact || hasExplicitFalse) {
+                newIsActive = false;
+              }
             }
 
             const newEmp: Employee = {
@@ -1255,9 +1439,9 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
               department: newDept,
               division: rawDivision || 'MO CS BTS',
               functionTitle: rawFunction || '',
-              costCenter: rawCostCenter || 'C93056',
+              costCenter: ccToUse,
               isShiftWorker: isShift,
-              isActive: true,
+              isActive: newIsActive,
               updatedAt: nowIso,
             };
 
@@ -1312,19 +1496,20 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
           );
           if (userIdx >= 0 && users[userIdx].department !== newDept) {
             users[userIdx].department = newDept;
-            storage.saveUser(users[userIdx]);
             usersModified = true;
           }
         });
         if (usersModified) {
+          await storage.setUsers(users);
           showToast('อัปเดตแผนกในบัญชีผู้ใช้งาน (User Accounts) ที่เกี่ยวข้องให้ตรงกันเรียบร้อย', 'info');
         }
       }
 
       // Save and sync to Cloud
+      let syncSucceeded = true;
       if (addedCount > 0 || updatedCount > 0) {
-        showToast('กำลังบันทึกและซิงค์ข้อมูลพนักงานขึ้นคลาวด์...', 'info');
-        await storage.setEmployees(currentList);
+        showToast('กำลังบันทึกและซิงค์ข้อมูลพนักงานขึ้นคลาวด์ (Time Out สูงสุด 60 วินาที)...', 'info');
+        syncSucceeded = await storage.setEmployees(currentList, 60000);
         onDataChanged();
       }
 
@@ -1348,14 +1533,30 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
       setUploadSummary(summary);
 
       if (addedCount > 0 || updatedCount > 0) {
-        showToast(`อัปเดตสำเร็จ! แก้ไข/เพิ่มข้อมูล ${updatedCount} คน, เพิ่มใหม่ ${addedCount} คน (ซิงค์คลาวด์แล้ว)`, 'success');
+        if (syncSucceeded) {
+          showToast(`อัปเดตสำเร็จ! ซิงค์ฐานข้อมูลขึ้นคลาวด์เรียบร้อย (เพิ่ม ${addedCount} คน, แก้ไข ${updatedCount} คน)`, 'success');
+        } else {
+          showToast(`บันทึกข้อมูลในเครื่องเรียบร้อยแล้ว (${currentList.length} คน) แต่การเชื่อมต่อคลาวด์ใช้เวลานาน ระบบจะซิงค์ในเบื้องหลัง`, 'info');
+        }
       } else {
         showToast('ข้อมูลในไฟล์ตรงกับฐานข้อมูลปัจจุบันแล้ว ไม่มีการเปลี่ยนแปลง', 'info');
       }
 
     } catch (err: any) {
       setIsSyncing(false);
-      alert(`ข้อผิดพลาดในการอัปโหลด: ${err.message}`);
+      console.error('Batch Upload Error:', err);
+      const errMsg = err?.message || 'เกิดข้อผิดพลาดในการประมวลผลไฟล์';
+      setUploadError({
+        title: 'เกิดข้อผิดพลาดในขั้นตอนการอัปโหลดข้อมูลพนักงาน',
+        message: errMsg,
+        details: [
+          'กรุณาตรวจสอบว่ามีคอลัมน์ระบุตัวตน (EmpNo, EmpCode หรือ GID) อย่างน้อย 1 คอลัมน์ในแต่ละแถว',
+          'หากเป็นพนักงานใหม่ ต้องมีคอลัมน์ชื่อพนักงาน (FirstName หรือ FullName)',
+          'ตรวจสอบว่าไฟล์มีชีตข้อมูลที่มีหัวตารางชัดเจน (สามารถดาวน์โหลด Template เพื่อดูตัวอย่างโครงสร้างได้)',
+          'หากไฟล์เป็น Excel ตรวจสอบว่าไม่ได้ป้องกันด้วยรหัสผ่าน หรือเปิดไฟล์ค้างอยู่ในโปรแกรมอื่น'
+        ]
+      });
+      showToast(`ข้อผิดพลาดในการอัปโหลด: ${errMsg}`, 'error');
     } finally {
       e.target.value = '';
     }
@@ -1402,7 +1603,9 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
             <p className="text-xs text-slate-400">
               {isAdmin 
                 ? 'เชื่อมโยงข้อมูลด้วย GID และ Employee No., กำหนดการเข้ากะ (Shift Status), และจัดการสถานะ Activate / Deactivate'
-                : `Role User (${currentUser.name}): สิทธิ์เรียกดูฐานข้อมูลพนักงาน กรองแผนก และส่งออกข้อมูล (View, Filter & Export Only) • การเพิ่ม แก้ไข หรือลบข้อมูลพนักงานสงวนไว้สำหรับ Role Admin`}
+                : currentUser.role === 'General'
+                  ? `Role General (${currentUser.name}): สิทธิ์เรียกดูฐานข้อมูลพนักงานเฉพาะแผนก ${currentUser.department} เท่านั้น (View Only)`
+                  : `Role User (${currentUser.name}): สิทธิ์เรียกดูฐานข้อมูลพนักงาน กรองแผนก และส่งออกข้อมูล (View, Filter & Export Only) • การเพิ่ม แก้ไข หรือลบข้อมูลพนักงานสงวนไว้สำหรับ Role Admin`}
             </p>
           </div>
         </div>
@@ -1477,6 +1680,24 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
               CSV
             </button>
           </div>
+
+          {/* Manual Cloud Sync Button with 45s Timeout */}
+          <button
+            type="button"
+            onClick={handleManualSync}
+            disabled={isSyncing}
+            title="ซิงค์ฐานข้อมูลพนักงานกับระบบ Cloud Firestore ทันที (ขยาย Time Out สูงสุด 45 วินาที)"
+            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded border text-xs font-semibold shadow-xs transition cursor-pointer ${
+              isSyncing
+                ? 'opacity-70 cursor-not-allowed bg-slate-800 border-slate-700 text-slate-400'
+                : isDark
+                  ? 'bg-sky-950/60 hover:bg-sky-900/80 border-sky-600/70 text-sky-300 hover:text-white'
+                  : 'bg-sky-50 hover:bg-sky-100 border-sky-300 text-sky-700 hover:text-sky-900'
+            }`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-sky-400' : 'text-sky-400'}`} />
+            <span>{isSyncing ? 'กำลังซิงค์...' : 'ซิงค์คลาวด์'}</span>
+          </button>
 
           {isAdmin && (
             <>
@@ -1570,26 +1791,38 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                   <label htmlFor="select-employee-section" className="text-xs font-bold text-teal-400 whitespace-nowrap flex items-center gap-1">
                     <span>Section / แผนก:</span>
                   </label>
-                  <select
-                    id="select-employee-section"
-                    aria-label="เลือก Section หรือแผนก"
-                    value={selectedSection}
-                    onChange={e => handleSectionChange(e.target.value)}
-                    className={`px-3 py-1.5 rounded border text-xs font-medium cursor-pointer outline-none transition min-w-[190px] ${
-                      isDark 
-                        ? 'bg-[#14202c] border-[#273a4e] text-white focus:border-[#00e5e5]' 
-                        : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-[#008b99]'
-                    }`}
-                  >
-                    <option value="ALL">
-                      ทุกแผนก (All Sections) ({employees.length} คน)
-                    </option>
-                    {availableSections.map(s => (
-                      <option key={s.code} value={s.code}>
-                        {s.code} - {s.name} ({sectionCounts[s.code] || 0} คน)
+                  {currentUser.role === 'General' ? (
+                    <div 
+                      className={`px-3 py-1.5 rounded border text-xs font-semibold flex items-center gap-1.5 ${
+                        isDark ? 'bg-[#14202c] border-purple-500/40 text-purple-300' : 'bg-purple-50 border-purple-300 text-purple-800'
+                      }`}
+                      title={`Role General: สิทธิ์ดูเฉพาะแผนก ${currentUser.department}`}
+                    >
+                      <Eye className="w-3.5 h-3.5 text-purple-400" />
+                      <span>แผนก {currentUser.department} (View Only)</span>
+                    </div>
+                  ) : (
+                    <select
+                      id="select-employee-section"
+                      aria-label="เลือก Section หรือแผนก"
+                      value={selectedSection}
+                      onChange={e => handleSectionChange(e.target.value)}
+                      className={`px-3 py-1.5 rounded border text-xs font-medium cursor-pointer outline-none transition min-w-[190px] ${
+                        isDark 
+                          ? 'bg-[#14202c] border-[#273a4e] text-white focus:border-[#00e5e5]' 
+                          : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-[#008b99]'
+                      }`}
+                    >
+                      <option value="ALL">
+                        ทุกแผนก (All Sections) ({employees.length} คน)
                       </option>
-                    ))}
-                  </select>
+                      {availableSections.map(s => (
+                        <option key={s.code} value={s.code}>
+                          {s.code} - {s.name} ({sectionCounts[s.code] || 0} คน)
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
 
                 {/* 2. Shift Worker Type Filter */}
@@ -2177,7 +2410,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                           isDark ? 'bg-[#0f1722] border-[#273a4e] text-teal-300' : 'bg-white border-slate-300 text-teal-800'
                         }`}
                       >
-                        {departments.map(d => (
+                        {visibleDepartments.map(d => (
                           <option key={d.code} value={d.code}>
                             {d.code} {d.name && d.name !== d.code ? `- ${d.name}` : ''}
                           </option>
@@ -2285,7 +2518,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
 
                   {/* Active Status Card */}
                   <div 
-                    onClick={() => setEmpForm(prev => ({ ...prev, isActive: !prev.isActive }))}
+                    onClick={() => setEmpForm(prev => ({ ...prev, isActive: !(prev.isActive !== false) }))}
                     className={`p-4 rounded-xl border transition-all cursor-pointer flex items-start gap-3.5 select-none ${
                       empForm.isActive !== false
                         ? isDark
@@ -2364,6 +2597,82 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                 </div>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Upload Error Diagnostic Modal */}
+      {uploadError && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-3 sm:p-6 backdrop-blur-xs">
+          <div className={`w-full max-w-lg rounded-xl border shadow-2xl overflow-hidden flex flex-col ${
+            isDark ? 'bg-[#101b26] border-rose-900/60 text-white' : 'bg-white border-rose-300 text-slate-900'
+          }`}>
+            <div className={`p-4 sm:p-5 border-b flex items-start justify-between ${
+              isDark ? 'bg-rose-950/40 border-rose-900/50' : 'bg-rose-50 border-rose-200'
+            }`}>
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 rounded-lg bg-rose-500/20 text-rose-400 border border-rose-500/30 shrink-0">
+                  <AlertCircle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-rose-300">
+                    {uploadError.title}
+                  </h3>
+                  <p className="text-xs text-rose-200/80 mt-0.5 font-mono">
+                    {uploadError.message}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setUploadError(null)}
+                className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-700/50 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 sm:p-5 space-y-3 text-xs">
+              <div className="font-semibold text-slate-200">
+                ข้อแนะนำในการแก้ไขและตรวจสอบไฟล์:
+              </div>
+              <ul className="space-y-2 text-slate-300">
+                {(uploadError.details || []).map((detail, dIdx) => (
+                  <li key={dIdx} className="flex items-start gap-2">
+                    <span className="text-rose-400 font-bold shrink-0">•</span>
+                    <span>{detail}</span>
+                  </li>
+                ))}
+              </ul>
+              <div className={`p-3 rounded-lg border mt-2 flex items-center justify-between gap-2 ${
+                isDark ? 'bg-[#142230] border-[#223547]' : 'bg-slate-50 border-slate-200'
+              }`}>
+                <div className="text-[11px] text-slate-400">
+                  ต้องการโครงสร้างไฟล์ต้นแบบที่ถูกต้อง?
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleDownloadImportTemplate('xlsx');
+                    setUploadError(null);
+                  }}
+                  className="px-2.5 py-1 rounded bg-teal-600 hover:bg-teal-500 text-white font-medium text-xs flex items-center gap-1 cursor-pointer transition"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>ดาวน์โหลด Template (.xlsx)</span>
+                </button>
+              </div>
+            </div>
+
+            <div className={`p-3 sm:p-4 border-t flex justify-end ${
+              isDark ? 'bg-[#152332] border-[#223547]' : 'bg-slate-50 border-slate-200'
+            }`}>
+              <button
+                onClick={() => setUploadError(null)}
+                className="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white font-medium text-xs transition cursor-pointer"
+              >
+                ปิดหน้าต่าง
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -2656,16 +2965,39 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
         <div className={`p-4 rounded border text-xs overflow-hidden ${
           isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
         }`}>
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="text-sm font-bold">รายชื่อแผนกทั้งหมด</h2>
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-4">
+            <div>
+              <h2 className="text-sm font-bold flex items-center gap-2">
+                <span>รายชื่อแผนกทั้งหมด</span>
+                <span className="text-xs px-2 py-0.5 rounded-full bg-teal-500/20 text-teal-300 font-mono">
+                  {visibleDepartments.length} แผนก
+                </span>
+              </h2>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                แผนกที่ระบบใช้งานจริง: ADM/CMM, BES/PSY, BES/PSY2, DWE, GM, MCC, MLR, OHL, RST, RST2, STR, TEL, TRW/TRL
+              </p>
+            </div>
             {isAdmin && (
-              <button
-                onClick={handleOpenCreateDept}
-                className="flex items-center space-x-1 px-3 py-1.5 rounded font-semibold text-xs bg-teal-600 hover:bg-teal-700 text-white shadow transition"
-              >
-                <UserPlus className="w-3.5 h-3.5" />
-                <span>เพิ่มแผนกใหม่</span>
-              </button>
+              <div className="flex items-center space-x-2">
+                {zeroEmpDeptsCount > 0 && (
+                  <button
+                    onClick={handlePurgeZeroEmployeeDepts}
+                    disabled={isSyncing}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 rounded font-semibold text-xs bg-rose-600/90 hover:bg-rose-600 text-white shadow transition cursor-pointer"
+                    title="ลบแผนกที่ไม่มีพนักงาน (0 คน) ออกจากระบบทั้งหมด"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>ลบแผนก 0 คนทั้งหมด ({zeroEmpDeptsCount} แผนก)</span>
+                  </button>
+                )}
+                <button
+                  onClick={handleOpenCreateDept}
+                  className="flex items-center space-x-1 px-3 py-1.5 rounded font-semibold text-xs bg-teal-600 hover:bg-teal-700 text-white shadow transition cursor-pointer"
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>เพิ่มแผนกใหม่</span>
+                </button>
+              </div>
             )}
           </div>
           <div className="overflow-x-auto">
@@ -2681,8 +3013,8 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                 </tr>
               </thead>
               <tbody>
-                {departments.map((dept) => {
-                  const empCount = employees.filter(e => (e.department || '').trim().toUpperCase() === (dept.code || '').trim().toUpperCase()).length;
+                {visibleDepartments.map((dept) => {
+                  const empCount = employees.filter(e => isSameDepartment(e.department, dept.code)).length;
                   return (
                     <tr key={dept.code} className={`border-b ${
                       isDark ? 'border-slate-800 hover:bg-[#1a2838]' : 'border-slate-200 hover:bg-slate-50'
@@ -2725,7 +3057,7 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                   </tr>
                 );
               })}
-              {departments.length === 0 && (
+              {visibleDepartments.length === 0 && (
                 <tr>
                   <td colSpan={4} className="p-4 text-center text-slate-400">
                       ไม่พบข้อมูลแผนก
@@ -2767,19 +3099,39 @@ export const EmployeeMasterView: React.FC<EmployeeMasterViewProps> = ({
                       required
                       disabled={!isNewDept}
                       value={deptForm.code}
-                      onChange={e => setDeptForm(prev => ({ ...prev, code: e.target.value.toUpperCase() }))}
+                      onChange={e => {
+                        const newCode = e.target.value.toUpperCase();
+                        const official = getCanonicalDepartmentFullName(newCode);
+                        setDeptForm(prev => ({
+                          ...prev,
+                          code: newCode,
+                          name: (!prev.name || prev.name === prev.code || prev.name === official) ? official : prev.name
+                        }));
+                      }}
                       className={`w-full p-2.5 rounded-lg border font-mono text-xs ${
                         isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
                       } ${!isNewDept ? 'opacity-50 cursor-not-allowed' : ''}`}
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-400 mb-1 text-xs font-semibold">ชื่อแผนก (Name) *</label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-slate-400 text-xs font-semibold">ชื่อแผนก (Name) *</label>
+                      {deptForm.code && getCanonicalDepartmentFullName(deptForm.code) !== deptForm.code && deptForm.name !== getCanonicalDepartmentFullName(deptForm.code) && (
+                        <button
+                          type="button"
+                          onClick={() => setDeptForm(prev => ({ ...prev, name: getCanonicalDepartmentFullName(prev.code) }))}
+                          className="text-[11px] text-teal-400 hover:text-teal-300 underline cursor-pointer"
+                        >
+                          ใช้ชื่อทางการ
+                        </button>
+                      )}
+                    </div>
                     <input
                       type="text"
                       required
                       value={deptForm.name}
                       onChange={e => setDeptForm(prev => ({ ...prev, name: e.target.value }))}
+                      placeholder={getCanonicalDepartmentFullName(deptForm.code) || 'เช่น Trackwork - Depot'}
                       className={`w-full p-2.5 rounded-lg border text-xs ${
                         isDark ? 'bg-[#0f1722] border-[#273a4e] text-white' : 'bg-slate-50 border-slate-300'
                       }`}

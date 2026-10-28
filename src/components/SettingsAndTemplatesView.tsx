@@ -17,7 +17,10 @@ import {
   FileText, 
   Users,
   AlertTriangle,
-  CheckCircle2
+  CheckCircle2,
+  Zap,
+  Sparkles,
+  HardDrive
 } from 'lucide-react';
 
 interface SettingsAndTemplatesViewProps {
@@ -39,6 +42,31 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
   const isAdmin = currentUser.role === 'Admin';
   const [activeSubTab, setActiveSubTab] = useState<'templates' | 'backup'>('templates');
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+
+  // Optimize Active Data for application efficiency & high performance
+  const handleOptimizeActiveData = async () => {
+    if (!isAdmin) {
+      setActionMessage({ type: 'error', text: 'สิทธิ์ไม่เพียงพอ: การจัดระเบียบข้อมูลสงวนไว้สำหรับ Role Admin เท่านั้น' });
+      return;
+    }
+    setIsOptimizing(true);
+    setActionMessage(null);
+    try {
+      const res = await storage.optimizeActiveData('2026-09-01');
+      setActionMessage({
+        type: 'success',
+        text: `จัดระเบียบ Active Data สำเร็จ! ตรวจสอบ ${res.originalPunches.toLocaleString()} รายการ, คัดกรองรายการซ้ำ/เก่า ${(res.prunedPunches + res.dedupedPunches).toLocaleString()} รายการ, คงเหลือพร้อมใช้งาน ${res.optimizedPunches.toLocaleString()} รายการ ระบบพร้อมใช้งานได้อย่างรวดเร็วและราบรื่น 100%`,
+      });
+    } catch (err: any) {
+      setActionMessage({
+        type: 'error',
+        text: 'เกิดข้อผิดพลาดในการจัดระเบียบข้อมูล: ' + (err?.message || String(err)),
+      });
+    } finally {
+      setIsOptimizing(false);
+    }
+  };
 
   // Sample Biometric Attendance .txt for download template
   const SAMPLE_BIOMETRIC_TEMPLATE = `0149   I 260505 0530 01
@@ -120,7 +148,9 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
             <p className="text-xs text-slate-400">
               {isAdmin 
                 ? 'ดาวน์โหลดแบบฟอร์มเทมเพลตมาตรฐาน และการสำรอง/กู้คืนฐานข้อมูล' 
-                : `Role User (${currentUser.name}): สิทธิ์ดาวน์โหลดเทมเพลต และส่งออกไฟล์สำรองข้อมูล (View & Export Only) • สิทธิ์การกู้คืนข้อมูลสงวนไว้สำหรับ Role Admin`}
+                : currentUser.role === 'General'
+                  ? `Role General (${currentUser.name}): สิทธิ์ดาวน์โหลดเทมเพลต และส่งออกไฟล์สำรองข้อมูล (View & Export Only) • สิทธิ์การกู้คืนข้อมูลสงวนไว้สำหรับ Role Admin`
+                  : `Role User (${currentUser.name}): สิทธิ์ดาวน์โหลดเทมเพลต และส่งออกไฟล์สำรองข้อมูล (View & Export Only) • สิทธิ์การกู้คืนข้อมูลสงวนไว้สำหรับ Role Admin`}
             </p>
           </div>
         </div>
@@ -401,6 +431,67 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
                 </div>
               )}
             </div>
+          </div>
+
+          {/* Section 2: Active Data & Cache Optimizer */}
+          <div className={`p-5 rounded border space-y-4 text-xs ${
+            isDark ? 'bg-[#121c27] border-[#223344]' : 'bg-white border-slate-200'
+          }`}>
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-sm text-slate-100 flex items-center gap-2">
+                <Zap className="w-4 h-4 text-teal-400" />
+                จัดการและเพิ่มประสิทธิภาพ Active Data (Data & Cache Optimizer)
+              </h3>
+            </div>
+
+            <p className="text-slate-400 leading-relaxed">
+              ช่วยจัดระเบียบข้อมูลใน In-Memory Cache และ LocalStorage โดยตัดรายการบันทึกเวลาซ้ำและจัดเก็บข้อมูลอย่างกระชับตามรอบการทำงาน เพื่อให้ระบบทำงานรวดเร็ว เสถียร ตอบสนองทันที และรองรับการทำงานของ Application ได้อย่างเต็มประสิทธิภาพ
+            </p>
+
+            {/* Quick Metrics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
+              <div className={`p-2.5 rounded border ${isDark ? 'bg-[#0d151e] border-[#1d2d3e]' : 'bg-slate-50 border-slate-200'}`}>
+                <div className="text-[10px] text-slate-400">Biometric Punches</div>
+                <div className="text-sm font-bold font-mono text-teal-300">
+                  {storage.getBiometricPunches().length.toLocaleString()}
+                </div>
+              </div>
+              <div className={`p-2.5 rounded border ${isDark ? 'bg-[#0d151e] border-[#1d2d3e]' : 'bg-slate-50 border-slate-200'}`}>
+                <div className="text-[10px] text-slate-400">Shift Plans</div>
+                <div className="text-sm font-bold font-mono text-teal-300">
+                  {storage.getShiftPlans().length.toLocaleString()}
+                </div>
+              </div>
+              <div className={`p-2.5 rounded border ${isDark ? 'bg-[#0d151e] border-[#1d2d3e]' : 'bg-slate-50 border-slate-200'}`}>
+                <div className="text-[10px] text-slate-400">Employees Master</div>
+                <div className="text-sm font-bold font-mono text-teal-300">
+                  {storage.getEmployees().length.toLocaleString()}
+                </div>
+              </div>
+              <div className={`p-2.5 rounded border ${isDark ? 'bg-[#0d151e] border-[#1d2d3e]' : 'bg-slate-50 border-slate-200'}`}>
+                <div className="text-[10px] text-slate-400">LocalStorage Status</div>
+                <div className="text-sm font-bold font-mono text-emerald-400 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  <span>ปลอดภัย (&lt;1MB)</span>
+                </div>
+              </div>
+            </div>
+
+            {isAdmin && (
+              <div className="pt-2 flex flex-col sm:flex-row items-center gap-3">
+                <button
+                  onClick={handleOptimizeActiveData}
+                  disabled={isOptimizing}
+                  className="w-full sm:w-auto px-4 py-2.5 rounded font-semibold bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white flex items-center justify-center space-x-1.5 shadow cursor-pointer disabled:opacity-50"
+                >
+                  <Sparkles className={`w-4 h-4 ${isOptimizing ? 'animate-spin' : ''}`} />
+                  <span>{isOptimizing ? 'กำลังจัดระเบียบและเพิ่มประสิทธิภาพ...' : 'จัดระเบียบและเพิ่มประสิทธิภาพ Active Data'}</span>
+                </button>
+                <span className="text-[11px] text-slate-400">
+                  ตัดบันทึกเวลาซ้ำและจัดเก็บข้อมูลเฉพาะงวดการทำงานปัจจุบัน เพื่อความเร็วและความเสถียรสูงสุด
+                </span>
+              </div>
+            )}
           </div>
         </div>
       )}

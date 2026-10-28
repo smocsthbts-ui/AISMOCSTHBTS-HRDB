@@ -126,7 +126,11 @@ export const ManageMyAccountView: React.FC<ManageMyAccountViewProps> = ({
           <span className={`text-xs px-2.5 py-1 rounded font-mono font-bold flex items-center gap-1.5 ${
             currentUser.role === 'Admin'
               ? isDark ? 'bg-red-500/20 text-red-300 border border-red-500/30' : 'bg-red-100 text-red-700 border border-red-200'
-              : isDark ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+              : currentUser.role === 'Supervisor'
+                ? isDark ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30' : 'bg-blue-100 text-blue-700 border border-blue-200'
+                : currentUser.role === 'General'
+                  ? isDark ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-purple-100 text-purple-700 border border-purple-200'
+                  : isDark ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-100 text-emerald-700 border border-emerald-200'
           }`}>
             <ShieldCheck className="w-3.5 h-3.5" />
             <span>Role: {currentUser.role}</span>
@@ -255,8 +259,12 @@ export const ManageMyAccountView: React.FC<ManageMyAccountViewProps> = ({
               <Info className="w-4 h-4 text-teal-400 shrink-0 mt-0.5" />
               <span>
                 {currentUser.role === 'Admin'
-                  ? 'Admin: สามารถปรับเปลี่ยนสังกัดแผนกของตนเองหรือสลับดูข้อมูลได้'
-                  : 'Role User: สังกัดแผนกถูกกำหนดโดย Admin เพื่อความถูกต้องของสิทธิ์การจัดตารางกะ (หากต้องการปรับปรุงสังกัดแผนก กรุณาติดต่อ Admin)'}
+                  ? 'Admin: สามารถปรับเปลี่ยนสังกัดแผนกของตนเองหรือสลับดูข้อมูลได้ทุกแผนก'
+                  : currentUser.role === 'Supervisor'
+                    ? `Supervisor: สิทธิ์หัวหน้างาน แก้ไขเวลาหน้า Time Sheet เฉพาะแผนกสังกัด (${currentUser.department})`
+                    : currentUser.role === 'General'
+                      ? `General: สิทธิ์เรียกดูเฉพาะแผนกต้นสังกัด (${currentUser.department}) อย่างเดียวเท่านั้น (View Only - ไม่สามารถจัดกะด่วนหรือแก้ไขข้อมูลได้)`
+                      : 'Role User: สังกัดแผนกถูกกำหนดโดย Admin เพื่อความถูกต้องของสิทธิ์การจัดตารางกะ (หากต้องการปรับปรุงสังกัดแผนก กรุณาติดต่อ Admin)'}
               </span>
             </div>
 

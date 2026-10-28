@@ -12,7 +12,9 @@ import {
   hhmmToMinutes, 
   minutesToHHMM,
   isEmployeeMatch,
-  isEmployeePlanMatch
+  isEmployeePlanMatch,
+  getRecordLookupKeys,
+  getEmployeeLookupKeys
 } from '../utils/timeCalc';
 import { 
   isSameDepartment 
@@ -42,7 +44,8 @@ import {
   FileSpreadsheet,
   TrendingUp,
   Sparkles,
-  Info
+  Info,
+  Eye
 } from 'lucide-react';
 import { 
   ResponsiveContainer, 
@@ -246,7 +249,12 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
     return uploadedPlansInfo.availableMonths[0];
   }, [uploadedPlansInfo.availableMonths, selectedMonthYear]);
 
-  // Available departments for the selected month
+  // Available departments across the company
+  const allCompanyDepartments = useMemo(() => {
+    return storage.getDepartments();
+  }, [shiftPlans]);
+
+  // Available departments that have uploaded shift plans for the selected month
   const availableDepartmentsForMonth = useMemo(() => {
     const deptsSet = uploadedPlansInfo.monthDeptMap.get(effectiveMonthYear);
     if (!deptsSet) return [];
@@ -255,13 +263,13 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
 
   // Ensure effective department is valid
   const effectiveDepartment = useMemo(() => {
-    if (availableDepartmentsForMonth.length === 0) {
-      return 'ALL';
+    if (currentUser.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+      return currentUser.department;
     }
     if (selectedDepartment === 'ALL') return 'ALL';
-    const found = availableDepartmentsForMonth.find(d => isSameDepartment(d, selectedDepartment));
-    return found || (availableDepartmentsForMonth.includes(selectedDepartment) ? selectedDepartment : 'ALL');
-  }, [availableDepartmentsForMonth, selectedDepartment]);
+    const found = allCompanyDepartments.find(d => isSameDepartment(d.code, selectedDepartment));
+    return found ? found.code : selectedDepartment;
+  }, [allCompanyDepartments, selectedDepartment, currentUser.role, currentUser.department]);
 
   // Active Year for the Yearly Bar Chart Overview
   const [selectedYear, setSelectedYear] = useState<number>(() => {
@@ -281,23 +289,25 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
     return STAT_CATEGORIES.find(c => c.id === activeCategory) || STAT_CATEGORIES[0];
   }, [activeCategory]);
 
+  // Active shift plans: authoritative storage data fallback to ensure accurate statistics
+  const activeShiftPlans = useMemo(() => {
+    const stored = storage.getShiftPlans();
+    if (stored && stored.length > 0) return stored;
+    return shiftPlans || [];
+  }, [shiftPlans]);
+
   // Pre-indexed Shift Plans Map (O(1) lookup by empNo/gid + date)
   const planLookupMap = useMemo(() => {
     const map = new Map<string, DailyShiftPlan>();
-    for (const sp of shiftPlans) {
+    for (const sp of activeShiftPlans) {
       if (!sp || !sp.date) continue;
-      if (sp.empNo) {
-        const cleanEmp = sp.empNo.trim().toUpperCase();
-        map.set(`${cleanEmp}_${sp.date}`, sp);
-        map.set(`${cleanEmp.replace(/^0+/, '')}_${sp.date}`, sp);
-        map.set(`${cleanEmp.padStart(4, '0')}_${sp.date}`, sp);
-      }
-      if (sp.gid) {
-        map.set(`${sp.gid.trim().toUpperCase()}_${sp.date}`, sp);
+      const keys = getRecordLookupKeys(sp);
+      for (const k of keys) {
+        map.set(`${k}_${sp.date}`, sp);
       }
     }
     return map;
-  }, [shiftPlans]);
+  }, [activeShiftPlans]);
 
   // Pre-indexed Biometric Punches Map (O(1) lookup by empIdentifier + date)
   const punchesByEmpAndDate = useMemo(() => {
@@ -354,8 +364,12 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
       const dayOfWeek = dayNames[dateObj.getDay()];
 
       // Find shift plan in O(1)
-      const plan = (empNoKey ? planLookupMap.get(`${empNoKey}_${dateStr}`) : undefined) ||
-                   (gidKey ? planLookupMap.get(`${gidKey}_${dateStr}`) : undefined);
+      const empKeys = getEmployeeLookupKeys(emp);
+      let plan: DailyShiftPlan | undefined;
+      for (const k of empKeys) {
+        plan = planLookupMap.get(`${k}_${dateStr}`);
+        if (plan) break;
+      }
 
       // If no plan exists for this day, skip or use default
       if (!plan) continue;
@@ -546,69 +560,19 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
   };
 
   // 3. Filter employees matching the department (which has uploaded shift plans)
+  // Authoritative employee master list for Statistics (strictly from Employee Master)
   const targetEmployees = useMemo(() => {
     const baseEmployees = employees.length > 0 ? employees : storage.getEmployees();
-    const list = [...baseEmployees];
-    const knownEmpNos = new Set<string>();
-    baseEmployees.forEach(e => {
-      if (e.empNo) {
-        const clean = e.empNo.trim().toUpperCase();
-        knownEmpNos.add(clean);
-        const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
-        if (digits) {
-          knownEmpNos.add(digits);
-          knownEmpNos.add(digits.padStart(4, '0'));
-          knownEmpNos.add(`1000${digits.padStart(4, '0')}`);
-        }
-      }
-      if (e.empCode) knownEmpNos.add(e.empCode.trim().toUpperCase());
-      if (e.gid) knownEmpNos.add(e.gid.trim().toUpperCase());
-    });
-    
-    const missingEmpsFromPlans = new Map<string, DailyShiftPlan>();
-    shiftPlans.forEach(p => {
-      if (!p || !p.date || !p.date.startsWith(effectiveMonthYear)) return;
-      const eNo = (p.empNo || '').trim().toUpperCase();
-      const digits = eNo.replace(/\D/g, '').replace(/^0+/, '');
-      const isKnown = (eNo && knownEmpNos.has(eNo)) || (digits && (knownEmpNos.has(digits) || knownEmpNos.has(digits.padStart(4, '0'))));
-      if (eNo && !isKnown && !missingEmpsFromPlans.has(eNo)) {
-        missingEmpsFromPlans.set(eNo, p);
-      }
-    });
-
-    missingEmpsFromPlans.forEach((p, eNo) => {
-      const cleanNo = p.empNo || eNo;
-      const digits = cleanNo.replace(/\D/g, '');
-      const paddedNo = digits && digits.length <= 4 ? digits.padStart(4, '0') : cleanNo;
-      list.push({
-        id: `synth-${paddedNo}`,
-        empNo: paddedNo,
-        empCode: digits ? `1000${paddedNo}` : cleanNo,
-        gid: p.gid || (digits ? `Z${paddedNo}TH` : `Z${cleanNo}TH`),
-        firstName: 'พนักงาน',
-        familyName: cleanNo,
-        department: p.department || (effectiveDepartment !== 'ALL' ? effectiveDepartment : 'GM'),
-        division: 'MO CS BTS',
-        functionTitle: 'Service Technician',
-        costCenter: 'C93051',
-        isShiftWorker: true,
-        isActive: true,
-      });
-    });
+    const list = baseEmployees.filter(e => Boolean(e && e.empNo && e.isActive !== false));
 
     // Collect all employee IDs/empNos who actually have shift plans in this department & month
     const empNosInMonthPlan = new Set<string>();
-    shiftPlans.forEach(sp => {
+    activeShiftPlans.forEach(sp => {
       if (sp.date.startsWith(effectiveMonthYear)) {
         if (effectiveDepartment === 'ALL' || isSameDepartment(sp.department, effectiveDepartment)) {
-          if (sp.empNo) {
-            const clean = sp.empNo.trim().toUpperCase();
-            empNosInMonthPlan.add(clean);
-            const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
-            if (digits) {
-              empNosInMonthPlan.add(digits);
-              empNosInMonthPlan.add(digits.padStart(4, '0'));
-            }
+          const keys = getRecordLookupKeys(sp);
+          for (const k of keys) {
+            empNosInMonthPlan.add(k);
           }
         }
       }
@@ -620,11 +584,13 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
         return false;
       }
       // Must have uploaded shift plan in this month
-      const clean = (emp.empNo || '').trim().toUpperCase();
-      const digits = clean.replace(/\D/g, '').replace(/^0+/, '');
-      return empNosInMonthPlan.has(clean) || (digits && (empNosInMonthPlan.has(digits) || empNosInMonthPlan.has(digits.padStart(4, '0'))));
+      const empKeys = getEmployeeLookupKeys(emp);
+      for (const k of empKeys) {
+        if (empNosInMonthPlan.has(k)) return true;
+      }
+      return false;
     });
-  }, [employees, shiftPlans, effectiveMonthYear, effectiveDepartment]);
+  }, [employees, activeShiftPlans, effectiveMonthYear, effectiveDepartment]);
 
   // 4. Compute monthly table statistics for each employee
   const currentMonthRecords = useMemo(() => {
@@ -952,27 +918,36 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
                 <Building2 className="w-3.5 h-3.5 text-teal-400" />
                 <span>แผนก (Department):</span>
               </label>
-              {availableDepartmentsForMonth.length > 0 ? (
+              {currentUser.role === 'General' ? (
+                <div 
+                  className={`px-3 py-1.5 rounded text-xs font-semibold border flex items-center gap-1.5 ${
+                    isDark ? 'bg-[#162230] border-purple-500/40 text-purple-300' : 'bg-purple-50 border-purple-300 text-purple-800'
+                  }`}
+                  title={`Role General: สิทธิ์ดูเฉพาะแผนก ${currentUser.department}`}
+                >
+                  <Eye className="w-3.5 h-3.5 text-purple-400" />
+                  <span>แผนก {currentUser.department} (View Only)</span>
+                </div>
+              ) : (
                 <select
                   value={effectiveDepartment}
                   onChange={e => onSelectDepartment(e.target.value)}
-                  className={`px-3 py-1.5 rounded text-xs font-medium border focus:outline-hidden focus:ring-1 focus:ring-teal-400 ${
+                  className={`px-3 py-1.5 rounded text-xs font-medium border focus:outline-hidden focus:ring-1 focus:ring-teal-400 cursor-pointer ${
                     isDark ? 'bg-[#162230] border-[#25384d] text-slate-200' : 'bg-slate-50 border-slate-300 text-slate-800'
                   }`}
                 >
                   <option value="ALL">
-                    ALL (ทุกแผนกที่อัปโหลด - {availableDepartmentsForMonth.length} แผนก)
+                    ALL (ทุกแผนก - {allCompanyDepartments.length} แผนก)
                   </option>
-                  {availableDepartmentsForMonth.map(dept => (
-                    <option key={dept} value={dept}>
-                      แผนก {dept}
-                    </option>
-                  ))}
+                  {allCompanyDepartments.map(dept => {
+                    const isUploaded = uploadedPlansInfo.monthDeptMap.get(effectiveMonthYear)?.has(dept.code);
+                    return (
+                      <option key={dept.code} value={dept.code}>
+                        แผนก {dept.code} {dept.name && dept.name !== dept.code ? `(${dept.name})` : ''} {isUploaded ? '✓ อัปโหลดแล้ว' : ''}
+                      </option>
+                    );
+                  })}
                 </select>
-              ) : (
-                <div className="text-xs text-slate-400 italic">
-                  -
-                </div>
               )}
             </div>
           </div>

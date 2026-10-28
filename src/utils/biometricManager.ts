@@ -17,11 +17,12 @@ export function canonicalEmpIdentifier(emp: string): string {
  */
 function isDateToken(token: string): boolean {
   if (!token) return false;
-  const clean = token.replace(/[-/.]/g, '');
+  const stripped = token.replace(/\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun|จ|อ|พ|พฤ|ศ|ส|อา)[a-z]*/i, '').trim();
+  const clean = stripped.replace(/[-/.]/g, '');
   if (clean.length === 6 && /^\d{6}$/.test(clean)) return true;
   if (clean.length === 8 && /^\d{8}$/.test(clean)) return true;
-  if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/.test(token)) return true;
-  if (/^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$/.test(token)) return true;
+  if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$/.test(stripped)) return true;
+  if (/^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$/.test(stripped)) return true;
   return false;
 }
 
@@ -38,10 +39,13 @@ function isTimeToken(token: string): boolean {
 
 /**
  * Normalizes any recognized date representation into YYYY-MM-DD
+ * Disambiguates Thai / British DD-MM-YY and YY-MM-DD reliably.
  */
 function normalizeDate(raw: string): string {
   if (!raw) return '';
-  const trimmed = raw.trim();
+  let trimmed = raw.trim();
+  // Strip day of week if present (e.g. '23-09-26 Wed' -> '23-09-26')
+  trimmed = trimmed.replace(/\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun|จ|อ|พ|พฤ|ศ|ส|อา)[a-z]*/i, '').trim();
 
   // 6 digits: YYMMDD (e.g. 260901 -> 2026-09-01, 260128 -> 2026-01-28)
   if (/^\d{6}$/.test(trimmed)) {
@@ -59,21 +63,55 @@ function normalizeDate(raw: string): string {
     return `${yyyy}-${mm}-${dd}`;
   }
 
-  // YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD
+  // 4-digit year at start: YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD
   const ymdMatch = trimmed.match(/^(\d{4})[-/. ](\d{1,2})[-/. ](\d{1,2})/);
   if (ymdMatch) {
-    const y = ymdMatch[1];
+    let y = parseInt(ymdMatch[1], 10);
+    if (y > 2400) y -= 543; // Buddhist Era support (e.g. 2569 -> 2026)
     const m = ymdMatch[2].padStart(2, '0');
     const d = ymdMatch[3].padStart(2, '0');
     return `${y}-${m}-${d}`;
   }
 
-  // DD-MM-YYYY or DD/MM/YYYY or DD.MM.YYYY
-  const dmyMatch = trimmed.match(/^(\d{1,2})[-/. ](\d{1,2})[-/. ](\d{2,4})/);
-  if (dmyMatch) {
-    const d = dmyMatch[1].padStart(2, '0');
-    const m = dmyMatch[2].padStart(2, '0');
-    let y = dmyMatch[3];
+  // Check 3 parts with separators (e.g. '23-09-26', '26-09-01', '01-09-26', '01-09-2026')
+  const match3 = trimmed.match(/^(\d{1,4})[-/. ](\d{1,2})[-/. ](\d{1,4})/);
+  if (match3) {
+    const p1 = parseInt(match3[1], 10);
+    const p2 = parseInt(match3[2], 10);
+    const p3 = parseInt(match3[3], 10);
+
+    // Case 1: 4-digit year at end: DD-MM-YYYY (e.g. 23-09-2026)
+    if (match3[3].length === 4) {
+      let y = p3;
+      if (y > 2400) y -= 543;
+      const m = String(p2).padStart(2, '0');
+      const d = String(p1).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    // Case 2: DD-MM-YY where p3 is 2-digit year (e.g. 24, 25, 26, 27) and p1 is day (1..31)
+    // E.g. '23-09-26' -> Day 23, Month 09, Year 2026 -> 2026-09-23
+    // E.g. '01-09-26' -> Day 01, Month 09, Year 2026 -> 2026-09-01
+    if (match3[3].length === 2 && (p3 === 25 || p3 === 26 || p3 === 27 || (p3 >= 20 && p3 <= 35 && p1 <= 31))) {
+      const y = `20${match3[3].padStart(2, '0')}`;
+      const m = String(p2).padStart(2, '0');
+      const d = String(p1).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    // Case 3: YY-MM-DD where p1 is 2-digit year (e.g. 24, 25, 26, 27) and p3 is day (1..31)
+    // E.g. '26-09-01' -> Year 2026, Month 09, Day 01 -> 2026-09-01
+    if (match3[1].length === 2 && (p1 === 25 || p1 === 26 || p1 === 27 || (p1 >= 20 && p1 <= 35))) {
+      const y = `20${match3[1].padStart(2, '0')}`;
+      const m = String(p2).padStart(2, '0');
+      const d = String(p3).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    // Default fallback to DD-MM-YY
+    const d = match3[1].padStart(2, '0');
+    const m = match3[2].padStart(2, '0');
+    let y = match3[3];
     if (y.length === 2) y = `20${y}`;
     return `${y}-${m}-${d}`;
   }
@@ -147,6 +185,9 @@ export function parseBiometricText(text: string, sourceFileName?: string): Biome
       return;
     }
 
+    // Strip standalone day-of-week tokens (e.g. "Wed", "พ.") to ensure standard date/time matching succeeds
+    const lineForMatch = line.replace(/\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun|จ|อ|พ|พฤ|ศ|ส|อา)[a-z]*(\s+|$)/ig, '$2').trim();
+
     let emp = '';
     let type: 'I' | 'O' = 'I';
     let dateStr = '';
@@ -154,17 +195,17 @@ export function parseBiometricText(text: string, sourceFileName?: string): Biome
     let dev = '01';
 
     // Pattern 1: Standard with spaces: "0082   I 260901 0546 03" or "0149   I 260128 0442 01"
-    const standardMatch = line.match(/^([A-Za-z0-9_-]+)\s+([IO]|IN|OUT)\s+(\d{6}|\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{4}|\d{1,2}:\d{2}(?::\d{2})?)\s*([A-Za-z0-9_-]*)/i);
+    const standardMatch = lineForMatch.match(/^([A-Za-z0-9_-]+)\s+([IO]|IN|OUT)\s+(\d{6}|\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{4}|\d{1,2}:\d{2}(?::\d{2})?)\s*([A-Za-z0-9_-]*)/i);
 
     // Pattern 2: Compact: "Z0057PUI 260128 0757 01" or "0451O 260802 0725 03"
-    const compactMatch = line.match(/^([A-Za-z0-9_-]+?)([IO]|IN|OUT)\s+(\d{6}|\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{4}|\d{1,2}:\d{2}(?::\d{2})?)\s*([A-Za-z0-9_-]*)/i);
+    const compactMatch = lineForMatch.match(/^([A-Za-z0-9_-]+?)([IO]|IN|OUT)\s+(\d{6}|\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{4}|\d{1,2}:\d{2}(?::\d{2})?)\s*([A-Za-z0-9_-]*)/i);
 
     // Pattern 3: Date and Time before I/O: "0082   260901 0546   I 03" or "0082 2026-09-01 05:46:00 I 01"
-    const dateFirstMatch = line.match(/^([A-Za-z0-9_-]+)\s+(\d{6}|\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{4}|\d{1,2}:\d{2}(?::\d{2})?)\s+([IO]|IN|OUT|\d)\s*([A-Za-z0-9_-]*)/i);
+    const dateFirstMatch = lineForMatch.match(/^([A-Za-z0-9_-]+)\s+(\d{6}|\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{4}|\d{1,2}:\d{2}(?::\d{2})?)\s+([IO]|IN|OUT|\d)\s*([A-Za-z0-9_-]*)/i);
 
     // Pattern 4: ZKTeco / Fingerprint standard delimited (Tab / Comma):
     // "0082\t2026-09-01 05:46:00\t1\t1" or "0082,2026-09-01 05:46:00,1,1"
-    const delimitedMatch = line.match(/^([A-Za-z0-9_-]+)[\t,;]\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?|\d{4})(?:[\t,;]\s*([A-Za-z0-9_-]+))?(?:[\t,;]\s*([A-Za-z0-9_-]+))?/i);
+    const delimitedMatch = lineForMatch.match(/^([A-Za-z0-9_-]+)[\t,;]\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?|\d{4})(?:[\t,;]\s*([A-Za-z0-9_-]+))?(?:[\t,;]\s*([A-Za-z0-9_-]+))?/i);
 
     if (standardMatch) {
       emp = standardMatch[1];
@@ -403,7 +444,7 @@ export async function getFilesFromDataTransferItems(items: DataTransferItemList)
 }
 
 /**
- * Filter valid attendance files (.txt, .TXT, .dat, .DAT, .csv, .log, .prn, .xlsx, .xls)
+ * Filter valid attendance files (.txt, .TXT, .tex, .TEX, .text, .dat, .DAT, .csv, .log, .prn, .xlsx, .xls)
  */
 export function isAttendanceFile(file: File): boolean {
   if (!file || !file.name) return false;
@@ -422,6 +463,8 @@ export function isAttendanceFile(file: File): boolean {
 
   return (
     name.endsWith('.txt') ||
+    name.endsWith('.tex') ||
+    name.endsWith('.text') ||
     name.endsWith('.dat') ||
     name.endsWith('.csv') ||
     name.endsWith('.log') ||

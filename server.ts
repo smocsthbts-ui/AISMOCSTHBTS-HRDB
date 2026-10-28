@@ -1,6 +1,16 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const getAppDir = () => {
+  try {
+    if (typeof __dirname !== 'undefined') return __dirname;
+    return path.dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return process.cwd();
+  }
+};
 
 async function startServer() {
   const app = express();
@@ -12,27 +22,38 @@ async function startServer() {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  // Vite middleware for development vs static files for production
-  const distPath = path.join(process.cwd(), 'dist');
-  const indexPath = path.join(distPath, 'index.html');
-  const isProduction = process.env.NODE_ENV === 'production';
+  // Determine if we should serve static production assets or run Vite dev middleware
+  const appDir = getAppDir();
+  const candidateDistPaths = [
+    path.join(appDir, 'dist'),
+    path.join(process.cwd(), 'dist'),
+    path.join(appDir),
+    path.join(process.cwd()),
+  ];
 
-  if (!isProduction || !fs.existsSync(indexPath)) {
+  const distPath = candidateDistPaths.find(p => fs.existsSync(path.join(p, 'index.html'))) || path.join(appDir, 'dist');
+  const indexPath = path.join(distPath, 'index.html');
+  const hasDist = fs.existsSync(indexPath);
+  const isExplicitDev = process.env.npm_lifecycle_event === 'dev' || process.argv.includes('--dev');
+  const shouldServeStatic = hasDist && !isExplicitDev;
+
+  if (shouldServeStatic) {
+    console.log(`[Production] Serving static files from: ${distPath}`);
+    app.use(express.static(distPath, {
+      maxAge: '1h',
+      index: false,
+    }));
+    app.get('*', (_req, res) => {
+      res.sendFile(indexPath);
+    });
+  } else {
+    console.log('[Development] Initializing Vite development middleware...');
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      if (fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-      } else {
-        res.status(404).send('Application dist index.html not found. Run npm run build.');
-      }
-    });
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {

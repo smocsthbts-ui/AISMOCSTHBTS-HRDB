@@ -1,4 +1,4 @@
-export type Role = 'Admin' | 'User';
+export type Role = 'Admin' | 'Supervisor' | 'User' | 'General';
 
 export type UserStatus = 'Active' | 'Pending_Approval' | 'Deactivated' | 'active' | 'pending' | 'deactivated';
 

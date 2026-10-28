@@ -19,7 +19,8 @@ import {
   UserX,
   Mail,
   UserCircle2,
-  RefreshCw
+  RefreshCw,
+  Eye
 } from 'lucide-react';
 
 interface UserManagementViewProps {
@@ -109,7 +110,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   }, [refreshUsers]);
 
   const [searchQuery, setSearchQuery] = useState('');
-  const [roleFilter, setRoleFilter] = useState<'ALL' | 'Admin' | 'User'>('ALL');
+  const [roleFilter, setRoleFilter] = useState<'ALL' | 'Admin' | 'Supervisor' | 'User' | 'General'>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'Active' | 'Pending_Approval' | 'Deactivated'>('ALL');
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -127,7 +128,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
   // Activate User State (assign role & department)
   const [userToActivate, setUserToActivate] = useState<UserAccount | null>(null);
-  const [activateRole, setActivateRole] = useState<'Admin' | 'User'>('User');
+  const [activateRole, setActivateRole] = useState<'Admin' | 'Supervisor' | 'User' | 'General'>('User');
   const [activateDept, setActivateDept] = useState<string>('GM');
   const [isActivating, setIsActivating] = useState<boolean>(false);
   const [matchedEmpInfo, setMatchedEmpInfo] = useState<any>(null);
@@ -178,12 +179,14 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setIsActivating(true);
 
     const targetUser = userToActivate;
+    const now = new Date().toISOString();
     const activatedUser: UserAccount = {
       ...targetUser,
       status: 'Active' as const,
       role: activateRole,
       department: activateDept,
-      activatedAt: new Date().toISOString(),
+      activatedAt: now,
+      updatedAt: now,
       assignedBy: currentUser.email,
     };
 
@@ -201,6 +204,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
       // 2. Persist to storage & Cloud Firestore in background
       await storage.saveUser(activatedUser);
+      if (currentUser && currentUser.email?.toLowerCase() === activatedUser.email?.toLowerCase()) {
+        storage.setCurrentUser(activatedUser);
+      }
     } catch (err: any) {
       console.warn('Activate user warning:', err);
     } finally {
@@ -258,8 +264,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     await handleChangeStatus(targetUser, nextStatus);
   };
 
-  // Change user role (Admin vs User)
-  const handleChangeRole = async (targetUser: UserAccount, newRole: 'Admin' | 'User') => {
+  // Change user role (Admin vs Supervisor vs User vs General)
+  const handleChangeRole = async (targetUser: UserAccount, newRole: 'Admin' | 'Supervisor' | 'User' | 'General') => {
     if (!isAdmin) return;
     if (targetUser.id === currentUser.id) {
       showNotification('warning', 'ไม่สามารถเปลี่ยน Role ของตนเองได้');
@@ -281,6 +287,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
     if (newRole === 'User') {
       showNotification('success', `ปรับ Role ของ ${targetUser.name} เป็น User เรียบร้อยแล้ว (สามารถลบบัญชีนี้ได้แล้ว)`);
+    } else if (newRole === 'Supervisor') {
+      showNotification('success', `ปรับ Role ของ ${targetUser.name} เป็น Supervisor เรียบร้อยแล้ว (สิทธิ์แก้ไข Time Sheet เฉพาะแผนก ${targetUser.department || 'ต้นสังกัด'})`);
+    } else if (newRole === 'General') {
+      showNotification('success', `ปรับ Role ของ ${targetUser.name} เป็น General เรียบร้อยแล้ว (สิทธิ์เรียกดูแผนก ${targetUser.department || 'ต้นสังกัด'} อย่างเดียวเท่านั้น - View Only)`);
     } else {
       showNotification('success', `ปรับ Role ของ ${targetUser.name} เป็น Admin เรียบร้อยแล้ว (ได้รับการป้องกันการลบ)`);
     }
@@ -594,8 +604,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             }`}
           >
             <option value="ALL">ทั้งหมด (All Roles)</option>
-            <option value="Admin">Admin</option>
-            <option value="User">User</option>
+            <option value="Admin">Admin (ผู้ดูแลระบบ)</option>
+            <option value="Supervisor">Supervisor (หัวหน้างาน)</option>
+            <option value="User">User (ผู้ใช้งานทั่วไป)</option>
+            <option value="General">General (ดูเฉพาะแผนก - View Only)</option>
           </select>
 
           <span className="text-slate-400 text-[11px] ml-2">สถานะ:</span>
@@ -694,18 +706,28 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                               className={`p-1.5 rounded font-bold text-xs outline-none border cursor-pointer transition ${
                                 u.role === 'Admin'
                                   ? isDark ? 'bg-red-500/20 text-red-300 border-red-500/40' : 'bg-red-50 text-red-700 border-red-300'
-                                  : isDark ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                                  : u.role === 'Supervisor'
+                                    ? isDark ? 'bg-blue-500/20 text-blue-300 border-blue-500/40' : 'bg-blue-50 text-blue-700 border-blue-300'
+                                    : u.role === 'General'
+                                      ? isDark ? 'bg-purple-500/20 text-purple-300 border-purple-500/40' : 'bg-purple-50 text-purple-700 border-purple-300'
+                                      : isDark ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-emerald-50 text-emerald-700 border-emerald-300'
                               }`}
                             >
                               <option value="Admin" className={isDark ? 'bg-[#141f2c] text-white' : ''}>Admin (ผู้ดูแลระบบ)</option>
+                              <option value="Supervisor" className={isDark ? 'bg-[#141f2c] text-white' : ''}>Supervisor (หัวหน้างาน)</option>
                               <option value="User" className={isDark ? 'bg-[#141f2c] text-white' : ''}>User (ผู้ใช้ทั่วไป)</option>
+                              <option value="General" className={isDark ? 'bg-[#141f2c] text-white' : ''}>General (ดูอย่างเดียว - View Only)</option>
                             </select>
                           </div>
                         ) : (
                           <span className={`text-[11px] px-2.5 py-1 rounded font-mono font-bold inline-flex items-center gap-1 ${
                             u.role === 'Admin' 
                               ? isDark ? 'bg-red-500/20 text-red-300 border border-red-500/30' : 'bg-red-100 text-red-700 border border-red-200'
-                              : isDark ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                              : u.role === 'Supervisor'
+                                ? isDark ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30' : 'bg-blue-100 text-blue-700 border border-blue-200'
+                                : u.role === 'General'
+                                  ? isDark ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-purple-100 text-purple-700 border border-purple-200'
+                                  : isDark ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-emerald-100 text-emerald-700 border border-emerald-200'
                           }`}>
                             <ShieldCheck className="w-3 h-3" />
                             {u.role}
@@ -1025,6 +1047,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     }`}
                   >
                     <option value="User">User (ผู้ใช้งานทั่วไป)</option>
+                    <option value="Supervisor">Supervisor (หัวหน้างาน - สิทธิ์แก้ไข Time Sheet แผนกสังกัด)</option>
+                    <option value="General">General (ดูข้อมูลแผนกต้นสังกัดอย่างเดียว - View Only)</option>
                     <option value="Admin">Admin (ผู้ดูแลระบบ)</option>
                   </select>
                 </div>
@@ -1177,7 +1201,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 <label className="block text-slate-300 font-bold mb-1.5">
                   1. กำหนดระดับบทบาท (Assign Role) *
                 </label>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
                   <div 
                     onClick={() => setActivateRole('User')}
                     className={`p-3 rounded-lg border cursor-pointer transition ${
@@ -1194,6 +1218,44 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     </div>
                     <p className="text-[10px] text-slate-400 mt-1 leading-normal">
                       เข้าถึง ดู และจัดการตารางกะ บันทึกเวลา และทำโอทีเฉพาะในแผนกที่รับผิดชอบ
+                    </p>
+                  </div>
+
+                  <div 
+                    onClick={() => setActivateRole('Supervisor')}
+                    className={`p-3 rounded-lg border cursor-pointer transition ${
+                      activateRole === 'Supervisor'
+                        ? isDark 
+                          ? 'bg-blue-500/15 border-blue-500 text-white ring-1 ring-blue-500' 
+                          : 'bg-blue-50 border-blue-500 text-blue-900 ring-1 ring-blue-500'
+                        : isDark ? 'bg-[#0f1722] border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    <div className="font-bold text-xs flex items-center gap-1.5">
+                      <ShieldCheck className="w-4 h-4 text-blue-400" />
+                      <span>Supervisor (หัวหน้างาน)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1 leading-normal">
+                      สามารถแก้ไขเวลาหน้า Time Sheet ได้เหมือน Admin จำกัดเฉพาะแผนกต้นสังกัด
+                    </p>
+                  </div>
+
+                  <div 
+                    onClick={() => setActivateRole('General')}
+                    className={`p-3 rounded-lg border cursor-pointer transition ${
+                      activateRole === 'General'
+                        ? isDark 
+                          ? 'bg-purple-500/15 border-purple-500 text-white ring-1 ring-purple-500' 
+                          : 'bg-purple-50 border-purple-500 text-purple-900 ring-1 ring-purple-500'
+                        : isDark ? 'bg-[#0f1722] border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    <div className="font-bold text-xs flex items-center gap-1.5">
+                      <Eye className="w-4 h-4 text-purple-400" />
+                      <span>General (ดูอย่างเดียว)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1 leading-normal">
+                      สิทธิ์เรียกดูตารางกะและบันทึกเวลาเฉพาะแผนกต้นสังกัดอย่างเดียวเท่านั้น ไม่สามารถจัดกะด่วนหรือแก้ไขข้อมูลได้ ซิงค์ข้อมูล Cloud เท่าเทียมกับ User
                     </p>
                   </div>
 

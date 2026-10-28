@@ -199,7 +199,7 @@ export const AttendanceImportPanel: React.FC<AttendanceImportPanelProps> = ({
     if (validFiles.length === 0) {
       setStatusMessage({
         type: 'error',
-        text: `ไม่พบไฟล์ลงเวลาที่รองรับจาก ${files.length} ไฟล์ที่เลือก (รองรับเฉพาะไฟล์ .txt, .dat, .csv, .xlsx, .xls)`,
+        text: `ไม่พบไฟล์ลงเวลาที่รองรับจาก ${files.length} ไฟล์ที่เลือก (รองรับเฉพาะไฟล์ .txt, .tex, .text, .dat, .csv, .xlsx, .xls)`,
       });
       return;
     }
@@ -686,7 +686,7 @@ export const AttendanceImportPanel: React.FC<AttendanceImportPanelProps> = ({
                 <span>Step 1: รูปแบบไฟล์ที่รองรับ</span>
               </h2>
               <p className="text-slate-400 leading-relaxed">
-                รองรับไฟล์บันทึกเวลาสแกนนิ้ว/รูดบัตรทุกนามสกุล เช่น <code>.txt</code>, <code>.TXT</code>, <code>.dat</code>, <code>.DAT</code>, <code>.csv</code>, <code>.xlsx</code>
+                รองรับไฟล์บันทึกเวลาสแกนเข้า-ออกทุกนามสกุล เช่น <code>.txt</code>, <code>.tex</code>, <code>.dat</code>, <code>.csv</code>, <code>.xlsx</code>
               </p>
 
               <div className={`p-2.5 rounded border font-mono text-[11px] space-y-1 ${
@@ -770,7 +770,7 @@ export const AttendanceImportPanel: React.FC<AttendanceImportPanelProps> = ({
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept=".txt,.TXT,.dat,.DAT,.csv,.CSV,.xlsx,.XLSX,.xls,.XLS,.log,.LOG,.prn,.PRN"
+                  accept=".txt,.TXT,.tex,.TEX,.text,.TEXT,.dat,.DAT,.csv,.CSV,.xlsx,.XLSX,.xls,.XLS,.log,.LOG,.prn,.PRN"
                   onChange={handleFilesSelect}
                   className="hidden"
                 />

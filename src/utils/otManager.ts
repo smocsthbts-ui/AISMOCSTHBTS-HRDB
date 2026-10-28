@@ -1,4 +1,5 @@
 import { OTRecord, Employee } from '../types';
+import { isEmployeeMatch, getEmployeeLookupKeys } from './timeCalc';
 
 export type OTMergeMode = 'smart_merge' | 'replace_month' | 'append_all';
 
@@ -288,6 +289,11 @@ export function resolveEmployeeIdentity(
   const cleanGid = (gid || '').trim();
 
   const matched = employees.find(e => {
+    if (cleanEmpNo && isEmployeeMatch(cleanEmpNo, e)) return true;
+    if (cleanGid && isEmployeeMatch(cleanGid, e)) return true;
+    const empKeys = getEmployeeLookupKeys(e);
+    if (cleanEmpNo && empKeys.has(cleanEmpNo.toUpperCase())) return true;
+    if (cleanGid && empKeys.has(cleanGid.toUpperCase())) return true;
     if (cleanEmpNo && e.empNo.toLowerCase() === cleanEmpNo.toLowerCase()) return true;
     if (cleanGid && e.gid.toLowerCase() === cleanGid.toLowerCase()) return true;
     // Match numeric padding (e.g. "950" vs "0950")

@@ -48,7 +48,7 @@ import {
   isSameDepartment,
   isEmployeeIdentifierMatch
 } from '../utils/fileParser';
-import { firestoreSync } from '../firebase';
+import { firestoreSync, isDemoDepartment } from '../firebase';
 
 const MONTH_NAMES_TH = [
   'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
@@ -210,13 +210,13 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
     if (effectiveDept === 'ALL') {
       return employees.filter(e => e.isActive !== false);
     }
-    return employees.filter(e => e.department === effectiveDept && e.isActive !== false);
+    return employees.filter(e => isSameDepartment(e.department, effectiveDept) && e.isActive !== false);
   }, [employees, targetDept, isAdmin, userDept]);
 
   // Shift codes available for target department
   const applicableShiftCodes = useMemo(() => {
     const effectiveDept = !isAdmin ? userDept : targetDept;
-    return shiftCodes.filter(sc => sc.department === 'ALL' || sc.department === effectiveDept);
+    return shiftCodes.filter(sc => sc.department === 'ALL' || isSameDepartment(sc.department, effectiveDept));
   }, [shiftCodes, targetDept, isAdmin, userDept]);
 
   // Summary of uploaded months specifically for the target department
@@ -474,8 +474,18 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
       const { buffer, importMode, selectedSheetName, selectedMonthYear: chosenMY, selectedDept: rawChosenDept, sheets } = uploadConfirmation;
       const chosenDept = !isAdmin ? userDept : rawChosenDept;
 
-      // Security check: Role User can only upload shift plans for their own department
-      if (!isAdmin && chosenDept !== userDept) {
+      // Security check: Role User can only upload shift plans for their own department; General cannot upload
+      if (currentUser.role === 'General') {
+        setStatusMessage({
+          type: 'error',
+          text: `สิทธิ์ไม่เพียงพอ: บัญชี Role General มีสิทธิ์เรียกดูข้อมูลแผนกต้นสังกัดเท่านั้น ไม่สามารถอัปโหลดหรือแก้ไขข้อมูลตารางกะได้`,
+        });
+        setUploadConfirmation(null);
+        setIsExecutingImport(false);
+        return;
+      }
+
+      if (!isAdmin && !isSameDepartment(chosenDept, userDept)) {
         setStatusMessage({
           type: 'error',
           text: `สิทธิ์ไม่เพียงพอ: คุณมีสิทธิ์ Role User สามารถอัปโหลดตารางกะได้เฉพาะแผนก ${userDept} เท่านั้น`,
@@ -620,13 +630,12 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
         if (result.newShiftCodes) aggregatedNewShiftCodes = result.newShiftCodes;
       }
 
-      // Normalized Employee ID helper (pads 1-4 digit numeric strings e.g. "503" -> "0503", "82" -> "0082")
+      // Normalized Employee ID helper (pads 1-4 digit pure numeric strings e.g. "503" -> "0503", "82" -> "0082"; keeps GIDs e.g. "Z004Z3KX" intact)
       const normalizeEmpId = (id?: string | null): string => {
         if (!id) return '';
         const clean = String(id).trim().toUpperCase();
-        const digits = clean.replace(/\D/g, '');
-        if (digits && digits.length <= 4) {
-          return digits.padStart(4, '0');
+        if (/^\d{1,4}$/.test(clean)) {
+          return clean.padStart(4, '0');
         }
         return clean;
       };
@@ -687,7 +696,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
               ...ne,
               id: existing.id,
               empNo: normNo,
-              department: ne.department || existing.department,
+              department: (isDemoDepartment(existing.department) || !existing.department) ? (ne.department || existing.department) : (existing.department || ne.department),
               updatedAt: new Date().toISOString(),
             });
           } else {
@@ -700,7 +709,6 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
 
         const newEmpList = Array.from(empMap.values());
         await storage.setEmployees(newEmpList);
-        await firestoreSync.syncEmployees(newEmpList);
         setNewlyAddedEmployees(aggregatedNewEmployees);
       } else {
         setNewlyAddedEmployees([]);
@@ -723,7 +731,6 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
 
         const newCodeList = Array.from(codeMap.values());
         await storage.setShiftCodes(newCodeList);
-        await firestoreSync.syncShiftCodes(newCodeList);
         setNewlyAddedShiftCodes(aggregatedNewShiftCodes);
       } else {
         setNewlyAddedShiftCodes([]);
@@ -864,8 +871,10 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 <span className="text-red-400">*</span>
               </label>
               {!isAdmin && (
-                <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-teal-500/20 text-teal-300 border border-teal-500/30">
-                  Role User: แผนกตนเอง ({currentUser.department})
+                <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${
+                  currentUser.role === 'General' ? 'bg-purple-500/20 text-purple-300 border-purple-500/30' : 'bg-teal-500/20 text-teal-300 border-teal-500/30'
+                }`}>
+                  {currentUser.role === 'General' ? 'Role General: View Only' : 'Role User: แผนกตนเอง'} ({currentUser.department})
                 </span>
               )}
             </div>
@@ -1199,17 +1208,25 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 รองรับไฟล์ตารางกะรายปี (12 Sheets) และไฟล์รายเดือน (.xlsx, .xls, .csv)
               </p>
 
-              <label className="cursor-pointer px-5 py-2.5 rounded font-bold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition flex items-center space-x-2">
-                <Upload className="w-3.5 h-3.5" />
-                <span>{isProcessing ? 'Inspecting File...' : 'Select Shift Plan File'}</span>
-                <input
-                  type="file"
-                  accept=".xlsx,.xls,.csv"
-                  onChange={handleFileInputChange}
-                  disabled={isProcessing}
-                  className="hidden"
-                />
-              </label>
+              {currentUser.role === 'General' ? (
+                <div className={`p-3 rounded border text-xs font-medium text-center ${
+                  isDark ? 'bg-purple-950/20 border-purple-500/40 text-purple-300' : 'bg-purple-50 border-purple-300 text-purple-800'
+                }`}>
+                  <span>บัญชี Role General: มีสิทธิ์เรียกดูข้อมูลตารางกะเฉพาะแผนก {currentUser.department} เท่านั้น (ไม่สามารถอัปโหลดไฟล์ได้)</span>
+                </div>
+              ) : (
+                <label className="cursor-pointer px-5 py-2.5 rounded font-bold text-xs bg-[#008b99] hover:bg-[#00a3a6] text-white shadow transition flex items-center space-x-2">
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>{isProcessing ? 'Inspecting File...' : 'Select Shift Plan File'}</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    onChange={handleFileInputChange}
+                    disabled={isProcessing}
+                    className="hidden"
+                  />
+                </label>
+              )}
             </div>
           </div>
 

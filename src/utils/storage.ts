@@ -11,6 +11,11 @@ import {
 } from '../types';
 import { 
   DEPARTMENTS as INITIAL_DEPARTMENTS,
+  OFFICIAL_DEPARTMENT_FULL_NAMES,
+  resolveDepartmentFullName,
+  getCanonicalDepartmentFullName,
+  toCanonicalDepartment,
+  canonicalEmpNo,
   INITIAL_EMPLOYEES, 
   INITIAL_SHIFT_CODES, 
   INITIAL_USERS, 
@@ -22,15 +27,19 @@ import {
   firestoreSync, 
   testFirestoreConnection, 
   isDemoDepartment, 
+  DEMO_DEPARTMENT_CODES,
   isDemoShiftCode,
   isDemoUser,
   isDemoEmployee,
   cleanDocId,
   sanitizeEmployeeDepartment,
+  deduplicateAndCanonicalizeEmployees,
+  deduplicateAndCanonicalizeShiftPlans,
   subscribeToCloudChanges 
 } from '../firebase';
 import { mergeAndDeduplicateOTRecords, sanitizeOTRecords } from './otManager';
 import { normalizeShiftTimeString } from './timeCalc';
+import { idbGet, idbSet, IDB_KEYS } from './indexedDBStorage';
 
 const STORAGE_KEYS = {
   USERS: 'siemens_ix_users',
@@ -91,28 +100,28 @@ export function safeSetItem(key: string, value: string): void {
   // 1. Immediately store into in-memory cache to guarantee synchronous state updates and zero crashes
   inMemoryCache.set(key, value);
 
-  // 2. Persist to localStorage safely
+  // If storing raw biometric punches, also asynchronously persist to IndexedDB (unlimited storage, never sliced)
+  if (key === STORAGE_KEYS.RAW_PUNCHES) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        idbSet(IDB_KEYS.BIOMETRIC_PUNCHES, parsed).catch(() => {});
+      }
+    } catch {}
+  }
+
+  // 2. Persist to localStorage safely if within size limits without slicing
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
-      localStorage.setItem(key, value);
-    }
-  } catch (err: any) {
-    console.warn(`[Storage] localStorage.setItem for key "${key}" hit browser quota limit. Active data is preserved in high-capacity in-memory cache.`, err);
-    try {
-      // If quota exceeded, trim older raw punch logs from localStorage to make space for critical shift plans and master tables
-      if (key !== STORAGE_KEYS.RAW_PUNCHES) {
-        const rawPunchesStr = inMemoryCache.get(STORAGE_KEYS.RAW_PUNCHES);
-        if (rawPunchesStr) {
-          try {
-            const parsed = JSON.parse(rawPunchesStr);
-            if (Array.isArray(parsed) && parsed.length > 1000) {
-              localStorage.setItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(parsed.slice(-1000)));
-            }
-          } catch {}
-        }
+      // If payload is excessively large for localStorage (>2.5MB), avoid pushing to localStorage to prevent quota crash
+      // Data is already preserved 100% in inMemoryCache and IndexedDB
+      if (value.length < 2500000) {
+        localStorage.setItem(key, value);
       }
-      localStorage.setItem(key, value);
-    } catch {}
+    }
+  } catch (_err: any) {
+    // If quota exceeded, do NOT slice or truncate punches!
+    // IndexedDB and in-memory cache maintain the complete, untruncated records.
   }
 }
 
@@ -125,10 +134,10 @@ export function safeRemoveItem(key: string): void {
   } catch {}
 }
 
-export const HISTORY_CUTOFF_DATE = '2025-01-01';
-export const HISTORY_CUTOFF_MONTH = '2025-01';
+export const HISTORY_CUTOFF_DATE = '2024-01-01';
+export const HISTORY_CUTOFF_MONTH = '2024-01';
 
-const CURRENT_SCHEMA_VERSION = 'v2026_09_prune_pre_aug2026_v5';
+const CURRENT_SCHEMA_VERSION = 'v2026_09_free_tier_compact_v9';
 
 // Self-healing migration for all connected clients upon opening the app
 try {
@@ -142,18 +151,119 @@ try {
     }
   }
 
-  // Purge any demo employees immediately from local storage cache
+  // Purge any demo employees immediately from local storage cache, auto-heal departments & eliminate duplicates
   const empRaw = safeGetItem(STORAGE_KEYS.EMPLOYEES);
+  let activeEmpsList: Employee[] = [];
+  let hasSanitizedOnBoot = false;
   if (empRaw) {
     try {
       const parsed = JSON.parse(empRaw);
       if (Array.isArray(parsed)) {
-        const cleaned = parsed.filter(e => e && e.empNo && !isDemoEmployee(e));
-        safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleaned));
+        activeEmpsList = deduplicateAndCanonicalizeEmployees(parsed);
+        if (activeEmpsList.length !== parsed.length || JSON.stringify(activeEmpsList) !== empRaw) {
+          hasSanitizedOnBoot = true;
+        }
+        safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(activeEmpsList));
+        if (hasSanitizedOnBoot) {
+          firestoreSync.syncEmployees(activeEmpsList).catch(() => null);
+        }
       }
     } catch {}
   }
 
+  // Deduplicate and canonicalize shift plans on boot
+  const plansBootRaw = safeGetItem(STORAGE_KEYS.SHIFT_PLANS);
+  if (plansBootRaw) {
+    try {
+      const parsedPlans = JSON.parse(plansBootRaw);
+      if (Array.isArray(parsedPlans)) {
+        const cleanedPlans = deduplicateAndCanonicalizeShiftPlans(parsedPlans, activeEmpsList);
+        if (cleanedPlans.length !== parsedPlans.length) {
+          safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleanedPlans));
+          firestoreSync.writeShiftPlansBundle(cleanedPlans).catch(() => null);
+        }
+      }
+    } catch {}
+  }
+
+  // The 14 authentic real departments used by the system
+  const REAL_SYSTEM_DEPTS = new Set(INITIAL_DEPARTMENTS.map(d => d.code.toUpperCase()));
+  const activeEmpDeptCodes = new Set(activeEmpsList.map(e => (e.department || '').trim().toUpperCase()).filter(Boolean));
+
+  // Purge any demo or 0-people departments that are NOT in the 14 real departments
+  const deptRaw = safeGetItem(STORAGE_KEYS.DEPARTMENTS);
+  const delRaw = safeGetItem(STORAGE_KEYS.DELETED_DEPARTMENTS);
+  const delList: string[] = delRaw ? JSON.parse(delRaw) : [];
+  const delSet = new Set(delList.map(c => String(c).trim().toUpperCase()));
+
+  // Always mark known demo department codes as deleted so they cannot re-emerge
+  DEMO_DEPARTMENT_CODES.forEach(code => delSet.add(code.toUpperCase()));
+
+  const currentList: Department[] = deptRaw ? JSON.parse(deptRaw) : [];
+  const deptMap = new Map<string, Department>();
+  const purgedCodes: string[] = [];
+
+  // 1. Seed with authentic real departments if not deleted by user
+  INITIAL_DEPARTMENTS.forEach(d => {
+    const upper = d.code.toUpperCase();
+    if (!delSet.has(upper) && !isDemoDepartment(upper)) {
+      deptMap.set(upper, { code: upper, name: resolveDepartmentFullName(upper, d.name) });
+    }
+  });
+
+  // 2. Filter existing departments: only keep authentic departments or ones with active employees (strictly non-demo)
+  if (Array.isArray(currentList)) {
+    currentList.forEach(d => {
+      if (!d || !d.code) return;
+      const upper = d.code.trim().toUpperCase();
+      if (delSet.has(upper) || isDemoDepartment(upper)) {
+        purgedCodes.push(upper);
+        delSet.add(upper);
+        return;
+      }
+      const isReal = REAL_SYSTEM_DEPTS.has(upper);
+      const hasEmps = activeEmpDeptCodes.has(upper);
+      if (isReal || hasEmps) {
+        const existing = deptMap.get(upper);
+        const resolvedName = resolveDepartmentFullName(upper, d.name, existing?.name);
+        deptMap.set(upper, { code: upper, name: resolvedName });
+      } else {
+        // 0-person unused department: banish and mark as deleted
+        purgedCodes.push(upper);
+        delSet.add(upper);
+      }
+    });
+  }
+
+  if (!delSet.has('OHL') && !deptMap.has('OHL')) {
+    deptMap.set('OHL', { code: 'OHL', name: 'Overhaul' });
+  }
+
+  deptMap.delete('TRW/TRD');
+  deptMap.delete('TRD');
+  deptMap.delete('OVH');
+  deptMap.delete('MRL');
+
+  const cleanDepts = Array.from(deptMap.values())
+    .filter(d => !isDemoDepartment(d.code) && d.code !== 'TRW/TRD' && d.code !== 'TRD' && d.code !== 'OVH' && d.code !== 'MRL')
+    .map(d => ({
+      code: d.code,
+      name: resolveDepartmentFullName(d.code, d.name),
+      updatedAt: d.updatedAt || new Date().toISOString(),
+    }))
+    .sort((a, b) => a.code.localeCompare(b.code));
+  safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
+  safeSetItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(delSet)));
+
+  // Delete purged codes only. Do NOT blindly push unverified local departments to cloud on boot!
+  if (purgedCodes.length > 0) {
+    purgedCodes.forEach(code => {
+      firestoreSync.deleteDepartment(code, cleanDepts).catch(() => null);
+    });
+  }
+} catch {}
+
+try {
   const currentVer = safeGetItem(STORAGE_KEYS.SCHEMA_VERSION);
   if (currentVer !== CURRENT_SCHEMA_VERSION) {
     // 1. Prune punches before Aug 2026 and deduplicate
@@ -454,12 +564,17 @@ export const storage = {
         const base = isIncomingNewer ? existing : normalized;
         const top = isIncomingNewer ? normalized : existing;
 
+        const isAlreadyActive = existing.status === 'Active' || normalized.status === 'Active';
+        const resolvedStatus = cleanEmail === 'smo.cs.th.bts@gmail.com' 
+          ? 'Active' 
+          : (isAlreadyActive ? 'Active' : (top.status || base.status || 'Active'));
+
         uMap.set(cleanEmail, {
           ...base,
           ...top,
           role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (top.role || base.role),
           department: top.department || base.department,
-          status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (top.status || base.status || 'Active'),
+          status: resolvedStatus,
           photoURL: top.photoURL || base.photoURL,
         });
       }
@@ -521,13 +636,31 @@ export const storage = {
         const base = isIncomingNewer ? existing : u;
         const top = isIncomingNewer ? u : existing;
 
-        uMap.set(cleanEmail, {
+        const currentStored = this.getCurrentUser();
+        const isCurrentActive = currentStored && currentStored.email?.trim().toLowerCase() === cleanEmail && currentStored.status === 'Active';
+        const isAlreadyActive = existing.status === 'Active' || u.status === 'Active' || isCurrentActive;
+        const resolvedStatus = cleanEmail === 'smo.cs.th.bts@gmail.com' 
+          ? 'Active' 
+          : (isAlreadyActive ? 'Active' : (top.status || base.status || status));
+
+        const resolvedDept = (top.department && top.department !== 'PENDING')
+          ? top.department
+          : ((base.department && base.department !== 'PENDING') ? base.department : (isCurrentActive && currentStored?.department !== 'PENDING' ? currentStored?.department : top.department));
+        const resolvedRole = cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (top.role || base.role || currentStored?.role || 'User');
+
+        const updatedMerged: UserAccount = {
           ...base,
           ...top,
           email: cleanEmail,
-          status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (top.status || base.status || status),
-          role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (top.role || base.role),
-        });
+          status: resolvedStatus,
+          department: resolvedDept,
+          role: resolvedRole,
+        };
+        uMap.set(cleanEmail, updatedMerged);
+
+        if (isCurrentActive && resolvedStatus === 'Active') {
+          safeSetItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify({ ...currentStored, ...updatedMerged }));
+        }
       }
     });
 
@@ -543,6 +676,7 @@ export const storage = {
   setUsers(users: UserAccount[]) {
     const deletedKeys = new Set(this.getDeletedUserKeys());
     const now = new Date().toISOString();
+    const currentStored = this.getCurrentUser();
     const uMap = new Map<string, UserAccount>();
     users.forEach(u => {
       if (!u || !u.email) return;
@@ -556,11 +690,12 @@ export const storage = {
         if (idLower && deletedKeys.has(idLower)) return;
       }
 
+      const isCurrentActive = currentStored && currentStored.email?.trim().toLowerCase() === cleanEmail && currentStored.status === 'Active';
       let status = u.status;
       if (status) {
         const s = status.toLowerCase();
         if (s === 'active') status = 'Active';
-        else if (s.includes('pending')) status = 'Pending_Approval';
+        else if (s.includes('pending')) status = isCurrentActive ? 'Active' : 'Pending_Approval';
         else if (s === 'deactivated') status = 'Deactivated';
       } else {
         status = 'Active';
@@ -584,11 +719,17 @@ export const storage = {
     const current = this.getUsers();
     const cleanEmail = (user.email || '').trim().toLowerCase();
     const now = new Date().toISOString();
+    const currentStored = this.getCurrentUser();
+    const isCurrentActive = currentStored && currentStored.email?.trim().toLowerCase() === cleanEmail && currentStored.status === 'Active';
+    const isLocalActive = current.some(u => u && u.email?.trim().toLowerCase() === cleanEmail && u.status === 'Active');
+
     let status = user.status;
     if (status) {
       const s = status.toLowerCase();
       if (s === 'active') status = 'Active';
-      else if (s.includes('pending')) status = 'Pending_Approval';
+      else if (s.includes('pending')) {
+        status = (isCurrentActive || isLocalActive) ? 'Active' : 'Pending_Approval';
+      }
       else if (s === 'deactivated') status = 'Deactivated';
     } else {
       status = 'Active';
@@ -597,7 +738,7 @@ export const storage = {
       ...user,
       email: cleanEmail,
       status,
-      updatedAt: now,
+      updatedAt: user.updatedAt || now,
     };
 
     const uMap = new Map<string, UserAccount>();
@@ -610,6 +751,12 @@ export const storage = {
 
     const cleanUsers = Array.from(uMap.values()).filter(u => !isDemoUser(u));
     safeSetItem(STORAGE_KEYS.USERS, JSON.stringify(cleanUsers));
+
+    // If current logged-in user, ensure CURRENT_USER in storage is also updated!
+    if (currentStored && currentStored.email?.trim().toLowerCase() === cleanEmail) {
+      safeSetItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify({ ...currentStored, ...normalizedUser }));
+    }
+
     notifyDataChanged();
     return await firestoreSync.saveUserDirect(normalizedUser);
   },
@@ -655,7 +802,8 @@ export const storage = {
   getDeletedDepartmentCodes(): string[] {
     try {
       const data = safeGetItem(STORAGE_KEYS.DELETED_DEPARTMENTS);
-      return data ? JSON.parse(data) : [];
+      const list: string[] = data ? JSON.parse(data) : [];
+      return list.map(c => String(c).trim().toUpperCase()).filter(Boolean);
     } catch {
       return [];
     }
@@ -663,7 +811,9 @@ export const storage = {
 
   recordDeletedDepartment(code: string) {
     try {
-      const clean = code.trim().toUpperCase();
+      const clean = (code || '').trim().toUpperCase();
+      if (!clean) return;
+
       const current = this.getDeletedDepartmentCodes();
       if (!current.includes(clean)) {
         current.push(clean);
@@ -678,50 +828,93 @@ export const storage = {
     const deletedCodes = this.getDeletedDepartmentCodes();
     const deletedSet = new Set(deletedCodes);
 
-    const data = safeGetItem(STORAGE_KEYS.DEPARTMENTS);
-    let list: Department[] = [];
-    if (data) {
-      try {
-        list = JSON.parse(data);
-      } catch {
-        list = [];
-      }
-    }
-
     const deptMap = new Map<string, Department>();
 
-    // If local storage has never been initialized, load INITIAL_DEPARTMENTS
-    if (!data) {
-      INITIAL_DEPARTMENTS.forEach(d => {
-        if (d && d.code) {
-          const upper = d.code.trim().toUpperCase();
-          if (!deletedSet.has(upper)) {
-            deptMap.set(upper, { code: d.code.trim(), name: d.name.trim() });
-          }
+    // 1. Seed with authentic real BTS departments (only if not marked deleted by user)
+    INITIAL_DEPARTMENTS.forEach(d => {
+      if (d && d.code) {
+        const upper = d.code.trim().toUpperCase();
+        if (!deletedSet.has(upper)) {
+          deptMap.set(upper, { code: upper, name: resolveDepartmentFullName(upper, d.name) });
         }
-      });
-    } else {
-      list.forEach(d => {
-        const code = (d.code || '').trim().toUpperCase();
-        if (code && !deletedSet.has(code)) {
-          let cleanName = (d.name || '').trim();
-          if (!cleanName) cleanName = code;
-          deptMap.set(code, { code, name: cleanName });
+      }
+    });
+
+    // 2. Overlay any stored/custom departments from local storage (smart-merge: never downgrade full names)
+    const data = safeGetItem(STORAGE_KEYS.DEPARTMENTS);
+    if (data) {
+      try {
+        const list: Department[] = JSON.parse(data);
+        if (Array.isArray(list)) {
+          list.forEach(d => {
+            if (d && d.code) {
+              const code = d.code.trim().toUpperCase();
+              if (!deletedSet.has(code)) {
+                const existing = deptMap.get(code);
+                const resolvedName = resolveDepartmentFullName(code, d.name, existing?.name);
+                deptMap.set(code, { code, name: resolvedName, updatedAt: d.updatedAt || existing?.updatedAt });
+              }
+            }
+          });
         }
-      });
+      } catch {}
     }
 
-    const sorted = Array.from(deptMap.values()).sort((a, b) => a.code.localeCompare(b.code));
+    // 3. Harvest departments ONLY from active employees that are not in deletedSet
+    try {
+      const empRaw = safeGetItem(STORAGE_KEYS.EMPLOYEES);
+      if (empRaw) {
+        const emps = JSON.parse(empRaw);
+        if (Array.isArray(emps)) {
+          emps.forEach((e: any) => {
+            if (e && e.department && e.department.trim() !== 'ALL') {
+              const upper = e.department.trim().toUpperCase();
+              if (!isDemoDepartment(upper) && !deptMap.has(upper) && !deletedSet.has(upper)) {
+                deptMap.set(upper, { code: upper, name: getCanonicalDepartmentFullName(upper) });
+              }
+            }
+          });
+        }
+      }
+    } catch {}
+
+    // Guarantee OHL (Overhaul) is present if not deleted
+    if (!deletedSet.has('OHL') && !deptMap.has('OHL')) {
+      deptMap.set('OHL', { code: 'OHL', name: 'Overhaul' });
+    }
+
+    // Explicitly exclude TRW/TRD, TRD, OVH, and MRL from displayed departments
+    deptMap.delete('TRW/TRD');
+    deptMap.delete('TRD');
+    deptMap.delete('OVH');
+    deptMap.delete('MRL');
+
+    const sorted = Array.from(deptMap.values())
+      .filter(d => d && d.code && !isDemoDepartment(d.code) && d.code !== 'TRW/TRD' && d.code !== 'TRD' && d.code !== 'OVH' && d.code !== 'MRL')
+      .map(d => {
+        const code = d.code.trim().toUpperCase();
+        return {
+          code,
+          name: resolveDepartmentFullName(code, d.name) || code,
+          updatedAt: d.updatedAt || new Date().toISOString(),
+        };
+      })
+      .sort((a, b) => a.code.localeCompare(b.code));
     return sorted;
   },
 
   async setDepartments(departments: Department[]): Promise<boolean> {
     const nowIso = new Date().toISOString();
-    const clean = departments.map(d => ({
-      code: d.code.trim().toUpperCase(),
-      name: (d.name || d.code).trim(),
-      updatedAt: d.updatedAt || nowIso,
-    }));
+    const clean = (departments || [])
+      .filter(d => d && d.code)
+      .map(d => {
+        const code = d.code.trim().toUpperCase();
+        return {
+          code,
+          name: resolveDepartmentFullName(code, d.name) || code,
+          updatedAt: d.updatedAt || nowIso,
+        };
+      });
     // Also un-record from deleted if explicitly added/updated
     const deletedCodes = this.getDeletedDepartmentCodes();
     const cleanCodesSet = new Set(clean.map(d => d.code));
@@ -792,6 +985,47 @@ export const storage = {
     return await firestoreSync.deleteDepartment(clean, filtered);
   },
 
+  async purgeUnusedZeroPersonDepartments(): Promise<{ purgedCount: number; purgedCodes: string[] }> {
+    const REAL_ACTIVE_CODES = new Set(INITIAL_DEPARTMENTS.map(d => d.code.toUpperCase()));
+    const emps = this.getEmployees();
+    const activeDeptCounts = new Map<string, number>();
+    emps.forEach(e => {
+      if (e && e.department) {
+        const d = e.department.trim().toUpperCase();
+        activeDeptCounts.set(d, (activeDeptCounts.get(d) || 0) + 1);
+      }
+    });
+
+    const currentDepts = this.getDepartments();
+    const purgedCodes: string[] = [];
+    const retainedDepts: Department[] = [];
+
+    currentDepts.forEach(d => {
+      const code = (d.code || '').trim().toUpperCase();
+      const count = activeDeptCounts.get(code) || 0;
+      const isReal = REAL_ACTIVE_CODES.has(code);
+      const isDemo = isDemoDepartment(code);
+      if (isDemo || (!isReal && count === 0)) {
+        purgedCodes.push(code);
+        this.recordDeletedDepartment(code);
+      } else {
+        retainedDepts.push(d);
+      }
+    });
+
+    if (purgedCodes.length > 0) {
+      safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(retainedDepts));
+      safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+      for (const code of purgedCodes) {
+        await firestoreSync.deleteDepartment(code, retainedDepts);
+      }
+      await firestoreSync.syncDepartments(retainedDepts);
+      notifyDataChanged();
+    }
+
+    return { purgedCount: purgedCodes.length, purgedCodes };
+  },
+
   getEmployees(): Employee[] {
     const data = safeGetItem(STORAGE_KEYS.EMPLOYEES);
     if (!data) {
@@ -807,7 +1041,11 @@ export const storage = {
     try {
       const parsed: Employee[] = JSON.parse(data);
       if (Array.isArray(parsed)) {
-        return parsed.filter(e => Boolean(e && e.empNo && !isDemoEmployee(e)));
+        const deduped = deduplicateAndCanonicalizeEmployees(parsed);
+        if (deduped.length !== parsed.length) {
+          safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(deduped));
+        }
+        return deduped;
       }
       return [];
     } catch {
@@ -815,41 +1053,8 @@ export const storage = {
     }
   },
 
-  async setEmployees(employees: Employee[]): Promise<boolean> {
-    const now = new Date().toISOString();
-    const cleanEmployees = (employees || [])
-      .filter(emp => emp && emp.empNo && !isDemoEmployee(emp))
-      .map(emp => {
-        const cleanItem: any = {
-          ...emp,
-          empNo: String(emp.empNo || '').trim(),
-          gid: String(emp.gid || '').trim(),
-          firstName: String(emp.firstName || '').trim(),
-          familyName: String(emp.familyName || '').trim(),
-          department: String(emp.department || 'GM').trim().toUpperCase(),
-          division: String(emp.division || 'MO CS BTS').trim(),
-          functionTitle: String(emp.functionTitle || '').trim(),
-          costCenter: String(emp.costCenter || 'C93056').trim(),
-          isShiftWorker: Boolean(emp.isShiftWorker),
-          isActive: emp.isActive !== false,
-          updatedAt: emp.updatedAt || now,
-        };
-        if (emp.empCode && String(emp.empCode).trim()) {
-          cleanItem.empCode = String(emp.empCode).trim();
-        } else {
-          delete cleanItem.empCode;
-        }
-        return cleanItem as Employee;
-      });
-
-    // Enforce uniqueness by employee number without cross-merging separate employee records
-    const empMap = new Map<string, Employee>();
-    for (const emp of cleanEmployees) {
-      const upperNo = emp.empNo.trim().toUpperCase();
-      empMap.set(upperNo, emp);
-    }
-
-    const uniqueEmployees = Array.from(empMap.values());
+  async setEmployees(employees: Employee[], timeoutMs?: number): Promise<boolean> {
+    const uniqueEmployees = deduplicateAndCanonicalizeEmployees(employees || []);
 
     // Un-blacklist any active employees so getEmployees() won't filter them out
     const identifiersToUnrecord: string[] = [];
@@ -865,7 +1070,7 @@ export const storage = {
     safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(uniqueEmployees));
     safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
     notifyDataChanged();
-    return await firestoreSync.syncEmployees(uniqueEmployees);
+    return await firestoreSync.syncEmployees(uniqueEmployees, timeoutMs);
   },
 
   getDeletedEmployeeNos(): string[] {
@@ -1302,15 +1507,20 @@ export const storage = {
     try {
       const parsed: DailyShiftPlan[] = JSON.parse(data);
       if (Array.isArray(parsed)) {
-        return parsed.filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
+        const cleaned = deduplicateAndCanonicalizeShiftPlans(parsed);
+        if (cleaned.length !== parsed.length) {
+          safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(cleaned));
+        }
+        return cleaned;
       }
       return [];
     } catch {
       return [];
     }
   },
+
   async setShiftPlans(plans: DailyShiftPlan[], newlyChangedPlans?: DailyShiftPlan[]): Promise<boolean> {
-    const cleanPlans = (plans || []).filter(p => !p.date || p.date >= HISTORY_CUTOFF_DATE);
+    const cleanPlans = deduplicateAndCanonicalizeShiftPlans(plans || []);
 
     // Synchronize manualOverrides so no stale override shift code conflicts with the new shift plan
     const overrides = this.getManualOverrides();
@@ -1349,45 +1559,46 @@ export const storage = {
     notifyDataChangedImmediate();
     return await firestoreSync.syncShiftPlans(cleanPlans, newlyChangedPlans);
   },
+
   async saveShiftPlan(plan: DailyShiftPlan): Promise<boolean> {
     const current = this.getShiftPlans();
-    const cleanEmp = (plan.empNo || '').trim().toUpperCase();
+    const canonNo = canonicalEmpNo(plan.empNo);
+    const canonDept = toCanonicalDepartment(plan.department);
     const cleanGid = (plan.gid || '').trim().toUpperCase();
-    const cleanDigits = cleanEmp.replace(/\D/g, '').replace(/^0+/, '');
     const nowIso = new Date().toISOString();
 
     const stampedPlan: DailyShiftPlan = {
       ...plan,
-      empNo: plan.empNo ? plan.empNo.trim() : '',
-      gid: plan.gid ? plan.gid.trim() : '',
+      empNo: canonNo || (plan.empNo ? plan.empNo.trim() : ''),
+      gid: cleanGid,
+      department: canonDept,
       updatedAt: nowIso,
     };
 
+    const targetEmpKey = canonNo || cleanGid;
     const filtered = current.filter(p => {
       if (p.date !== plan.date) return true;
-      const pEmp = (p.empNo || '').trim().toUpperCase();
+      const pCanonNo = canonicalEmpNo(p.empNo);
       const pGid = (p.gid || '').trim().toUpperCase();
-      const pDigits = pEmp.replace(/\D/g, '').replace(/^0+/, '');
-      const isMatch = (
-        (cleanEmp && pEmp && cleanEmp === pEmp) ||
+      const isMatch = Boolean(
+        (canonNo && pCanonNo && canonNo === pCanonNo) ||
         (cleanGid && pGid && cleanGid === pGid) ||
-        (cleanDigits && pDigits && cleanDigits === pDigits) ||
-        (cleanEmp && pGid && cleanEmp === pGid) ||
-        (cleanGid && pEmp && cleanGid === pEmp)
+        (canonNo && pGid && canonNo === pGid) ||
+        (cleanGid && pCanonNo && cleanGid === pCanonNo)
       );
       return !isMatch;
     });
 
     filtered.push(stampedPlan);
+    const dedupedAll = deduplicateAndCanonicalizeShiftPlans(filtered);
 
     // Synchronize manualOverrides so no stale override shift code conflicts with the new shift plan
     const overrides = this.getManualOverrides();
     let overridesChanged = false;
     const empKeys = [
-      `${cleanEmp}_${plan.date}`,
+      targetEmpKey ? `${targetEmpKey}_${plan.date}` : '',
       cleanGid ? `${cleanGid}_${plan.date}` : '',
-      cleanDigits ? `${cleanDigits}_${plan.date}` : '',
-      cleanDigits ? `${cleanDigits.padStart(4, '0')}_${plan.date}` : '',
+      canonNo ? `${canonNo}_${plan.date}` : '',
     ].filter(Boolean);
 
     empKeys.forEach(k => {
@@ -1397,7 +1608,7 @@ export const storage = {
       }
     });
 
-    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(filtered));
+    safeSetItem(STORAGE_KEYS.SHIFT_PLANS, JSON.stringify(dedupedAll));
     safeSetItem(STORAGE_KEYS.SHIFT_PLANS_MODIFIED, String(Date.now()));
 
     if (overridesChanged) {
@@ -1406,7 +1617,7 @@ export const storage = {
     }
 
     notifyDataChangedImmediate();
-    return await firestoreSync.saveShiftPlanDirect(stampedPlan, filtered);
+    return await firestoreSync.saveShiftPlanDirect(stampedPlan, dedupedAll);
   },
 
   getCanonicalEmpIdMap(): Map<string, string> {
@@ -1546,6 +1757,8 @@ export const storage = {
     const data = safeGetItem(STORAGE_KEYS.RAW_PUNCHES);
     if (!data) {
       memoryPunchesCache = [];
+      // Trigger async hydration from IndexedDB in background
+      this.hydrateFromIndexedDB().catch(() => {});
       return memoryPunchesCache;
     }
     try {
@@ -1555,48 +1768,85 @@ export const storage = {
           (p): p is BiometricRawPunch =>
             Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '' && (!p.date || p.date >= HISTORY_CUTOFF_DATE))
         );
+        // Trigger async hydration from IndexedDB to ensure complete records
+        this.hydrateFromIndexedDB().catch(() => {});
         return memoryPunchesCache;
       }
       memoryPunchesCache = [];
+      this.hydrateFromIndexedDB().catch(() => {});
       return memoryPunchesCache;
     } catch {
       memoryPunchesCache = [];
+      this.hydrateFromIndexedDB().catch(() => {});
       return memoryPunchesCache;
     }
   },
+
+  async hydrateFromIndexedDB(): Promise<{ count: number }> {
+    try {
+      const idbPunches = await idbGet<BiometricRawPunch[]>(IDB_KEYS.BIOMETRIC_PUNCHES);
+      if (Array.isArray(idbPunches) && idbPunches.length > 0) {
+        const punchMap = new Map<string, BiometricRawPunch>();
+        idbPunches.forEach(p => {
+          if (!p || !p.date || !p.time || p.date < HISTORY_CUTOFF_DATE) return;
+          const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+          punchMap.set(k, p);
+        });
+        if (memoryPunchesCache && memoryPunchesCache.length > 0) {
+          memoryPunchesCache.forEach(p => {
+            if (!p || !p.date || !p.time || p.date < HISTORY_CUTOFF_DATE) return;
+            const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+            if (!punchMap.has(k)) punchMap.set(k, p);
+          });
+        }
+        const merged = Array.from(punchMap.values());
+        if (!memoryPunchesCache || merged.length !== memoryPunchesCache.length) {
+          memoryPunchesCache = merged;
+          notifyDataChanged();
+        }
+        return { count: merged.length };
+      }
+    } catch (err) {
+      console.warn('Hydrate punches from IndexedDB warning:', err);
+    }
+    return { count: memoryPunchesCache ? memoryPunchesCache.length : 0 };
+  },
+
   async setBiometricPunches(punches: BiometricRawPunch[]): Promise<boolean> {
     const cleanPunches = (punches || []).filter(
       (p): p is BiometricRawPunch =>
         Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '' && (!p.date || p.date >= HISTORY_CUTOFF_DATE))
     );
     
-    // 1. Immediately update fast memory cache so UI components receive data synchronously with zero blocking
-    memoryPunchesCache = cleanPunches;
+    // 1. Deduplicate punches and update synchronous fast in-memory cache
+    const punchMap = new Map<string, BiometricRawPunch>();
+    cleanPunches.forEach(p => {
+      const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+      if (!punchMap.has(k)) punchMap.set(k, p);
+    });
+    const dedupedPunches = Array.from(punchMap.values());
+    memoryPunchesCache = dedupedPunches;
     isLocalSavingPunches = true;
 
-    // 2. Persist to LocalStorage with quota exhaustion safety
+    // 2. Persist 100% of punches to IndexedDB (zero quota limits, unlimited capacity, never sliced)
+    idbSet(IDB_KEYS.BIOMETRIC_PUNCHES, dedupedPunches).catch(err => {
+      console.warn('IndexedDB setBiometricPunches error:', err);
+    });
+
+    // 3. Persist safely to inMemoryCache and LocalStorage without any truncation
     try {
-      safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
+      safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(dedupedPunches));
       safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
-    } catch (storageErr) {
-      console.warn('LocalStorage quota limit reached for full biometric dataset; falling back to memory & Firestore persistence:', storageErr);
-      // Try keeping the most recent 15,000 punches in localStorage if quota exceeded
-      try {
-        const trimmedForLocalStorage = cleanPunches.slice(-15000);
-        safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(trimmedForLocalStorage));
-        safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
-      } catch {}
-    }
+    } catch {}
 
     notifyDataChanged();
 
-    // 3. Background Sync full bundle to Cloud Firestore (non-blocking for UI)
-    firestoreSync.syncBiometricPunches(cleanPunches)
+    // 4. Background Sync compact bundle to Cloud Firestore (non-blocking for UI)
+    firestoreSync.syncBiometricPunches(dedupedPunches)
       .then(() => {
         setTimeout(() => { isLocalSavingPunches = false; }, 1000);
       })
-      .catch((e) => {
-        console.warn('Background syncBiometricPunches caught error:', e);
+      .catch(() => {
         isLocalSavingPunches = false;
       });
 
@@ -1686,6 +1936,8 @@ export const storage = {
   },
 
   async syncAllToCloud(): Promise<boolean> {
+    // 1. Ensure memory is 100% hydrated from IndexedDB before pushing to Cloud
+    await this.hydrateFromIndexedDB().catch(() => {});
     return await firestoreSync.syncAllToCloud({
       employees: this.getEmployees(),
       shiftCodes: this.getShiftCodes(),
@@ -1700,16 +1952,11 @@ export const storage = {
   },
 
   async initCloudSync(): Promise<{ connected: boolean; source: 'cloud' | 'local' }> {
-    if (firestoreSync.isQuotaExceeded()) {
-      return { connected: false, source: 'local' };
-    }
     try {
-      const isConnected = await testFirestoreConnection();
-      if (!isConnected || firestoreSync.isQuotaExceeded()) {
-        return { connected: false, source: 'local' };
-      }
-
+      // Connect and fetch data directly from Cloud Firestore
       const cloudData = await firestoreSync.fetchAllFromCloud();
+      const isCloudReady = Boolean(cloudData && (cloudData.hasData || (cloudData.departments && cloudData.departments.length > 0) || (cloudData.users && cloudData.users.length > 0)));
+
       if (cloudData && cloudData.hasData) {
         // 1. SHIFT CODES (Cloud is authoritative master)
         if (cloudData.shiftCodes && cloudData.shiftCodes.length > 0) {
@@ -1723,29 +1970,113 @@ export const storage = {
           safeSetItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
         }
 
-        // 2. BIOMETRIC PUNCHES (Cloud is authoritative master)
+        // 2. BIOMETRIC PUNCHES (Cloud is authoritative master with deduplication)
         if (cloudData.punches && cloudData.punches.length > 0) {
-          const cleanPunches = cloudData.punches.filter(
-            (p): p is BiometricRawPunch =>
-              Boolean(p && typeof p === 'object' && typeof p.time === 'string' && p.time.trim() !== '' && (!p.date || p.date >= HISTORY_CUTOFF_DATE))
-          );
+          const punchMap = new Map<string, BiometricRawPunch>();
+          cloudData.punches.forEach(p => {
+            if (!p || !p.date || !p.time || p.date < HISTORY_CUTOFF_DATE) return;
+            const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+            if (!punchMap.has(k)) punchMap.set(k, p);
+          });
+          // Also merge any existing punches currently in memory cache
+          if (memoryPunchesCache && memoryPunchesCache.length > 0) {
+            memoryPunchesCache.forEach(p => {
+              if (!p || !p.date || !p.time || p.date < HISTORY_CUTOFF_DATE) return;
+              const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+              if (!punchMap.has(k)) punchMap.set(k, p);
+            });
+          }
+          const cleanPunches = Array.from(punchMap.values());
           memoryPunchesCache = cleanPunches;
+          idbSet(IDB_KEYS.BIOMETRIC_PUNCHES, cleanPunches).catch(() => {});
           try {
             safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches));
             safeSetItem(STORAGE_KEYS.PUNCHES_MODIFIED, String(Date.now()));
-          } catch {
-            try {
-              safeSetItem(STORAGE_KEYS.RAW_PUNCHES, JSON.stringify(cleanPunches.slice(-15000)));
-            } catch {}
-          }
+          } catch {}
+          notifyDataChangedImmediate();
         }
 
-        // 3. EMPLOYEES (Cloud is authoritative master)
+        // 3. EMPLOYEES (Two-Way Smart Merge with Conflict-Free Timestamp Resolution)
         if (cloudData.employees && cloudData.employees.length > 0) {
-          const cleanCloudEmps = cloudData.employees.filter(e => e && e.empNo && !isDemoEmployee(e));
-          if (cleanCloudEmps.length > 0) {
-            safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(cleanCloudEmps));
+          let hasSanitizedDemo = false;
+          let hasHealedEmpCode = false;
+          let needsPushToCloud = false;
+
+          const currentLocalEmps = this.getEmployees();
+          const localEmpMap = new Map<string, Employee>();
+          currentLocalEmps.forEach(le => {
+            if (le && le.empNo) localEmpMap.set(le.empNo.trim().toUpperCase(), le);
+          });
+
+          const deletedNosSet = new Set(this.getDeletedEmployeeNos().map(n => n.trim().toUpperCase()));
+          const mergedEmpMap = new Map<string, Employee>();
+
+          // Process all cloud employees
+          cloudData.employees
+            .filter(e => e && e.empNo && !isDemoEmployee(e))
+            .forEach(e => {
+              const upperNo = e.empNo.trim().toUpperCase();
+              if (deletedNosSet.has(upperNo)) return;
+
+              const sanitized = sanitizeEmployeeDepartment(e);
+              if (sanitized.department !== e.department) {
+                hasSanitizedDemo = true;
+              }
+
+              const localMatch = localEmpMap.get(upperNo);
+              if (!localMatch) {
+                // Not in local yet: adopt cloud employee
+                const empNoDigits = (sanitized.empNo || '').replace(/\D/g, '');
+                if (!sanitized.empCode && empNoDigits && empNoDigits.length <= 4) {
+                  sanitized.empCode = `1000${empNoDigits.padStart(4, '0')}`;
+                  hasHealedEmpCode = true;
+                }
+                mergedEmpMap.set(upperNo, sanitized);
+              } else {
+                // Both local and cloud have this employee: compare timestamps!
+                const localTime = localMatch.updatedAt || '1970-01-01T00:00:00.000Z';
+                const cloudTime = sanitized.updatedAt || '1970-01-01T00:00:00.000Z';
+
+                if (localTime > cloudTime) {
+                  // LOCAL is newer (e.g. user just updated via template or toggled De-activate):
+                  // KEEP localMatch as authoritative and mark for push to cloud!
+                  needsPushToCloud = true;
+                  mergedEmpMap.set(upperNo, localMatch);
+                } else {
+                  // CLOUD is newer or equal: adopt cloud employee, but preserve local empCode if cloud has none
+                  const empNoDigits = (sanitized.empNo || '').replace(/\D/g, '');
+                  if (!sanitized.empCode) {
+                    if (localMatch.empCode) {
+                      sanitized.empCode = localMatch.empCode;
+                      hasHealedEmpCode = true;
+                    } else if (empNoDigits && empNoDigits.length <= 4) {
+                      sanitized.empCode = `1000${empNoDigits.padStart(4, '0')}`;
+                      hasHealedEmpCode = true;
+                    }
+                  }
+                  mergedEmpMap.set(upperNo, sanitized);
+                }
+              }
+            });
+
+          // Also retain any local employees not present in cloud (e.g. newly created locally that haven't pushed yet)
+          currentLocalEmps.forEach(le => {
+            if (le && le.empNo && !isDemoEmployee(le)) {
+              const upperNo = le.empNo.trim().toUpperCase();
+              if (!deletedNosSet.has(upperNo) && !mergedEmpMap.has(upperNo)) {
+                mergedEmpMap.set(upperNo, le);
+                needsPushToCloud = true;
+              }
+            }
+          });
+
+          const finalMergedEmps = Array.from(mergedEmpMap.values());
+          if (finalMergedEmps.length > 0) {
+            safeSetItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(finalMergedEmps));
             safeSetItem(STORAGE_KEYS.EMPLOYEES_MODIFIED, String(Date.now()));
+            if (hasSanitizedDemo || hasHealedEmpCode || needsPushToCloud) {
+              firestoreSync.syncEmployees(finalMergedEmps).catch(() => null);
+            }
           }
         }
 
@@ -1755,24 +2086,71 @@ export const storage = {
           this.mergeCloudShiftPlans(cleanPlans);
         }
 
-        // 5. DEPARTMENTS & DELETED DEPARTMENTS (Cloud is authoritative master)
+        // 5. DEPARTMENTS & DELETED DEPARTMENTS
+        const REAL_SYSTEM_DEPTS = new Set(INITIAL_DEPARTMENTS.map(d => d.code.toUpperCase()));
         if (cloudData.deletedDepartments && Array.isArray(cloudData.deletedDepartments) && cloudData.deletedDepartments.length > 0) {
           const currentDeleted = new Set(this.getDeletedDepartmentCodes());
           cloudData.deletedDepartments.forEach(d => currentDeleted.add(d.trim().toUpperCase()));
           safeSetItem(STORAGE_KEYS.DELETED_DEPARTMENTS, JSON.stringify(Array.from(currentDeleted)));
         }
 
-        if (cloudData.departments && cloudData.departments.length > 0) {
-          const deletedDeptSet = new Set(this.getDeletedDepartmentCodes());
-          const cleanDepts = cloudData.departments
-            .filter(d => d && d.code && !deletedDeptSet.has(d.code.trim().toUpperCase()))
-            .map(d => ({ ...d, code: d.code.trim().toUpperCase(), name: (d.name || d.code).trim() }))
-            .sort((a, b) => a.code.localeCompare(b.code));
-          if (cleanDepts.length > 0) {
-            safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
-            safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
+        const activeDeletedSet = new Set(this.getDeletedDepartmentCodes());
+        const deptMap = new Map<string, Department>();
+
+        // Seed with authentic real departments if not deleted
+        INITIAL_DEPARTMENTS.forEach(d => {
+          const upper = d.code.toUpperCase();
+          if (!activeDeletedSet.has(upper)) {
+            deptMap.set(upper, { code: upper, name: resolveDepartmentFullName(upper, d.name) });
           }
+        });
+
+        if (cloudData.departments && cloudData.departments.length > 0) {
+          const activeEmps = cloudData.employees || this.getEmployees();
+          const empsWithDept = new Set(activeEmps.map(e => (e.department || '').trim().toUpperCase()).filter(Boolean));
+
+          cloudData.departments.forEach(d => {
+            if (d && d.code) {
+              const upper = d.code.trim().toUpperCase();
+              if (activeDeletedSet.has(upper)) return;
+              const isReal = REAL_SYSTEM_DEPTS.has(upper);
+              const hasEmps = empsWithDept.has(upper);
+              if (isReal || hasEmps) {
+                const existing = deptMap.get(upper);
+                const resolvedName = resolveDepartmentFullName(upper, d.name, existing?.name);
+                deptMap.set(upper, {
+                  code: upper,
+                  name: resolvedName,
+                  updatedAt: d.updatedAt || existing?.updatedAt,
+                });
+              } else {
+                activeDeletedSet.add(upper);
+                this.recordDeletedDepartment(upper);
+              }
+            }
+          });
         }
+
+        if (!activeDeletedSet.has('OHL') && !deptMap.has('OHL')) {
+          deptMap.set('OHL', { code: 'OHL', name: 'Overhaul' });
+        }
+
+        // Exclude TRW/TRD, TRD, OVH, and MRL from displayed departments
+        deptMap.delete('TRW/TRD');
+        deptMap.delete('TRD');
+        deptMap.delete('OVH');
+        deptMap.delete('MRL');
+
+        const cleanDepts = Array.from(deptMap.values())
+          .filter(d => d.code !== 'TRW/TRD' && d.code !== 'TRD' && d.code !== 'OVH' && d.code !== 'MRL')
+          .map(d => ({
+            code: d.code,
+            name: resolveDepartmentFullName(d.code, d.name),
+            updatedAt: d.updatedAt || new Date().toISOString(),
+          }))
+          .sort((a, b) => a.code.localeCompare(b.code));
+        safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
+        safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
 
         // 6. OT RECORDS (Cloud is authoritative master)
         if ((cloudData as any).hasOTBundle || (cloudData.otRecords && cloudData.otRecords.length > 0)) {
@@ -1805,10 +2183,10 @@ export const storage = {
       } else {
         // Cloud returned no bundled data. If local has initial data, seed once safely
         const localEmps = this.getEmployees();
-        if (localEmps.length > 0 && isConnected) {
+        if (localEmps.length > 0 && isCloudReady) {
           await this.syncAllToCloud().catch(console.warn);
         }
-        return { connected: true, source: 'local' };
+        return { connected: isCloudReady, source: 'local' };
       }
     } catch (e) {
       console.error('initCloudSync error:', e);
@@ -1824,9 +2202,8 @@ export const storage = {
     safeSetItem(STORAGE_KEYS.SHIFT_CODES, JSON.stringify(cleanCodes));
     safeSetItem(STORAGE_KEYS.SHIFT_CODES_MODIFIED, String(Date.now()));
 
-    // 2. Clean Departments: remove RS, SIG, STN, IT
-    const currentDepts = this.getDepartments();
-    const cleanDepts = currentDepts.filter(d => !isDemoDepartment(d.code));
+    // 2. Clean Departments: ensure all authentic standard BTS departments are preserved
+    const cleanDepts = this.getDepartments();
     safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
 
     // 3. Clean Employees: remove any demo employees & sanitize departments
@@ -1893,6 +2270,78 @@ export const storage = {
   },
   resetToDefaults() {
     this.resetAllToInitial();
+  },
+
+  // Optimize active data & in-memory cache to guarantee optimal application speed and stability
+  async optimizeActiveData(cutoffDate = '2026-09-01'): Promise<{
+    originalPunches: number;
+    optimizedPunches: number;
+    prunedPunches: number;
+    dedupedPunches: number;
+    originalPlans: number;
+    optimizedPlans: number;
+  }> {
+    const punches = this.getBiometricPunches();
+    const origPunchCount = punches.length;
+    const punchMap = new Map<string, BiometricRawPunch>();
+    let deduped = 0;
+    let pruned = 0;
+
+    punches.forEach(p => {
+      if (!p || !p.date || !p.time) {
+        pruned++;
+        return;
+      }
+      if (p.date < cutoffDate) {
+        pruned++;
+        return;
+      }
+      const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+      if (punchMap.has(k)) {
+        deduped++;
+      } else {
+        punchMap.set(k, {
+          ...p,
+          id: p.id || k,
+          empIdentifier: (p.empIdentifier || '').trim(),
+          type: p.type || 'I',
+          date: p.date,
+          time: p.time,
+          deviceId: p.deviceId || '01',
+        });
+      }
+    });
+
+    const cleanPunches = Array.from(punchMap.values()).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+    await this.setBiometricPunches(cleanPunches);
+
+    // Deduplicate shift plans
+    const plans = this.getShiftPlans();
+    const origPlansCount = plans.length;
+    const planMap = new Map<string, DailyShiftPlan>();
+    plans.forEach(p => {
+      if (!p || !p.date || (!p.empNo && !p.gid)) return;
+      if (p.date < cutoffDate) return;
+      const k = `${(p.empNo || p.gid || '').trim().toUpperCase()}_${p.date}`;
+      if (!planMap.has(k) || (p.updatedAt && (!planMap.get(k)?.updatedAt || p.updatedAt > (planMap.get(k)?.updatedAt || '')))) {
+        planMap.set(k, p);
+      }
+    });
+    const cleanPlans = Array.from(planMap.values());
+    if (cleanPlans.length !== origPlansCount) {
+      await this.setShiftPlans(cleanPlans);
+    }
+
+    notifyDataChanged();
+
+    return {
+      originalPunches: origPunchCount,
+      optimizedPunches: cleanPunches.length,
+      prunedPunches: pruned,
+      dedupedPunches: deduped,
+      originalPlans: origPlansCount,
+      optimizedPlans: cleanPlans.length,
+    };
   },
 
   // Prune all historical data prior to August 2026 (Aug 1, 2026) to reduce payload and eliminate lag

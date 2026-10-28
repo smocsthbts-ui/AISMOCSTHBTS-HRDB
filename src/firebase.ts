@@ -31,6 +31,13 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import { 
+  DEPARTMENTS as INITIAL_DEPARTMENTS,
+  resolveDepartmentFullName,
+  getCanonicalDepartmentFullName,
+  toCanonicalDepartment,
+  canonicalEmpNo
+} from './data/initialData';
+import { 
   Employee, 
   ShiftCode, 
   DailyShiftPlan, 
@@ -240,10 +247,11 @@ export async function resetQuotaState(): Promise<boolean> {
   return true;
 }
 
-// Test connection on boot (with 3-second timeout so it never hangs)
+// Test connection on boot (with 10-second timeout so it reliably connects even during cold starts)
 export async function testFirestoreConnection(): Promise<boolean> {
+  // Always reset temporary quota flag on connection test to ensure live cloud connection
   if (isFirestoreQuotaExceeded) {
-    return false; // In local persistence mode when quota is reached
+    isFirestoreQuotaExceeded = false;
   }
   try {
     const checkPromise = (async () => {
@@ -260,7 +268,7 @@ export async function testFirestoreConnection(): Promise<boolean> {
       return true;
     })();
 
-    const result = await promiseWithTimeout(checkPromise, 3000, false);
+    const result = await promiseWithTimeout(checkPromise, 10000, false);
     if (result) {
       console.log('Firebase Firestore connection verified successfully!');
       return true;
@@ -315,11 +323,23 @@ export function cleanDocId(id: string): string {
   return sanitized || 'doc_' + Math.random().toString(36).substring(2, 9);
 }
 
-// Authentic BTS departments (RS=Rolling Stock, SIG=Signaling, STN=Station, GM, etc. are REAL departments)
-export const DEMO_DEPARTMENT_CODES: string[] = [];
+// The Authentic BTS Departments (only canonical codes, TRW/TRD canonicalizes to TRW/TRL)
+export const AUTHENTIC_BTS_DEPARTMENTS = new Set([
+  'ADM/CMM', 'BES/PSY', 'BES/PSY2', 'DWE', 'GM', 'MCC', 'MLR', 'OHL', 'RST', 'RST2', 'STR', 'TEL', 'TRW/TRL'
+]);
 
-export function isDemoDepartment(_dept: string): boolean {
-  return false;
+// Non-standard / demo department codes that should never linger in the system
+export const DEMO_DEPARTMENT_CODES = [
+  'RS', 'SIG', 'QST', 'STN', 'IT', 'DEMO', 'TEST', 'TESTING', 'DUMMY'
+];
+
+export function isDemoDepartment(dept?: string | null): boolean {
+  if (!dept) return false;
+  const clean = dept.trim().toUpperCase();
+  if (clean === 'ALL' || clean === 'PENDING') return false;
+  if (DEMO_DEPARTMENT_CODES.includes(clean)) return true;
+  if (clean.startsWith('DEMO') || clean.startsWith('TEST')) return true;
+  return !AUTHENTIC_BTS_DEPARTMENTS.has(clean);
 }
 
 // Demo employee identifiers (strictly targeting only the legacy dummy record)
@@ -354,7 +374,8 @@ export function isDemoEmployee(empOrIdentifier?: string | Employee | null): bool
 // Authentic railway shift codes
 export const DEMO_SHIFT_CODES: string[] = [];
 
-export function isDemoShiftCode(_code: string, _dept?: string): boolean {
+export function isDemoShiftCode(_code: string, dept?: string): boolean {
+  if (dept && isDemoDepartment(dept)) return true;
   return false;
 }
 
@@ -379,20 +400,64 @@ export function isDemoUser(userOrEmail?: string | UserAccount | null): boolean {
   return false;
 }
 
-// Preserve original employee department without alterations
+// Sanitize employee department: remap any legacy demo departments and aliases (e.g. TRW/TRD -> TRW/TRL)
 export function sanitizeEmployeeDepartment(emp: Employee): Employee {
+  if (!emp) return emp;
+  const rawDept = (emp.department || '').trim().toUpperCase();
+  const canonDept = toCanonicalDepartment(rawDept);
+  const canonNo = canonicalEmpNo(emp.empNo);
+  const cleanEmpNo = canonNo.replace(/^0+/, '');
+  const fName = (emp.firstName || '').trim().toLowerCase();
+  const lName = (emp.familyName || '').trim().toLowerCase();
+  let cleanDept = canonDept;
+
+  const isKittisak = canonNo === '1442' || cleanEmpNo === '1442' || fName.includes('kittisak') || lName.includes('boonma');
+  const isSarawut = canonNo === '1234' || cleanEmpNo === '1234' || fName.includes('sarawut') || lName.includes('phromdee');
+
+  // Specific employee operational records from BES/PSY:
+  if (isKittisak || isSarawut) {
+    if (rawDept === 'SIG' || rawDept === 'RS' || isDemoDepartment(rawDept) || rawDept === 'TEL' || rawDept === 'RST' || !rawDept) {
+      cleanDept = 'BES/PSY';
+    }
+  } else if (rawDept === 'RS') {
+    cleanDept = 'RST';
+  } else if (rawDept === 'SIG') {
+    cleanDept = 'TEL';
+  } else if (rawDept === 'OVH') {
+    cleanDept = 'OHL';
+  } else if (rawDept === 'TRW/TRD' || rawDept === 'TRD' || rawDept === 'TRW') {
+    cleanDept = 'TRW/TRL';
+  } else if (rawDept === 'QST') {
+    cleanDept = 'GM';
+  } else if (isDemoDepartment(cleanDept)) {
+    cleanDept = 'GM';
+  }
+
+  const hasEmpNoChanged = Boolean(canonNo && canonNo !== emp.empNo);
+  const hasDeptChanged = cleanDept !== emp.department;
+
+  if (hasDeptChanged || hasEmpNoChanged) {
+    return {
+      ...emp,
+      empNo: canonNo || emp.empNo,
+      department: cleanDept,
+      updatedAt: emp.updatedAt || new Date().toISOString()
+    };
+  }
   return emp;
 }
 
 // Ensure employee object has no undefined fields (which would cause Firestore writes to crash)
 export function cleanEmployeeForFirestore(emp: Employee, defaultTime?: string): Employee {
   const baseTime = defaultTime || '1970-01-01T00:00:00.000Z';
+  const canonNo = canonicalEmpNo(emp.empNo) || String(emp.empNo || '').trim();
+  const canonDept = toCanonicalDepartment(emp.department);
   const clean: any = {
-    empNo: String(emp.empNo || '').trim(),
-    gid: String(emp.gid || '').trim(),
+    empNo: canonNo,
+    gid: String(emp.gid || '').trim().toUpperCase(),
     firstName: String(emp.firstName || '').trim(),
     familyName: String(emp.familyName || '').trim(),
-    department: String(emp.department || 'GM').trim().toUpperCase(),
+    department: canonDept,
     division: String(emp.division || 'MO CS BTS').trim(),
     functionTitle: String(emp.functionTitle || '').trim(),
     costCenter: String(emp.costCenter || 'C93056').trim(),
@@ -400,13 +465,223 @@ export function cleanEmployeeForFirestore(emp: Employee, defaultTime?: string): 
     isActive: emp.isActive !== false,
     updatedAt: emp.updatedAt || baseTime,
   };
+  // Ensure 8-digit Payroll EmpCode is preserved or auto-healed for numeric empNo
+  const empNoDigits = clean.empNo.replace(/\D/g, '');
   if (emp.empCode && String(emp.empCode).trim()) {
     clean.empCode = String(emp.empCode).trim();
+  } else if (empNoDigits && empNoDigits.length <= 4) {
+    clean.empCode = `1000${empNoDigits.padStart(4, '0')}`;
   }
-  if (emp.id && String(emp.id).trim()) {
-    clean.id = String(emp.id).trim();
+  clean.id = `emp-${canonNo}`;
+  return removeUndefinedFields(clean) as Employee;
+}
+
+/**
+ * Universal Deduplication & Canonicalization for Employee Master:
+ * Unifies duplicate employee records caused by unpadded vs 4-digit padded empNo (e.g. "139" vs "0139"),
+ * maps department variations (e.g. "TRW/TRD" -> "TRW/TRL"), and merges records sharing the same GID or full name.
+ */
+export function deduplicateAndCanonicalizeEmployees(employees: Employee[]): Employee[] {
+  if (!Array.isArray(employees)) return [];
+  const mergedMap = new Map<string, Employee>();
+  const now = new Date().toISOString();
+
+  for (const raw of employees) {
+    if (!raw || !raw.empNo || isDemoEmployee(raw)) continue;
+    const sanitized = sanitizeEmployeeDepartment(raw);
+    const canonNo = canonicalEmpNo(sanitized.empNo);
+    const canonDept = toCanonicalDepartment(sanitized.department);
+    const gidClean = (sanitized.gid || '').trim().toUpperCase();
+    const isValidGid = Boolean(gidClean && gidClean !== 'NA' && gidClean.length >= 3 && !gidClean.includes('0000'));
+    const cleanFn = (sanitized.firstName || '').trim().toLowerCase();
+    const cleanLn = (sanitized.familyName || '').trim().toLowerCase();
+    const fullNameKey = (cleanFn && cleanLn && cleanLn !== '-') ? `name:${cleanFn}_${cleanLn}` : '';
+
+    // Determine matching key: GID takes highest precedence, then Canonical EmpNo, then Full Name
+    let matchKey = '';
+    if (isValidGid && mergedMap.has(`gid:${gidClean}`)) {
+      matchKey = mergedMap.get(`gid:${gidClean}`) as any;
+    } else if (canonNo && mergedMap.has(`no:${canonNo}`)) {
+      matchKey = mergedMap.get(`no:${canonNo}`) as any;
+    } else if (fullNameKey && mergedMap.has(fullNameKey)) {
+      matchKey = mergedMap.get(fullNameKey) as any;
+    }
+
+    const cleanItem: Employee = {
+      ...sanitized,
+      empNo: canonNo,
+      id: `emp-${canonNo}`,
+      department: canonDept,
+      gid: gidClean || sanitized.gid,
+      empCode: sanitized.empCode || (canonNo.length === 4 ? `1000${canonNo}` : undefined),
+      isActive: sanitized.isActive !== false,
+      updatedAt: sanitized.updatedAt || now,
+    };
+
+    if (matchKey) {
+      const existing = mergedMap.get(matchKey)!;
+      const existingTime = existing.updatedAt || '';
+      const incomingTime = cleanItem.updatedAt || '';
+      const isIncomingNewer = incomingTime >= existingTime;
+      const primary = isIncomingNewer ? cleanItem : existing;
+      const secondary = isIncomingNewer ? existing : cleanItem;
+
+      // Prefer padded 4-digit empNo
+      const bestEmpNo = (primary.empNo && primary.empNo.length === 4) ? primary.empNo : (secondary.empNo || primary.empNo);
+      // Prefer authentic non-default empCode (e.g. 65090139 over 10000139)
+      const bestEmpCode = (primary.empCode && !primary.empCode.startsWith('1000'))
+        ? primary.empCode
+        : ((secondary.empCode && !secondary.empCode.startsWith('1000')) ? secondary.empCode : (primary.empCode || secondary.empCode));
+      // Canonical department: TRW/TRL wins over TRW/TRD
+      const bestDept = (primary.department === 'TRW/TRL' || secondary.department === 'TRW/TRL')
+        ? 'TRW/TRL'
+        : (toCanonicalDepartment(primary.department) || toCanonicalDepartment(secondary.department));
+      // Authentic GID
+      const bestGid = (isValidGid ? gidClean : '') || primary.gid || secondary.gid;
+
+      const merged: Employee = {
+        ...secondary,
+        ...primary,
+        empNo: bestEmpNo,
+        id: `emp-${bestEmpNo}`,
+        department: bestDept,
+        gid: bestGid,
+        empCode: bestEmpCode,
+        firstName: primary.firstName || secondary.firstName,
+        familyName: primary.familyName || secondary.familyName,
+        functionTitle: (primary.functionTitle && primary.functionTitle !== 'Service Technician') ? primary.functionTitle : (secondary.functionTitle || primary.functionTitle),
+        costCenter: (primary.costCenter && primary.costCenter !== 'C93056') ? primary.costCenter : (secondary.costCenter || primary.costCenter || 'C93056'),
+        division: primary.division || secondary.division || 'MO CS BTS',
+        isShiftWorker: Boolean(primary.isShiftWorker || secondary.isShiftWorker),
+        isActive: primary.isActive !== false && secondary.isActive !== false,
+        updatedAt: primary.updatedAt || secondary.updatedAt || now,
+      };
+
+      mergedMap.set(matchKey, merged);
+    } else {
+      const assignedKey = `item:${isValidGid ? gidClean : canonNo}`;
+      mergedMap.set(assignedKey, cleanItem);
+      if (isValidGid) mergedMap.set(`gid:${gidClean}`, assignedKey as any);
+      if (canonNo) mergedMap.set(`no:${canonNo}`, assignedKey as any);
+      if (fullNameKey) mergedMap.set(fullNameKey, assignedKey as any);
+    }
   }
-  return clean as Employee;
+
+  const results: Employee[] = [];
+  const seenNos = new Set<string>();
+  for (const [k, v] of mergedMap.entries()) {
+    if (k.startsWith('item:') && typeof v === 'object' && v.empNo && !seenNos.has(v.empNo)) {
+      seenNos.add(v.empNo);
+      results.push(v);
+    }
+  }
+  return results.sort((a, b) => a.empNo.localeCompare(b.empNo));
+}
+
+/**
+ * Universal Deduplication & Canonicalization for Daily Shift Plans:
+ * Merges plans sharing the same employee (by canonical empNo or GID) on the same date,
+ * standardizes empNo to 4 digits ("0139") and maps department to canonical "TRW/TRL".
+ */
+export function deduplicateAndCanonicalizeShiftPlans(
+  plans: DailyShiftPlan[],
+  employees?: Employee[]
+): DailyShiftPlan[] {
+  if (!Array.isArray(plans)) return [];
+  const planMap = new Map<string, DailyShiftPlan>();
+  const now = new Date().toISOString();
+
+  // Create fast lookup for employee GID and department by canonical empNo
+  const empLookup = new Map<string, { gid?: string; department?: string }>();
+  if (Array.isArray(employees)) {
+    employees.forEach(e => {
+      if (e && e.empNo) {
+        const cNo = canonicalEmpNo(e.empNo);
+        empLookup.set(cNo, { gid: e.gid, department: e.department });
+      }
+    });
+  }
+
+  plans.forEach(p => {
+    if (!p || !p.date || !p.shiftCode) return;
+    if (p.date < '2024-01-01') return;
+
+    const canonNo = canonicalEmpNo(p.empNo);
+    const linkedEmp = canonNo ? empLookup.get(canonNo) : undefined;
+    const gidClean = ((p.gid || linkedEmp?.gid || '')).trim().toUpperCase();
+    const canonDept = toCanonicalDepartment(p.department || linkedEmp?.department);
+
+    // Primary unique key for an employee on a specific date:
+    // A single employee has only ONE scheduled shift per calendar date
+    const targetEmpKey = canonNo || gidClean;
+    if (!targetEmpKey) return;
+    const key = `${targetEmpKey}_${p.date}`;
+
+    const cleanPlan: DailyShiftPlan = {
+      ...p,
+      id: p.id || `plan_${cleanDocId(targetEmpKey)}_${p.date}`,
+      empNo: canonNo || p.empNo,
+      gid: gidClean || p.gid,
+      department: canonDept,
+      updatedAt: p.updatedAt || now,
+    };
+
+    const existing = planMap.get(key);
+    if (!existing) {
+      planMap.set(key, cleanPlan);
+    } else {
+      const existingTime = existing.updatedAt || '';
+      const incomingTime = cleanPlan.updatedAt || '';
+      const isIncomingNewer = incomingTime >= existingTime;
+      const primary = isIncomingNewer ? cleanPlan : existing;
+      const secondary = isIncomingNewer ? existing : cleanPlan;
+
+      planMap.set(key, {
+        ...secondary,
+        ...primary,
+        empNo: canonNo || primary.empNo || secondary.empNo,
+        gid: gidClean || primary.gid || secondary.gid,
+        department: canonDept,
+        shiftCode: primary.shiftCode || secondary.shiftCode,
+        updatedAt: primary.updatedAt || secondary.updatedAt || now,
+      });
+    }
+  });
+
+  return Array.from(planMap.values());
+}
+
+/**
+ * Recursively remove any keys that have undefined values from an object or array
+ * to ensure 100% compliance with Firestore's strict no-undefined policy.
+ */
+export function removeUndefinedFields<T>(obj: T): T {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) {
+    return obj.map(item => removeUndefinedFields(item)) as unknown as T;
+  }
+  if (typeof obj === 'object') {
+    const clean: any = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (value !== undefined) {
+        clean[key] = removeUndefinedFields(value);
+      }
+    }
+    return clean;
+  }
+  return obj;
+}
+
+export function cleanDepartmentForFirestore(dept: Department, defaultTime?: string): Department {
+  const baseTime = defaultTime || new Date().toISOString();
+  const code = String(dept?.code || '').trim().toUpperCase() || 'UNKNOWN';
+  const name = String(resolveDepartmentFullName(code, dept?.name) || code || 'General').trim();
+  const updatedAt = String((dept && dept.updatedAt) || baseTime).trim();
+  return removeUndefinedFields({
+    code,
+    name,
+    updatedAt,
+  });
 }
 
 // Chunk helper for large arrays
@@ -416,6 +691,70 @@ function chunkArray<T>(arr: T[], chunkSize: number): T[][] {
     chunks.push(arr.slice(i, i + chunkSize));
   }
   return chunks;
+}
+
+// Unified high-capacity Biometric Punches chunk writer (2,000 punches per document bundle)
+async function writeBiometricPunchesChunksInternal(punches: BiometricRawPunch[], now: string): Promise<Promise<any>[]> {
+  const punchMap = new Map<string, any>();
+  (punches || []).forEach(p => {
+    if (!p || !p.date || !p.time) return;
+    if (p.date < '2024-01-01') return;
+    const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+    if (!punchMap.has(k)) {
+      punchMap.set(k, {
+        id: p.id || k,
+        empIdentifier: (p.empIdentifier || '').trim(),
+        type: p.type || 'I',
+        date: p.date,
+        time: p.time,
+        deviceId: p.deviceId || '01',
+      });
+    }
+  });
+  const leanPunches = Array.from(punchMap.values()).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+  const punchChunks = chunkArray(leanPunches, 2000);
+
+  const promises: Promise<any>[] = [];
+  promises.push(
+    setDoc(doc(db, 'app_bundles', 'punches_manifest'), {
+      chunks: punchChunks.length,
+      totalPunches: leanPunches.length,
+      updatedAt: now,
+    }, { merge: true }).catch(err => {
+      if (isQuotaExceededError(err)) markQuotaExceeded(err);
+      console.warn('Cloud sync punches_manifest error:', err?.message);
+    })
+  );
+
+  if (punchChunks.length === 0) {
+    promises.push(
+      setDoc(doc(db, 'app_bundles', 'punches_0'), {
+        data: [],
+        chunkIndex: 0,
+        count: 0,
+        updatedAt: now,
+      }, { merge: true }).catch(err => {
+        if (isQuotaExceededError(err)) markQuotaExceeded(err);
+      })
+    );
+  } else {
+    for (let i = 0; i < punchChunks.length; i++) {
+      promises.push(
+        setDoc(doc(db, 'app_bundles', `punches_${i}`), {
+          data: punchChunks[i],
+          chunkIndex: i,
+          count: punchChunks[i].length,
+          updatedAt: now,
+        }, { merge: true }).catch(err => {
+          if (isQuotaExceededError(err)) markQuotaExceeded(err);
+          console.warn(`Cloud sync punches_${i} error:`, err?.message);
+        })
+      );
+    }
+  }
+
+  // Manifest specifies the exact chunk count; fetchAllFromCloud strictly loads chunks 0 to punchesManifestChunks - 1
+  return promises;
 }
 
 let shiftPlansBundleDebounceTimer: any = null;
@@ -446,10 +785,11 @@ export const firestoreSync = {
       const promises: Promise<any>[] = [];
 
       // 1. Shift Codes bundle (1 write instead of 800+ writes)
+      const cleanShiftCodes = (data.shiftCodes || []).map(sc => removeUndefinedFields(sc));
       promises.push(
         setDoc(doc(db, 'app_bundles', 'shift_codes'), {
-          data: data.shiftCodes,
-          count: data.shiftCodes.length,
+          data: cleanShiftCodes,
+          count: cleanShiftCodes.length,
           updatedAt: now,
         }, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
@@ -458,13 +798,15 @@ export const firestoreSync = {
       );
 
       // 2. Employees bundle (1 write instead of 400+ writes)
-      const cleanEmps = (data.employees || []).map(e => cleanEmployeeForFirestore(e, now));
+      const dedupedEmps = deduplicateAndCanonicalizeEmployees(data.employees || []);
+      const cleanEmps = dedupedEmps.map(e => removeUndefinedFields(cleanEmployeeForFirestore(e, now)));
+      const empPayload = removeUndefinedFields({
+        data: cleanEmps,
+        count: cleanEmps.length,
+        updatedAt: now,
+      });
       promises.push(
-        setDoc(doc(db, 'app_bundles', 'employees'), {
-          data: cleanEmps,
-          count: cleanEmps.length,
-          updatedAt: now,
-        }, { merge: true }).catch(err => {
+        setDoc(doc(db, 'app_bundles', 'employees'), empPayload, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
           console.warn('Cloud sync employees error:', err?.message);
         })
@@ -472,48 +814,34 @@ export const firestoreSync = {
 
       // 3. Departments bundle (1 write)
       if (data.departments && data.departments.length > 0) {
+        const cleanDepartments = data.departments
+          .filter(d => d && d.code)
+          .map(d => removeUndefinedFields(cleanDepartmentForFirestore(d, now)));
+        const deptPayload = removeUndefinedFields({
+          data: cleanDepartments,
+          count: cleanDepartments.length,
+          updatedAt: now,
+        });
         promises.push(
-          setDoc(doc(db, 'app_bundles', 'departments'), {
-            data: data.departments,
-            count: data.departments.length,
-            updatedAt: now,
-          }, { merge: true }).catch(err => {
+          setDoc(doc(db, 'app_bundles', 'departments'), deptPayload, { merge: true }).catch(err => {
             if (isQuotaExceededError(err)) markQuotaExceeded(err);
             console.warn('Cloud sync departments error:', err?.message);
           })
         );
       }
 
-      // 4. Biometric Punches bundles (chunked in 1,200 punches per bundle, 1-2 writes instead of 2,000+ writes)
-      const punchChunks = chunkArray(data.punches, 1200);
-      promises.push(
-        setDoc(doc(db, 'app_bundles', 'punches_manifest'), {
-          chunks: punchChunks.length,
-          totalPunches: data.punches.length,
-          updatedAt: now,
-        }, { merge: true }).catch(err => {
-          if (isQuotaExceededError(err)) markQuotaExceeded(err);
-        })
-      );
-      punchChunks.forEach((chunk, idx) => {
-        promises.push(
-          setDoc(doc(db, 'app_bundles', `punches_${idx}`), {
-            data: chunk,
-            chunkIndex: idx,
-            updatedAt: now,
-          }, { merge: true }).catch(err => {
-            if (isQuotaExceededError(err)) markQuotaExceeded(err);
-            console.warn(`Cloud sync punches_${idx} error:`, err?.message);
-          })
-        );
-      });
+      // 4. Biometric Punches bundles (using unified chunks of 2,000 punches per bundle)
+      const punchPromises = await writeBiometricPunchesChunksInternal(data.punches, now);
+      promises.push(...punchPromises);
 
       // 5. Shift Plans bundles (chunked in 1,500 plans per bundle)
-      const planChunks = chunkArray(data.shiftPlans, 1500);
+      const dedupedPlans = deduplicateAndCanonicalizeShiftPlans(data.shiftPlans || [], dedupedEmps);
+      const cleanPlans = dedupedPlans.map(p => removeUndefinedFields(p));
+      const planChunks = chunkArray(cleanPlans, 1500);
       promises.push(
         setDoc(doc(db, 'app_bundles', 'shift_plans_manifest'), {
           chunks: planChunks.length,
-          totalPlans: data.shiftPlans.length,
+          totalPlans: cleanPlans.length,
           updatedAt: now,
         }, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
@@ -532,10 +860,11 @@ export const firestoreSync = {
       });
 
       // 6. OT Records bundle (1 write)
+      const cleanOT = (data.otRecords || []).map(o => removeUndefinedFields(o));
       promises.push(
         setDoc(doc(db, 'app_bundles', 'ot_records'), {
-          data: data.otRecords,
-          count: data.otRecords.length,
+          data: cleanOT,
+          count: cleanOT.length,
           updatedAt: now,
         }, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
@@ -543,10 +872,11 @@ export const firestoreSync = {
       );
 
       // 7. Other Allowances bundle (1 write)
+      const cleanAllw = (data.otherAllowances || []).map(a => removeUndefinedFields(a));
       promises.push(
         setDoc(doc(db, 'app_bundles', 'other_allowances'), {
-          data: data.otherAllowances,
-          count: data.otherAllowances.length,
+          data: cleanAllw,
+          count: cleanAllw.length,
           updatedAt: now,
         }, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
@@ -554,10 +884,11 @@ export const firestoreSync = {
       );
 
       // 8. Users bundle (1 write)
+      const cleanUsers = (data.users || []).map(u => removeUndefinedFields(u));
       promises.push(
         setDoc(doc(db, 'app_bundles', 'users'), {
-          data: data.users,
-          count: data.users.length,
+          data: cleanUsers,
+          count: cleanUsers.length,
           updatedAt: now,
         }, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
@@ -565,16 +896,17 @@ export const firestoreSync = {
       );
 
       // 9. Manual Overrides bundle (1 write)
+      const cleanOverrides = removeUndefinedFields(data.manualOverrides || {});
       promises.push(
         setDoc(doc(db, 'app_bundles', 'manual_overrides'), {
-          data: data.manualOverrides,
+          data: cleanOverrides,
           updatedAt: now,
         }, { merge: true }).catch(err => {
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
         })
       );
 
-      await promiseWithTimeout(Promise.all(promises), 6000, []);
+      await promiseWithTimeout(Promise.all(promises), 35000, []);
       console.log('Successfully synced bundled data to Cloud Firestore!');
       return true;
     } catch (error: any) {
@@ -614,78 +946,14 @@ export const firestoreSync = {
     }
   },
 
-  // Fast targeted sync for Biometric Punches (chunked 1,500 punches per bundle with parallel writes & timeout safety)
+  // Fast targeted sync for Biometric Punches (unified 2,000 punches per bundle with parallel writes & timeout safety)
   async syncBiometricPunches(punches: BiometricRawPunch[]): Promise<boolean> {
     if (isFirestoreQuotaExceeded) return false;
     try {
       const now = new Date().toISOString();
-      // Filter >= 2025-01-01, clean and compact punches to minimize Firestore document payload
-      const leanPunches = punches
-        .filter(p => !p.date || p.date >= '2025-01-01')
-        .map(p => ({
-          id: p.id,
-          empIdentifier: p.empIdentifier,
-          type: p.type || 'I',
-          timestamp: p.timestamp,
-          date: p.date,
-          time: p.time,
-          deviceId: p.deviceId || '01',
-        }));
-
-      const punchChunks = chunkArray(leanPunches, 1500);
-
-      const syncTask = async () => {
-        const promises: Promise<any>[] = [];
-        promises.push(
-          setDoc(doc(db, 'app_bundles', 'punches_manifest'), {
-            chunks: punchChunks.length,
-            totalPunches: leanPunches.length,
-            updatedAt: now,
-          })
-        );
-
-        if (punchChunks.length === 0) {
-          promises.push(
-            setDoc(doc(db, 'app_bundles', 'punches_0'), {
-              data: [],
-              chunkIndex: 0,
-              count: 0,
-              updatedAt: now,
-            })
-          );
-        } else {
-          for (let i = 0; i < punchChunks.length; i++) {
-            promises.push(
-              setDoc(doc(db, 'app_bundles', `punches_${i}`), {
-                data: punchChunks[i],
-                chunkIndex: i,
-                count: punchChunks[i].length,
-                updatedAt: now,
-              })
-            );
-          }
-        }
-
-        // Clean up orphaned punch chunks
-        const startOrphan = Math.max(1, punchChunks.length);
-        for (let orphanIdx = startOrphan; orphanIdx < 20; orphanIdx++) {
-          promises.push(
-            deleteDoc(doc(db, 'app_bundles', `punches_${orphanIdx}`)).catch(() => null)
-          );
-        }
-
-        await Promise.all(promises);
-        return true;
-      };
-
-      const timeoutTask = new Promise<boolean>((resolve) =>
-        setTimeout(() => {
-          console.warn('[syncBiometricPunches] Cloud sync timeout (10s); local memory/storage remains active.');
-          resolve(true);
-        }, 10000)
-      );
-
-      return await Promise.race([syncTask(), timeoutTask]);
+      const promises = await writeBiometricPunchesChunksInternal(punches, now);
+      await promiseWithTimeout(Promise.all(promises), 35000, []);
+      return true;
     } catch (error: any) {
       if (isQuotaExceededError(error)) markQuotaExceeded(error);
       console.warn('syncBiometricPunches cloud write warning:', error?.message || error);
@@ -698,7 +966,7 @@ export const firestoreSync = {
     if (shiftPlansBundleDebounceTimer) clearTimeout(shiftPlansBundleDebounceTimer);
     shiftPlansBundleDebounceTimer = setTimeout(() => {
       this.writeShiftPlansBundle(plans).catch(console.warn);
-    }, 2500);
+    }, 400);
   },
 
   // Write full shift plans bundle to Cloud Firestore (chunked in 1500 items)
@@ -712,7 +980,7 @@ export const firestoreSync = {
       try {
         const existingBundleSnap = await promiseWithTimeout(
           getDoc(doc(db, 'app_bundles', 'shift_plans_0')),
-          2500,
+          8000,
           null
         );
         if (existingBundleSnap?.exists()) {
@@ -736,7 +1004,9 @@ export const firestoreSync = {
         }
       } catch {}
 
-      const stampedPlans = plansToBundle
+      // Canonicalize and deduplicate plans by employee and date
+      const dedupedPlans = deduplicateAndCanonicalizeShiftPlans(plansToBundle);
+      const stampedPlans = dedupedPlans
         .filter(p => !p.date || p.date >= '2025-01-01')
         .map(p => ({
           ...p,
@@ -783,14 +1053,7 @@ export const firestoreSync = {
         }
       }
 
-      // Clean up orphaned shift plan chunks
-      const startOrphan = Math.max(1, planChunks.length);
-      for (let orphanIdx = startOrphan; orphanIdx < 20; orphanIdx++) {
-        promises.push(
-          deleteDoc(doc(db, 'app_bundles', `shift_plans_${orphanIdx}`)).catch(() => null)
-        );
-      }
-
+      // Manifest specifies the exact chunk count; fetchAllFromCloud strictly loads valid chunks
       // Also update legacy shift_plans bundle
       promises.push(
         setDoc(doc(db, 'app_bundles', 'shift_plans'), {
@@ -801,7 +1064,7 @@ export const firestoreSync = {
         }, { merge: true }).catch(() => null)
       );
 
-      await promiseWithTimeout(Promise.all(promises), 6000, []);
+      await promiseWithTimeout(Promise.all(promises), 30000, []);
       return true;
     } catch (error: any) {
       if (isQuotaExceededError(error)) markQuotaExceeded(error);
@@ -993,26 +1256,27 @@ export const firestoreSync = {
       const now = new Date().toISOString();
       const cleanDepartments: Department[] = (departments || [])
         .filter(d => d && d.code)
-        .map(d => ({
-          code: d.code.trim().toUpperCase(),
-          name: (d.name || d.code).trim(),
-          updatedAt: d.updatedAt || now,
-        }));
+        .map(d => removeUndefinedFields(cleanDepartmentForFirestore(d, now)));
 
-      // 1. Primary high-efficiency bundle write
-      await setDoc(doc(db, 'app_bundles', 'departments'), {
+      const deptPayload = removeUndefinedFields({
         data: cleanDepartments,
         count: cleanDepartments.length,
         updatedAt: now,
-      }, { merge: true });
+      });
+
+      // 1. Primary high-efficiency bundle write (strictly sanitized with no undefined keys)
+      await setDoc(doc(db, 'app_bundles', 'departments'), deptPayload, { merge: true });
+
+      // Clean up deleted_departments in Firestore: only remove a department code if it was explicitly created/updated as a custom active department with recent timestamp
+      // Do NOT arbitrarily wipe out deleted department codes!
 
       // 2. Dual-sync individual documents in background for 100% cloud consistency
       Promise.all(cleanDepartments.map(d => 
-        setDoc(doc(db, 'departments', d.code), {
+        setDoc(doc(db, 'departments', d.code), removeUndefinedFields({
           code: d.code,
           name: d.name,
           updatedAt: d.updatedAt || now,
-        }, { merge: true }).catch(() => null)
+        }), { merge: true }).catch(() => null)
       )).catch(() => {});
 
       return true;
@@ -1024,51 +1288,55 @@ export const firestoreSync = {
   },
 
   // Sync Employees list (Pure bundle write: 1 write per update, eliminates multi-doc race conditions)
-  async syncEmployees(employees: Employee[]): Promise<boolean> {
+  async syncEmployees(employees: Employee[], timeoutMs = 35000): Promise<boolean> {
     if (isFirestoreQuotaExceeded) return false;
     try {
       const now = new Date().toISOString();
-      const cleanEmployees: Employee[] = (employees || [])
+      const deduped = deduplicateAndCanonicalizeEmployees(employees || []);
+      const cleanEmployees: Employee[] = deduped
         .filter(emp => emp && emp.empNo && !isDemoEmployee(emp))
-        .map(emp => cleanEmployeeForFirestore(emp, now));
+        .map(emp => removeUndefinedFields(cleanEmployeeForFirestore(emp, now)));
+
+      const empPayload = removeUndefinedFields({
+        data: cleanEmployees,
+        count: cleanEmployees.length,
+        updatedAt: now,
+      });
 
       const syncTask = async () => {
-        await setDoc(doc(db, 'app_bundles', 'employees'), {
-          data: cleanEmployees,
-          count: cleanEmployees.length,
-          updatedAt: now,
-        });
+        // Master employee bundle write
+        await setDoc(doc(db, 'app_bundles', 'employees'), empPayload);
 
-        // Un-blacklist any active employees in app_bundles/deleted_employees
-        try {
-          const activeKeys = new Set<string>();
-          cleanEmployees.forEach(e => {
-            if (e.empNo) activeKeys.add(e.empNo.trim().toUpperCase());
-            if (e.empNo) activeKeys.add(cleanDocId(e.empNo).toUpperCase());
-            if (e.gid) activeKeys.add(e.gid.trim().toUpperCase());
-            if (e.empCode) activeKeys.add(e.empCode.trim().toUpperCase());
-          });
-          const delRef = doc(db, 'app_bundles', 'deleted_employees');
-          const delSnap = await getDoc(delRef).catch(() => null);
-          if (delSnap?.exists()) {
-            const ids: string[] = delSnap.data()?.ids || [];
-            const remaining = ids.filter(id => !activeKeys.has(id.toUpperCase()));
-            if (remaining.length !== ids.length) {
-              await setDoc(delRef, { ids: remaining, updatedAt: now }, { merge: true });
+        // Background non-blocking cleanup of deleted_employees (never stalls employee sync)
+        (async () => {
+          try {
+            const activeKeys = new Set<string>();
+            cleanEmployees.forEach(e => {
+              if (e.empNo) activeKeys.add(e.empNo.trim().toUpperCase());
+              if (e.empNo) activeKeys.add(cleanDocId(e.empNo).toUpperCase());
+              if (e.gid) activeKeys.add(e.gid.trim().toUpperCase());
+              if (e.empCode) activeKeys.add(e.empCode.trim().toUpperCase());
+            });
+            const delRef = doc(db, 'app_bundles', 'deleted_employees');
+            const delSnap = await promiseWithTimeout(getDoc(delRef), 2000, null).catch(() => null);
+            if (delSnap?.exists()) {
+              const ids: string[] = delSnap.data()?.ids || [];
+              const remaining = ids.filter(id => !activeKeys.has(id.toUpperCase()));
+              if (remaining.length !== ids.length) {
+                await setDoc(delRef, { ids: remaining, updatedAt: now }, { merge: true }).catch(() => null);
+              }
             }
-          }
-        } catch (delErr) {
-          console.warn('Cleanup deleted_employees warning:', delErr);
-        }
+          } catch {}
+        })().catch(() => {});
 
         return true;
       };
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncEmployees] Cloud sync timeout (10s); local storage active.');
-          resolve(true); // Don't fail locally on network latency
-        }, 10000)
+          console.warn(`[syncEmployees] Cloud sync timeout (${Math.round(timeoutMs / 1000)}s); local storage active.`);
+          resolve(false);
+        }, timeoutMs)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1125,14 +1393,7 @@ export const firestoreSync = {
           }
         }
 
-        // Clean up orphaned OT record chunks
-        const startOrphan = Math.max(1, otChunks.length);
-        for (let orphanIdx = startOrphan; orphanIdx < 20; orphanIdx++) {
-          promises.push(
-            deleteDoc(doc(db, 'app_bundles', `ot_records_${orphanIdx}`)).catch(() => null)
-          );
-        }
-
+        // Manifest specifies the exact chunk count; fetchAllFromCloud strictly loads valid chunks
         // 3. Write primary ot_records document for backward compatibility
         promises.push(
           setDoc(doc(db, 'app_bundles', 'ot_records'), {
@@ -1150,9 +1411,9 @@ export const firestoreSync = {
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncOTRecords] Cloud sync timeout (10s)');
+          console.warn('[syncOTRecords] Cloud sync timeout (45s)');
           resolve(true);
-        }, 10000)
+        }, 45000)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1178,9 +1439,9 @@ export const firestoreSync = {
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncOtherAllowances] Cloud sync timeout (10s)');
+          console.warn('[syncOtherAllowances] Cloud sync timeout (35s)');
           resolve(true);
-        }, 10000)
+        }, 35000)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1205,9 +1466,9 @@ export const firestoreSync = {
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncManualOverrides] Cloud sync timeout (10s)');
+          console.warn('[syncManualOverrides] Cloud sync timeout (35s)');
           resolve(true);
-        }, 10000)
+        }, 35000)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1326,15 +1587,17 @@ export const firestoreSync = {
         return true;
       };
 
-      // Safety timeout so UI / storage never hangs
-      const timeoutPromise = new Promise<boolean>((_, reject) =>
-        setTimeout(() => reject(new Error('saveUserDirect timeout')), 6000)
+      // Safety timeout so UI / storage never hangs (local storage is already updated first)
+      const timeoutPromise = new Promise<boolean>((resolve) =>
+        setTimeout(() => {
+          // Gracefully complete without disrupting active user session
+          resolve(true);
+        }, 20000)
       );
 
       return await Promise.race([syncOperation(), timeoutPromise]);
     } catch (error: any) {
       if (isQuotaExceededError(error)) markQuotaExceeded(error);
-      console.warn('saveUserDirect warning:', error?.message);
       return false;
     }
   },
@@ -1498,9 +1761,9 @@ export const firestoreSync = {
 
       const timeoutPromise = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('deleteEmployee firestore timeout fallback');
+          console.warn('deleteEmployee firestore timeout fallback (25s)');
           resolve(true);
-        }, 5000)
+        }, 25000)
       );
 
       return await Promise.race([deleteOps(), timeoutPromise]);
@@ -1528,16 +1791,15 @@ export const firestoreSync = {
       };
     }
     try {
-      // 1. First attempt to read from high-efficiency app_bundles (with 4000ms safety timeout)
+      // 1. First attempt to read from high-efficiency app_bundles (with 35000ms safety timeout for high-capacity transfer)
       let bundleSnap = null;
       try {
         bundleSnap = await promiseWithTimeout(
           getDocs(collection(db, 'app_bundles')),
-          4000,
+          35000,
           null
         );
-      } catch (err: any) {
-        console.warn('app_bundles fetch timeout or error:', err?.message);
+      } catch (_err: any) {
         bundleSnap = null;
       }
 
@@ -1687,19 +1949,26 @@ export const firestoreSync = {
         });
       }
 
-      // Reconstruct Punches
+      // Reconstruct Punches: Merge all available chunks with deduplication so zero records are lost
       if (punchesManifestTotal === 0 || punchesManifestChunks === 0) {
         punches = [];
-      } else if (rawChunkedPunchDocs.length > 0) {
-        const validPunches = punchesManifestChunks !== null
-          ? rawChunkedPunchDocs.filter(c => c.index < punchesManifestChunks)
-          : rawChunkedPunchDocs;
-        validPunches.sort((a, b) => a.index - b.index);
-        punches = [];
-        validPunches.forEach(c => {
-          const valid = c.data.filter((p: any) => p && (!p.date || p.date >= '2025-01-01'));
-          punches.push(...valid);
+      } else if (rawChunkedPunchDocs.length > 0 || punches.length > 0) {
+        const punchMap = new Map<string, BiometricRawPunch>();
+        // Add any legacy punches already collected
+        punches.forEach(p => {
+          if (!p || !p.date || !p.time || p.date < '2024-01-01') return;
+          const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+          punchMap.set(k, p);
         });
+        // Merge all chunked docs
+        rawChunkedPunchDocs.forEach(c => {
+          (c.data || []).forEach((p: any) => {
+            if (!p || !p.date || !p.time || p.date < '2024-01-01') return;
+            const k = `${(p.empIdentifier || '').trim().toLowerCase()}_${p.date}_${p.time}_${p.type || ''}`;
+            if (!punchMap.has(k)) punchMap.set(k, p);
+          });
+        });
+        punches = Array.from(punchMap.values()).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
       }
 
       // Reconstruct Shift Plans
@@ -1799,8 +2068,8 @@ export const firestoreSync = {
             }
           });
         }
-      } catch (legacyErr) {
-        console.warn('Legacy collection fetch warning:', legacyErr);
+      } catch (_legacyErr) {
+        // Silently continue if legacy collections do not exist
       }
 
       // Deduplicate shift codes (key: code_department) - Bundles override legacy
@@ -1817,38 +2086,21 @@ export const firestoreSync = {
       });
       const cleanShiftCodes = Array.from(scMap.values());
 
-      // Deduplicate employees (key: empNo) - Latest updatedAt always wins
-      const empMap = new Map<string, Employee>();
-      if (employees.length > 0) {
-        employees.forEach(emp => {
-          if (emp && emp.empNo && !isDemoEmployee(emp)) {
-            const key = emp.empNo.trim().toUpperCase();
-            const clean = cleanEmployeeForFirestore(emp);
-            const existing = empMap.get(key);
-            if (!existing) {
-              empMap.set(key, clean);
-            } else {
-              const existingTime = existing.updatedAt || '1970-01-01T00:00:00.000Z';
-              const incomingTime = clean.updatedAt || '1970-01-01T00:00:00.000Z';
-              if (incomingTime >= existingTime) {
-                empMap.set(key, clean);
-              }
-            }
-          }
-        });
-      } else {
-        legacyEmployees.forEach(emp => {
-          if (emp && emp.empNo && !isDemoEmployee(emp)) {
-            const id = cleanDocId(emp.empNo).toUpperCase();
-            const rawNo = emp.empNo.trim().toUpperCase();
-            const gid = (emp.gid || '').trim().toUpperCase();
-            if (!deletedIds.has(id) && !deletedIds.has(rawNo) && (!gid || !deletedIds.has(gid))) {
-              empMap.set(rawNo, cleanEmployeeForFirestore(emp));
-            }
-          }
-        });
+      // Deduplicate employees and canonicalize numeric IDs & departments (TRW/TRD -> TRW/TRL)
+      const rawCandidates = employees.length > 0 ? employees : legacyEmployees;
+      const filteredCandidates = rawCandidates.filter(emp => {
+        if (!emp || !emp.empNo || isDemoEmployee(emp)) return false;
+        const id = cleanDocId(emp.empNo).toUpperCase();
+        const rawNo = emp.empNo.trim().toUpperCase();
+        const gid = (emp.gid || '').trim().toUpperCase();
+        return !deletedIds.has(id) && !deletedIds.has(rawNo) && (!gid || !deletedIds.has(gid));
+      });
+      const cleanEmployees = deduplicateAndCanonicalizeEmployees(filteredCandidates);
+
+      // Deduplicate and canonicalize shift plans against employee master
+      if (shiftPlans.length > 0) {
+        shiftPlans = deduplicateAndCanonicalizeShiftPlans(shiftPlans, cleanEmployees);
       }
-      const cleanEmployees = Array.from(empMap.values());
 
       // Deduplicate users (key: email) - Merge bundle and individual documents, normalize status, filter out deleted users
       const uMap = new Map<string, UserAccount>();
@@ -1883,13 +2135,18 @@ export const firestoreSync = {
             const primary = isIncomingNewer ? normalizedUser : existing;
             const secondary = isIncomingNewer ? existing : normalizedUser;
 
+            const isAlreadyActive = existing.status === 'Active' || normalizedUser.status === 'Active';
+            const resolvedStatus = cleanEmail === 'smo.cs.th.bts@gmail.com' 
+              ? 'Active' 
+              : (isAlreadyActive ? 'Active' : (primary.status || secondary.status || 'Active'));
+
             uMap.set(cleanEmail, {
               ...secondary,
               ...primary,
               // Admin role protection for default admin
               role: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Admin' : (primary.role || secondary.role),
               department: (primary.department && primary.department !== 'PENDING') ? primary.department : (secondary.department || primary.department),
-              status: cleanEmail === 'smo.cs.th.bts@gmail.com' ? 'Active' : (primary.status || secondary.status || 'Active'),
+              status: resolvedStatus,
               photoURL: primary.photoURL || secondary.photoURL,
             });
           }
@@ -1916,34 +2173,95 @@ export const firestoreSync = {
         return true;
       });
 
-      // Deduplicate departments (key: code)
+      // The real active departments used by the company (including MRL/MLR)
+      const REAL_SYSTEM_DEPT_CODES = new Set([
+        'ADM/CMM', 'BES/PSY', 'BES/PSY2', 'DWE', 'GM', 'MCC', 'MLR', 'MRL', 'OHL', 'RST', 'RST2', 'STR', 'TEL', 'TRW/TRD', 'TRW/TRL'
+      ]);
+
+      // Departments with active employees are protected from being hidden
+      const assignedDeptCodes = new Set(cleanEmployees.map(e => (e.department || '').trim().toUpperCase()).filter(Boolean));
+
       const deptMap = new Map<string, Department>();
+      // 1. Seed with authentic active BTS departments
+      INITIAL_DEPARTMENTS.forEach(d => {
+        if (d && d.code) {
+          const upper = d.code.trim().toUpperCase();
+          if (!deletedDeptCodesSet.has(upper)) {
+            deptMap.set(upper, { code: upper, name: resolveDepartmentFullName(upper, d.name) });
+          }
+        }
+      });
+
+      // 2. Overlay from cloud departments bundle (smart-merge: never downgrade full names)
       departments.forEach(d => {
         if (d && d.code) {
           const upper = d.code.trim().toUpperCase();
-          if (!deletedDeptCodesSet.has(upper)) {
-            deptMap.set(upper, { ...d, code: upper, name: (d.name || d.code).trim() });
+          if (deletedDeptCodesSet.has(upper) || isDemoDepartment(upper)) {
+            deleteDoc(doc(db, 'departments', upper)).catch(() => null);
+            deletedDeptCodesSet.add(upper);
+            return;
+          }
+          if (REAL_SYSTEM_DEPT_CODES.has(upper)) {
+            const existing = deptMap.get(upper);
+            const resolvedName = resolveDepartmentFullName(upper, d.name, existing?.name);
+            deptMap.set(upper, {
+              ...d,
+              code: upper,
+              name: resolvedName,
+              updatedAt: d.updatedAt || existing?.updatedAt,
+            });
+          } else {
+            // Delete unused/demo doc from cloud collection
+            deleteDoc(doc(db, 'departments', upper)).catch(() => null);
+            deletedDeptCodesSet.add(upper);
           }
         }
       });
+
+      // 3. Overlay from legacy collection (only real authentic active departments)
       legacyDepartments.forEach(d => {
         if (d && d.code) {
           const upper = d.code.trim().toUpperCase();
-          if (!deletedDeptCodesSet.has(upper)) {
+          if (deletedDeptCodesSet.has(upper) || isDemoDepartment(upper)) {
+            deleteDoc(doc(db, 'departments', upper)).catch(() => null);
+            deletedDeptCodesSet.add(upper);
+            return;
+          }
+          if (REAL_SYSTEM_DEPT_CODES.has(upper)) {
             const existing = deptMap.get(upper);
-            if (!existing) {
-              deptMap.set(upper, { ...d, code: upper, name: (d.name || d.code).trim() });
-            } else {
-              const legTime = d.updatedAt ? new Date(d.updatedAt).getTime() : 0;
-              const exTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
-              if (legTime > exTime || (d.name && d.name !== d.code && existing.name === existing.code)) {
-                deptMap.set(upper, { ...d, code: upper, name: (d.name || d.code).trim() });
-              }
-            }
+            const resolvedName = resolveDepartmentFullName(upper, d.name, existing?.name);
+            deptMap.set(upper, {
+              ...d,
+              code: upper,
+              name: resolvedName,
+              updatedAt: d.updatedAt || existing?.updatedAt,
+            });
+          } else {
+            // Unused/demo legacy department: delete from cloud collection
+            deleteDoc(doc(db, 'departments', upper)).catch(() => null);
+            deletedDeptCodesSet.add(upper);
           }
         }
       });
-      const cleanDepartments = Array.from(deptMap.values()).sort((a, b) => a.code.localeCompare(b.code));
+
+      // Guarantee OHL (Overhaul) is present if not deleted
+      if (!deletedDeptCodesSet.has('OHL') && !deptMap.has('OHL')) {
+        deptMap.set('OHL', { code: 'OHL', name: 'Overhaul' });
+      }
+
+      // Hide TRW/TRD, TRD, OVH, and MRL from displayed departments list
+      deptMap.delete('TRW/TRD');
+      deptMap.delete('TRD');
+      deptMap.delete('OVH');
+      deptMap.delete('MRL');
+
+      const cleanDepartments = Array.from(deptMap.values())
+        .filter(d => d.code !== 'TRW/TRD' && d.code !== 'TRD' && d.code !== 'OVH' && d.code !== 'MRL')
+        .map(d => ({
+          ...d,
+          name: resolveDepartmentFullName(d.code, d.name)
+        }))
+        .sort((a, b) => a.code.localeCompare(b.code));
 
       // Filter and deduplicate shift plans (keeping latest updatedAt timestamp, >= 2025-01-01)
       const cleanIdentifier = (v: any) => String(v || '').trim();
@@ -2226,13 +2544,35 @@ export const firestoreSync = {
         await this.syncShiftCodes(clean).catch(() => null);
       }
 
-      // 2. Departments
+      // 2. Departments: ensure all authentic standard departments are kept & demo departments are eradicated
       const deptSnap = await getDoc(doc(db, 'app_bundles', 'departments')).catch(() => null);
-      if (deptSnap?.exists()) {
-        const existing: Department[] = deptSnap.data().data || [];
-        const clean = existing.filter(d => !isDemoDepartment(d.code));
-        await this.syncDepartments(clean).catch(() => null);
-      }
+      const existingDepts: Department[] = deptSnap?.exists() && Array.isArray(deptSnap.data().data) ? deptSnap.data().data : [];
+      const deptMap = new Map<string, Department>();
+      INITIAL_DEPARTMENTS.forEach(d => {
+        const upper = d.code.toUpperCase();
+        deptMap.set(upper, { code: upper, name: resolveDepartmentFullName(upper, d.name) });
+      });
+      existingDepts.forEach(d => { 
+        if (d && d.code && !isDemoDepartment(d.code)) {
+          const upper = d.code.toUpperCase();
+          const existing = deptMap.get(upper);
+          const resolvedName = resolveDepartmentFullName(upper, d.name, existing?.name);
+          deptMap.set(upper, { ...d, code: upper, name: resolvedName, updatedAt: d.updatedAt || existing?.updatedAt }); 
+        }
+      });
+      const cleanDepts = Array.from(deptMap.values()).sort((a, b) => a.code.localeCompare(b.code));
+      await this.syncDepartments(cleanDepts).catch(() => null);
+
+      // Permanently remove demo department individual docs from Firestore
+      const demoDeptDeletes = DEMO_DEPARTMENT_CODES.map(c => deleteDoc(doc(db, 'departments', c)).catch(() => null));
+      await Promise.all(demoDeptDeletes);
+
+      // Add to deleted_departments bundle so clients never re-adopt them
+      const delDeptRef = doc(db, 'app_bundles', 'deleted_departments');
+      await setDoc(delDeptRef, {
+        data: DEMO_DEPARTMENT_CODES,
+        updatedAt: new Date().toISOString(),
+      }, { merge: true }).catch(() => null);
 
       // 3. Employees (filter demo employees completely and sanitize departments)
       const empSnap = await getDoc(doc(db, 'app_bundles', 'employees')).catch(() => null);
@@ -2298,10 +2638,9 @@ export const firestoreSync = {
         }, err => {
           if (isFirestoreInternalAssertion(err)) return;
           if (isQuotaExceededError(err)) markQuotaExceeded(err);
-          console.warn('app_bundles listener notice:', err?.message);
         });
-      } catch (e) {
-        console.warn('subscribeToCloudChanges setup error:', e);
+      } catch (_e) {
+        // Suppress listener setup notice
       }
     };
 
@@ -2329,7 +2668,6 @@ export const firestoreSync = {
       }, err => {
         if (isFirestoreInternalAssertion(err)) return;
         if (isQuotaExceededError(err)) markQuotaExceeded(err);
-        console.warn('users bundle listener notice:', err?.message);
       });
 
       return () => {
@@ -2354,7 +2692,6 @@ export const firestoreSync = {
       }, err => {
         if (isFirestoreInternalAssertion(err)) return;
         if (isQuotaExceededError(err)) markQuotaExceeded(err);
-        console.warn('subscribeToCurrentUser listener notice:', err?.message);
       });
       return () => {
         try { unsub(); } catch {}

@@ -49,8 +49,15 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
       const localFound = localUsers.find(u => u.email.trim().toLowerCase() === cleanEmail || u.id === currentUser.id);
       if (localFound && localFound.status === 'Active') {
         hasActivatedRef.current = true;
-        storage.setCurrentUser(localFound);
-        onUserActivated(localFound);
+        const activeUser: UserAccount = {
+          ...currentUser,
+          ...localFound,
+          status: 'Active',
+          updatedAt: localFound.updatedAt || new Date().toISOString(),
+        };
+        storage.setCurrentUser(activeUser);
+        await storage.saveUser(activeUser);
+        onUserActivated(activeUser);
         return;
       }
 
@@ -67,8 +74,15 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
 
       if (latestUser && latestUser.status === 'Active') {
         hasActivatedRef.current = true;
-        storage.setCurrentUser(latestUser);
-        onUserActivated(latestUser);
+        const activeUser: UserAccount = {
+          ...currentUser,
+          ...latestUser,
+          status: 'Active',
+          updatedAt: latestUser.updatedAt || new Date().toISOString(),
+        };
+        storage.setCurrentUser(activeUser);
+        await storage.saveUser(activeUser);
+        onUserActivated(activeUser);
         return;
       }
 
@@ -92,11 +106,18 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
     const cleanEmail = currentUser.email.trim().toLowerCase();
     const docKey = cleanDocId(cleanEmail);
 
-    const handleActivated = (activated: UserAccount) => {
+    const handleActivated = async (activated: UserAccount) => {
       if (hasActivatedRef.current) return;
       hasActivatedRef.current = true;
-      storage.setCurrentUser(activated);
-      onUserActivated(activated);
+      const activeUser: UserAccount = {
+        ...currentUser,
+        ...activated,
+        status: 'Active',
+        updatedAt: activated.updatedAt || new Date().toISOString(),
+      };
+      storage.setCurrentUser(activeUser);
+      await storage.saveUser(activeUser);
+      onUserActivated(activeUser);
     };
 
     // 1. Direct listener on individual user_accounts doc

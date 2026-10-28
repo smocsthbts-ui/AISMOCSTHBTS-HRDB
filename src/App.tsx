@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useTransition } from 'react';
+import React, { useState, useEffect, useCallback, useTransition, useRef } from 'react';
 import { 
   UserAccount, 
   Employee, 
@@ -64,7 +64,7 @@ export default function App() {
   const [isPending, startTransition] = useTransition();
   const [navigatingTab, setNavigatingTab] = useState<string | null>(null);
   const [navigationProgress, setNavigationProgress] = useState<number>(0);
-  const [importInitialTab, setImportInitialTab] = useState<'shift-plan' | 'shift-code' | 'attendance' | 'ot'>('shift-plan');
+  const [importInitialTab, setImportInitialTab] = useState<'shift-code' | 'attendance' | 'ot'>('shift-code');
 
   // Smooth, non-blocking page transition handler
   const handleSelectTab = useCallback((tab: string) => {
@@ -121,6 +121,8 @@ export default function App() {
     isQuotaExceeded: firestoreSync.isQuotaExceeded(),
   });
 
+  const isManualSyncRunningRef = useRef<boolean>(false);
+
   // Load data from storage
   const reloadData = useCallback(() => {
     setDepartments(storage.getDepartments());
@@ -137,13 +139,16 @@ export default function App() {
   useEffect(() => {
     reloadData();
 
-    // Auto-purge any legacy demo datasets from LocalStorage and Cloud Firestore on startup
-    if (typeof window !== 'undefined' && !localStorage.getItem('sys_demo_dataset_purged_v3')) {
-      storage.purgeAllDemoDataset().then(() => {
-        try { localStorage.setItem('sys_demo_dataset_purged_v3', 'true'); } catch {}
-        reloadData();
-      }).catch(() => null);
-    }
+    // Hydrate biometric punches from IndexedDB to guarantee 100% complete records across all months
+    storage.hydrateFromIndexedDB().then((res) => {
+      if (res && res.count > 0) {
+        setBiometricPunches(storage.getBiometricPunches());
+      }
+    }).catch(() => {});
+
+    // Ensure departments are fully loaded and self-healed on startup
+    const loadedDepts = storage.getDepartments();
+    setDepartments(loadedDepts);
 
     // Firebase Auth State Listener
     const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -191,13 +196,16 @@ export default function App() {
             (e.firstName && cleanEmail.includes(e.firstName.toLowerCase()))
           );
 
+          const storedUser = storage.getCurrentUser();
+          const isLocallyActive = storedUser && storedUser.email?.trim().toLowerCase() === cleanEmail && storedUser.status === 'Active';
+
           targetUser = {
             id: `usr-${firebaseUser.uid}`,
             email: firebaseUser.email,
             name: firebaseUser.displayName || (matchedEmp ? `${matchedEmp.firstName} ${matchedEmp.familyName}`.trim() : firebaseUser.email.split('@')[0]),
-            role: isDefaultAdmin ? 'Admin' : 'User',
-            department: isDefaultAdmin ? 'ALL' : (matchedEmp?.department || 'PENDING'),
-            status: isDefaultAdmin ? 'Active' : 'Pending_Approval',
+            role: isDefaultAdmin ? 'Admin' : (isLocallyActive ? (storedUser.role || 'User') : 'User'),
+            department: isDefaultAdmin ? 'ALL' : (isLocallyActive && storedUser.department !== 'PENDING' ? storedUser.department : (matchedEmp?.department || 'PENDING')),
+            status: isDefaultAdmin ? 'Active' : (isLocallyActive ? 'Active' : 'Pending_Approval'),
             photoURL: firebaseUser.photoURL || undefined,
             isGoogleAccount: true,
             createdAt: new Date().toISOString(),
@@ -206,13 +214,22 @@ export default function App() {
           await storage.saveUser(targetUser);
         } else {
           // Update photoURL or last login without reverting status
+          const storedUser = storage.getCurrentUser();
+          const isLocallyActive = storedUser && storedUser.email?.trim().toLowerCase() === cleanEmail && storedUser.status === 'Active';
+          const resolvedStatus = isDefaultAdmin ? 'Active' : (targetUser.status === 'Active' || isLocallyActive ? 'Active' : targetUser.status);
+          const resolvedDept = (targetUser.department && targetUser.department !== 'PENDING')
+            ? targetUser.department
+            : (storedUser?.department && storedUser.department !== 'PENDING' ? storedUser.department : targetUser.department);
+          const resolvedRole = isDefaultAdmin ? 'Admin' : (targetUser.role || storedUser?.role || 'User');
+
           const updatedUser: UserAccount = {
             ...targetUser,
             name: firebaseUser.displayName || targetUser.name,
             photoURL: firebaseUser.photoURL || targetUser.photoURL,
             lastLogin: new Date().toISOString(),
-            role: isDefaultAdmin ? 'Admin' : targetUser.role,
-            status: isDefaultAdmin ? 'Active' : targetUser.status,
+            role: resolvedRole,
+            department: resolvedDept,
+            status: resolvedStatus,
           };
           targetUser = updatedUser;
           await storage.saveUser(updatedUser);
@@ -227,7 +244,7 @@ export default function App() {
           } else {
             storage.setCurrentUser(targetUser);
             setCurrentUser(targetUser);
-            if (targetUser.role === 'User' && targetUser.department && targetUser.department !== 'ALL' && targetUser.department !== 'PENDING') {
+            if ((targetUser.role === 'User' || targetUser.role === 'Supervisor' || targetUser.role === 'General') && targetUser.department && targetUser.department !== 'ALL' && targetUser.department !== 'PENDING') {
               setSelectedDepartment(targetUser.department);
             }
             setIsAuthModalOpen(false);
@@ -241,28 +258,31 @@ export default function App() {
       }
     });
 
-    // Connect and sync with Firebase Firestore
-    storage.initCloudSync()
-      .then((res) => {
-        const isQuota = firestoreSync.isQuotaExceeded();
+    // Connect and sync with Firebase Firestore on boot with auto-retry
+    const runCloudConnect = async (attempt = 1) => {
+      try {
+        const res = await storage.initCloudSync();
         setCloudStatus({
-          isConnected: res.connected && !isQuota,
+          isConnected: res.connected,
           isSyncing: false,
           lastSync: new Date().toLocaleTimeString('th-TH'),
-          isQuotaExceeded: isQuota,
+          isQuotaExceeded: false,
         });
         if (res.connected) {
           reloadData();
+        } else if (attempt < 3) {
+          setTimeout(() => runCloudConnect(attempt + 1), 2000);
         }
-      })
-      .catch((err) => {
-        console.error('Cloud sync initialization failed:', err);
-        setCloudStatus((prev) => ({ 
-          ...prev, 
-          isSyncing: false,
-          isQuotaExceeded: firestoreSync.isQuotaExceeded()
-        }));
-      });
+      } catch (err) {
+        console.error(`Cloud sync boot attempt ${attempt} note:`, err);
+        if (attempt < 3) {
+          setTimeout(() => runCloudConnect(attempt + 1), 2000);
+        } else {
+          setCloudStatus(prev => ({ ...prev, isSyncing: false }));
+        }
+      }
+    };
+    runCloudConnect();
 
     // Real-time listener for app_bundles and shift_plans updates
     let bundleDebounceTimer: any = null;
@@ -274,12 +294,14 @@ export default function App() {
           return;
         }
         if (source === 'app_bundles') {
+          if (isManualSyncRunningRef.current) return;
           if (bundleDebounceTimer) clearTimeout(bundleDebounceTimer);
           bundleDebounceTimer = setTimeout(async () => {
+            if (isManualSyncRunningRef.current) return;
             console.log(`[Cloud Sync] Multi-user realtime update from ${source}...`);
             await storage.initCloudSync();
             reloadData();
-          }, 800);
+          }, 2000);
         }
       } catch (e) {
         console.warn('Realtime cloud sync refresh notice:', e);
@@ -299,6 +321,18 @@ export default function App() {
         if (updated) {
           if (updated.status === 'Deactivated') {
             handleSignOut();
+            return;
+          }
+          // CRITICAL: An Active user must NEVER be demoted back to Pending_Approval by background sync!
+          if (currentStored.status === 'Active' && updated.status === 'Pending_Approval') {
+            updated.status = 'Active';
+            if (currentStored.department && currentStored.department !== 'PENDING') {
+              updated.department = currentStored.department;
+            }
+            if (currentStored.role) {
+              updated.role = currentStored.role;
+            }
+            storage.saveUser(updated);
             return;
           }
           if (updated.status !== currentStored.status || updated.department !== currentStored.department || updated.role !== currentStored.role) {
@@ -373,12 +407,14 @@ export default function App() {
 
   // Manual cloud sync trigger / retry connection (True bidirectional sync)
   const handleSyncCloud = async () => {
+    if (isManualSyncRunningRef.current) return;
+    isManualSyncRunningRef.current = true;
     setCloudStatus((prev) => ({ ...prev, isSyncing: true }));
     try {
       // Clear local quota exceeded flag to attempt fresh cloud probe
       await firestoreSync.resetQuotaState();
       
-      // Strict 7-second timeout promise to guarantee the sync process never hangs indefinitely
+      // Ample 35-second timeout promise for complete bi-directional dataset transfer
       await Promise.race([
         (async () => {
           // 1. Download & merge from Cloud
@@ -386,11 +422,15 @@ export default function App() {
           // 2. Upload merged master state to Cloud if needed
           await storage.syncAllToCloud().catch(console.warn);
         })(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Manual sync timeout')), 7000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Manual sync timeout')), 35000))
       ]);
     } catch (e: any) {
       console.warn('Manual sync notice:', e?.message || e);
     } finally {
+      // Grace period before clearing isManualSyncRunningRef so realtime echo doesn't refetch
+      setTimeout(() => {
+        isManualSyncRunningRef.current = false;
+      }, 3000);
       // ALWAYS guarantee that isSyncing turns off and latest data is reloaded into view
       reloadData();
       const isQuota = firestoreSync.isQuotaExceeded();
@@ -469,6 +509,22 @@ export default function App() {
     return () => unsubCurrentUser();
   }, [currentUser?.email, currentUser?.role, currentUser?.status, currentUser?.department]);
 
+  // Pin selected department to affiliated department for General role
+  useEffect(() => {
+    if (currentUser?.role === 'General' && currentUser.department && currentUser.department !== 'ALL' && currentUser.department !== 'PENDING') {
+      setSelectedDepartment(currentUser.department);
+    }
+  }, [currentUser?.role, currentUser?.department]);
+
+  const handleSelectDepartment = useCallback((dept: string) => {
+    if (currentUser?.role === 'General' && currentUser.department && currentUser.department !== 'ALL') {
+      // Role General is strictly locked to their own department
+      setSelectedDepartment(currentUser.department);
+      return;
+    }
+    setSelectedDepartment(dept);
+  }, [currentUser?.role, currentUser?.department]);
+
   // Centralized, 1-Click Instant Sign-Out
   const handleSignOut = async () => {
     // 1. Immediately wipe local storage and UI state for instant response
@@ -513,9 +569,18 @@ export default function App() {
       <WaitingVerificationScreen
         currentUser={currentUser}
         theme={theme}
-        onUserActivated={(activatedUser) => {
-          setCurrentUser(activatedUser);
-          storage.setCurrentUser(activatedUser);
+        onUserActivated={async (activatedUser) => {
+          const activeUser: UserAccount = {
+            ...activatedUser,
+            status: 'Active',
+            updatedAt: activatedUser.updatedAt || new Date().toISOString(),
+          };
+          setCurrentUser(activeUser);
+          storage.setCurrentUser(activeUser);
+          await storage.saveUser(activeUser);
+          if (activeUser.department && activeUser.department !== 'ALL' && activeUser.department !== 'PENDING') {
+            setSelectedDepartment(activeUser.department);
+          }
           reloadData();
         }}
         onSignOut={handleSignOut}
@@ -579,7 +644,7 @@ export default function App() {
           selectedMonthYear={selectedMonthYear}
           onSelectMonthYear={setSelectedMonthYear}
           selectedDepartment={selectedDepartment}
-          onSelectDepartment={setSelectedDepartment}
+          onSelectDepartment={handleSelectDepartment}
           onOpenAuthModal={() => setIsAuthModalOpen(true)}
           onResetData={handleResetData}
           activeTab={activeTab}
@@ -599,11 +664,12 @@ export default function App() {
                 selectedMonthYear={selectedMonthYear}
                 onSelectMonthYear={setSelectedMonthYear}
                 selectedDepartment={selectedDepartment}
-                onSelectDepartment={setSelectedDepartment}
+                onSelectDepartment={handleSelectDepartment}
                 employees={employees}
                 shiftCodes={shiftCodes}
                 shiftPlans={shiftPlans}
                 onNavigateToImport={() => handleSelectTab('upload-shift-plan')}
+                onDataImported={reloadData}
               />
             )}
 
@@ -614,7 +680,7 @@ export default function App() {
               selectedMonthYear={selectedMonthYear}
               onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
+              onSelectDepartment={handleSelectDepartment}
               employees={employees}
               shiftCodes={shiftCodes}
               shiftPlans={shiftPlans}
@@ -635,7 +701,7 @@ export default function App() {
               selectedMonthYear={selectedMonthYear}
               onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
+              onSelectDepartment={handleSelectDepartment}
               employees={employees}
               shiftCodes={shiftCodes}
               shiftPlans={shiftPlans}
@@ -656,7 +722,7 @@ export default function App() {
               selectedMonthYear={selectedMonthYear}
               onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
+              onSelectDepartment={handleSelectDepartment}
               onNavigateToUploadShiftPlan={() => handleSelectTab('upload-shift-plan')}
             />
           )}
@@ -668,7 +734,7 @@ export default function App() {
               selectedMonthYear={selectedMonthYear}
               onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
+              onSelectDepartment={handleSelectDepartment}
               employees={employees}
               shiftCodes={shiftCodes}
               onDataImported={reloadData}
@@ -685,7 +751,7 @@ export default function App() {
               selectedMonthYear={selectedMonthYear}
               onSelectMonthYear={setSelectedMonthYear}
               selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
+              onSelectDepartment={handleSelectDepartment}
               employees={employees}
               shiftCodes={shiftCodes}
               shiftPlans={shiftPlans}
@@ -702,7 +768,7 @@ export default function App() {
               theme={theme}
               employees={employees}
               selectedDepartment={selectedDepartment}
-              onSelectDepartment={setSelectedDepartment}
+              onSelectDepartment={handleSelectDepartment}
               onDataChanged={reloadData}
             />
           )}

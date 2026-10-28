@@ -1,6 +1,7 @@
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { TimeSheetSummary } from '../types';
+import { registerThaiFont } from './thaiFont';
 
 export interface PDFExportProgress {
   current: number;
@@ -29,6 +30,10 @@ export async function exportTimeSheetsToPDF(
     unit: 'mm',
     format: 'a4',
   });
+
+  // Register Sarabun Thai font for full Unicode & Thai text support (including OT Remarks)
+  registerThaiFont(doc);
+  doc.setFont('Sarabun', 'normal');
 
   const total = summaries.length;
 
@@ -74,7 +79,7 @@ export async function exportTimeSheetsToPDF(
     const darkGray = '#333333';
 
     // 1. Top Brand Header
-    doc.setFont('helvetica', 'bold');
+    doc.setFont('Sarabun', 'bold');
     doc.setFontSize(18);
     doc.setTextColor(siemensTeal);
     doc.text('SIEMENS', 14, 13);
@@ -84,13 +89,13 @@ export async function exportTimeSheetsToPDF(
     doc.text('Time Sheet', 52, 13);
 
     // Warning note in red (as in Time Sheet.png)
-    doc.setFont('helvetica', 'normal');
+    doc.setFont('Sarabun', 'normal');
     doc.setFontSize(8);
     doc.setTextColor(200, 30, 30);
     doc.text('Notice: Any manual adjustments must be crossed out (not erased) and counter-signed.', 95, 12.5);
 
     // Division in bold on the right
-    doc.setFont('helvetica', 'bold');
+    doc.setFont('Sarabun', 'bold');
     doc.setFontSize(14);
     doc.setTextColor(0, 0, 0);
     doc.text(employee.division || 'MO CS BTS', 280, 13, { align: 'right' });
@@ -102,7 +107,7 @@ export async function exportTimeSheetsToPDF(
 
     // 2. Metadata Grid (Boxed Header details)
     doc.setFontSize(8);
-    doc.setFont('helvetica', 'normal');
+    doc.setFont('Sarabun', 'normal');
     doc.setTextColor(0, 0, 0);
 
     const startY = 19;
@@ -125,7 +130,7 @@ export async function exportTimeSheetsToPDF(
     doc.text(`Cost Center :  ${employee.costCenter || 'C93056'}`, 215, startY + lineHeight);
 
     // Month indicator badge
-    doc.setFont('helvetica', 'bold');
+    doc.setFont('Sarabun', 'bold');
     doc.text(`Period : ${monthYear}`, 280, startY, { align: 'right' });
 
     // 3. Main Timesheet Table
@@ -223,6 +228,8 @@ export async function exportTimeSheetsToPDF(
       tableWidth: 269,
       theme: 'grid',
       styles: {
+        font: 'Sarabun',
+        fontStyle: 'normal',
         fontSize: 6.5,
         cellPadding: 0.8,
         lineColor: [40, 50, 60],
@@ -230,19 +237,21 @@ export async function exportTimeSheetsToPDF(
         textColor: [20, 20, 20],
       },
       headStyles: {
+        font: 'Sarabun',
         fillColor: [240, 244, 248],
         textColor: [0, 0, 0],
         fontStyle: 'bold',
         lineWidth: 0.2,
       },
       footStyles: {
+        font: 'Sarabun',
         fillColor: [230, 238, 244],
         textColor: [0, 0, 0],
         fontStyle: 'bold',
         lineWidth: 0.25,
       },
       columnStyles: {
-        0: { cellWidth: 22, fontStyle: 'bold' }, // Date
+        0: { cellWidth: 22, font: 'Sarabun', fontStyle: 'bold' }, // Date
         1: { cellWidth: 10, halign: 'center' },  // Shift Code
         2: { cellWidth: 12, halign: 'center' },  // Shift In
         3: { cellWidth: 12, halign: 'center' },  // Real Time I In
@@ -258,7 +267,7 @@ export async function exportTimeSheetsToPDF(
         13: { cellWidth: 16, halign: 'center' }, // Standby
         14: { cellWidth: 16, halign: 'center' }, // Emergency
         15: { cellWidth: 11, halign: 'center' }, // Leave
-        16: { cellWidth: 64, halign: 'left', overflow: 'ellipsize' } // Remark (single line truncated with ... to guarantee perfect A4 layout)
+        16: { cellWidth: 64, halign: 'left', overflow: 'ellipsize', font: 'Sarabun', fontStyle: 'normal' } // Remark (supports Thai and English remarks)
       },
       didParseCell: function(data) {
         // Shading for weekends/holidays
@@ -279,6 +288,7 @@ export async function exportTimeSheetsToPDF(
     const legendY = Math.min(finalY + 1.5, 180);
     const legendHeight = 7;
 
+    doc.setFont('Sarabun', 'normal');
     doc.setFontSize(6.2);
     doc.setDrawColor(60, 70, 80);
     doc.setLineWidth(0.2);
@@ -293,7 +303,7 @@ export async function exportTimeSheetsToPDF(
     // Signatures
     const sigY = Math.min(legendY + legendHeight + 8, 196);
     doc.setFontSize(8);
-    doc.setFont('helvetica', 'normal');
+    doc.setFont('Sarabun', 'normal');
 
     // Originator signature line
     doc.line(130, sigY, 190, sigY);

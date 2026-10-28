@@ -1,30 +1,215 @@
 import { Employee, ShiftCode, UserAccount, BiometricRawPunch, OTRecord, OtherAllowance } from '../types';
 
+export const OFFICIAL_DEPARTMENT_FULL_NAMES: Record<string, string> = {
+  'ADM/CMM': 'Administration / Commercial',
+  'ADM': 'Administration / Commercial',
+  'CMM': 'Administration / Commercial',
+  'BES/PSY': 'Building and Power Supply',
+  'BES': 'Building and Power Supply',
+  'PSY': 'Building and Power Supply',
+  'BES/PSY2': 'Building and Power Supply2',
+  'BES2': 'Building and Power Supply2',
+  'PSY2': 'Building and Power Supply2',
+  'DWE': 'Depot Workshop & Equipment',
+  'GM': 'General Management',
+  'MCC': 'Maintenance Control Center',
+  'MLR': 'Midlife and Refurbishment',
+  'MRL': 'Midlife and Refurbishment',
+  'OHL': 'Overhaul',
+  'OVH': 'Overhaul',
+  'OVERHAUL': 'Overhaul',
+  'OVERHEAD': 'Overhaul',
+  'RST': 'Rolling Stock',
+  'RS': 'Rolling Stock',
+  'RST2': 'Rolling Stock 2',
+  'RS2': 'Rolling Stock 2',
+  'STR': 'Stores & Warehouse',
+  'TEL': 'Telecom and SCADA',
+  'SIG': 'Telecom and SCADA',
+  'SIGNAL': 'Telecom and SCADA',
+  'SIGNALLING': 'Telecom and SCADA',
+  'TRW/TRL': 'Trackwork and Third Rail',
+  'TRW/TRD': 'Trackwork and Third Rail',
+  'TRD': 'Trackwork and Third Rail',
+  'TRL': 'Trackwork and Third Rail',
+  'TRW': 'Trackwork and Third Rail',
+};
+
 export const DEPARTMENTS = [
-  { code: 'ADM', name: 'ADM' },
-  { code: 'ADM/CMM', name: 'ADM/CMM' },
-  { code: 'BES/PSY', name: 'BES/PSY' },
-  { code: 'BES/PSY2', name: 'BES/PSY2' },
-  { code: 'CMM', name: 'CMM' },
-  { code: 'DWE', name: 'DWE' },
-  { code: 'GM', name: 'GM' },
-  { code: 'MCC', name: 'MCC' },
-  { code: 'MLR', name: 'MLR' },
-  { code: 'OHL', name: 'OHL' },
-  { code: 'OVH', name: 'OVH' },
-  { code: 'QST', name: 'QST' },
-  { code: 'RS', name: 'RS' },
-  { code: 'RST', name: 'RST' },
-  { code: 'RST2', name: 'RST2' },
-  { code: 'SAF', name: 'SAF' },
-  { code: 'SIG', name: 'SIG' },
-  { code: 'STN', name: 'STN' },
-  { code: 'STR', name: 'STR' },
-  { code: 'TEL', name: 'TEL' },
-  { code: 'TRW/TRD', name: 'TRW/TRD' },
-  { code: 'TRW/TRL', name: 'TRW/TRL' },
-  { code: 'WSH', name: 'WSH' },
+  { code: 'ADM/CMM', name: 'Administration / Commercial' },
+  { code: 'BES/PSY', name: 'Building and Power Supply' },
+  { code: 'BES/PSY2', name: 'Building and Power Supply2' },
+  { code: 'DWE', name: 'Depot Workshop & Equipment' },
+  { code: 'GM', name: 'General Management' },
+  { code: 'MCC', name: 'Maintenance Control Center' },
+  { code: 'MLR', name: 'Midlife and Refurbishment' },
+  { code: 'OHL', name: 'Overhaul' },
+  { code: 'RST', name: 'Rolling Stock' },
+  { code: 'RST2', name: 'Rolling Stock 2' },
+  { code: 'STR', name: 'Stores & Warehouse' },
+  { code: 'TEL', name: 'Telecom and SCADA' },
+  { code: 'TRW/TRL', name: 'Trackwork and Third Rail' },
 ];
+
+/**
+ * Standardize numeric Employee Numbers:
+ * Ensures pure numeric IDs (1 to 4 digits) are consistently padded with leading zeros (e.g. "139" -> "0139", "77" -> "0077")
+ * Also converts 8-digit Payroll codes (starting with 1000) to their core 4-digit EmpNo.
+ */
+export function canonicalEmpNo(empNo?: string | number | null): string {
+  if (empNo === undefined || empNo === null) return '';
+  const clean = String(empNo).trim().replace(/\.0+$/, '');
+  if (!clean) return '';
+  const digits = clean.replace(/\D/g, '');
+  if (digits && digits.length <= 4) {
+    return digits.padStart(4, '0');
+  }
+  if (digits && digits.length === 8 && digits.startsWith('1000')) {
+    return digits.slice(-4);
+  }
+  return clean.toUpperCase();
+}
+
+/**
+ * Maps any department code or legacy variation to its authoritative Canonical BTS Department Code.
+ * Critical Rule: "TRW/TRD", "TRD", "TRW" ALWAYS map to canonical "TRW/TRL" (Trackwork and Third Rail)
+ */
+export function toCanonicalDepartment(dept?: string | null): string {
+  if (!dept) return 'GM';
+  const clean = dept.trim().toUpperCase();
+  if (clean === 'ALL' || clean === 'PENDING') return clean;
+
+  const noSep = clean.replace(/[\s\-_&/]/g, '');
+  if (noSep === 'BES' || noSep === 'PSY' || noSep === 'BESPSY' || noSep === 'BES1') return 'BES/PSY';
+  if (noSep === 'BES2' || noSep === 'PSY2' || noSep === 'BESPSY2') return 'BES/PSY2';
+  if (noSep === 'ADM' || noSep === 'CMM' || noSep === 'ADMCMM') return 'ADM/CMM';
+  if (noSep === 'TRW' || noSep === 'TRD' || noSep === 'TRWTRD' || noSep === 'TRL' || noSep === 'TRWTRL') return 'TRW/TRL';
+  if (noSep === 'RS' || noSep === 'RST' || noSep === 'ROLLINGSTOCK') return 'RST';
+  if (noSep === 'RS2' || noSep === 'RST2') return 'RST2';
+  if (noSep === 'SIG' || noSep === 'SIGNAL' || noSep === 'SIGNALLING' || noSep === 'TEL' || noSep === 'TELECOM') return 'TEL';
+  if (noSep === 'OVH' || noSep === 'OHL' || noSep === 'OVERHAUL' || noSep === 'OVERHEAD') return 'OHL';
+  if (noSep === 'GM' || noSep === 'QST') return 'GM';
+  if (noSep === 'DWE') return 'DWE';
+  if (noSep === 'MCC') return 'MCC';
+  if (noSep === 'MLR' || noSep === 'MRL') return 'MLR';
+  if (noSep === 'STR') return 'STR';
+
+  return clean;
+}
+
+/**
+ * Strict Abbreviation Detector:
+ * Determines if a given string is a short acronym, abbreviation, or code variation
+ * rather than a genuine descriptive full name.
+ */
+export function isDepartmentAbbreviation(val?: string | null, code?: string): boolean {
+  if (!val) return true;
+  const v = val.trim();
+  if (!v) return true;
+
+  const vUpper = v.toUpperCase();
+  const cUpper = (code || '').trim().toUpperCase();
+
+  // If it matches the official full name (e.g. "Overhaul" for OHL), it is NEVER an abbreviation!
+  const officialForCode = OFFICIAL_DEPARTMENT_FULL_NAMES[cUpper];
+  if (officialForCode && (vUpper === officialForCode.toUpperCase() || v === officialForCode)) {
+    return false;
+  }
+
+  // 1. Exact match to code
+  if (vUpper === cUpper) return true;
+
+  // 2. Strip all whitespace, slashes, dashes, hyphens, ampersands, dots, commas
+  const cleanV = vUpper.replace(/[\s\-_&/.,\\()]/g, '');
+  const cleanC = cUpper.replace(/[\s\-_&/.,\\()]/g, '');
+
+  // If stripped version is identical to stripped code (e.g. "BES / PSY" vs "BES/PSY", "TRW - TRD" vs "TRW/TRD")
+  if (cleanV === cleanC) return true;
+
+  // 3. Known department abbreviations dictionary (short acronyms only)
+  const KNOWN_ABBREVIATIONS = new Set([
+    'ADM', 'CMM', 'ADMCMM', 'ADM/CMM',
+    'BES', 'PSY', 'BESPSY', 'BES/PSY',
+    'BES2', 'PSY2', 'BESPSY2', 'BES/PSY2',
+    'DWE', 'GM', 'MCC',
+    'MLR', 'MRL',
+    'OHL', 'OVH', 'OHLOVH', 'OVHOHL',
+    'RST', 'RS',
+    'RST2', 'RS2',
+    'STR',
+    'TEL', 'SIG',
+    'TRW', 'TRD', 'TRL', 'TRWTRD', 'TRWTRL', 'TRW/TRD', 'TRW/TRL',
+  ]);
+
+  if (KNOWN_ABBREVIATIONS.has(cleanV)) return true;
+
+  // 4. Sub-code match (e.g. "TRD" for "TRW/TRL", "PSY" for "BES/PSY")
+  if (cleanC && cleanV.length <= cleanC.length && (cleanC.includes(cleanV) || cleanV.includes(cleanC))) {
+    return true;
+  }
+
+  // 5. Short all-caps string (<= 5 characters) without spaces is almost always an acronym
+  if (v.length <= 5 && v === vUpper && !v.includes(' ')) return true;
+
+  return false;
+}
+
+/**
+ * Smart Department Full Name Resolver:
+ * Resolves conflicts between abbreviations and full names across multi-user sync.
+ * Rules:
+ * 1. NEVER downgrade a meaningful full name to a short abbreviation!
+ * 2. Official BTS standard departments ALWAYS default to their canonical full English names.
+ * 3. Prevents multi-user race conditions from overwriting full names with short codes.
+ */
+export function resolveDepartmentFullName(code: string, incomingName?: string, existingName?: string): string {
+  const upperCode = (code || '').trim().toUpperCase();
+  const inc = (incomingName || '').trim();
+  const ex = (existingName || '').trim();
+
+  // Find canonical full name for this department code from official dictionary
+  const canonicalCode = upperCode.replace(/[\s\-_&/.,\\()]/g, '');
+  let officialName = OFFICIAL_DEPARTMENT_FULL_NAMES[upperCode];
+  if (!officialName) {
+    for (const [k, v] of Object.entries(OFFICIAL_DEPARTMENT_FULL_NAMES)) {
+      if (k.replace(/[\s\-_&/.,\\()]/g, '') === canonicalCode) {
+        officialName = v;
+        break;
+      }
+    }
+  }
+
+  const isIncAbbrev = isDepartmentAbbreviation(inc, upperCode);
+  const isExAbbrev = isDepartmentAbbreviation(ex, upperCode);
+
+  // 1. If existing has a rich full name and incoming is an abbreviation, KEEP existing!
+  if (!isExAbbrev && isIncAbbrev) {
+    return ex;
+  }
+
+  // 2. If incoming has a rich full name and existing is an abbreviation, ADOPT incoming!
+  if (!isIncAbbrev && isExAbbrev) {
+    return inc;
+  }
+
+  // 3. If both have non-abbreviation names: prefer official if one matches it, otherwise keep incoming
+  if (!isIncAbbrev && !isExAbbrev) {
+    if (officialName && inc === officialName) return inc;
+    if (officialName && ex === officialName) return ex;
+    return inc || ex;
+  }
+
+  // 4. Both are abbreviations or empty: Enforce official canonical full name!
+  if (officialName) {
+    return officialName;
+  }
+
+  return inc || ex || upperCode;
+}
+
+export function getCanonicalDepartmentFullName(code: string, currentName?: string): string {
+  return resolveDepartmentFullName(code, currentName, undefined);
+}
 
 export const INITIAL_USERS: UserAccount[] = [
   {
@@ -43,29 +228,19 @@ export const INITIAL_EMPLOYEES: Employee[] = [];
 
 export const ALL_SECTIONS = [
   'ALL',
-  'ADM',
   'ADM/CMM',
   'BES/PSY',
   'BES/PSY2',
-  'CMM',
   'DWE',
   'GM',
   'MCC',
   'MLR',
   'OHL',
-  'OVH',
-  'QST',
-  'RS',
   'RST',
   'RST2',
-  'SAF',
-  'SIG',
-  'STN',
   'STR',
   'TEL',
-  'TRW/TRD',
   'TRW/TRL',
-  'WSH',
 ];
 
 export const INITIAL_SHIFT_CODES: ShiftCode[] = [
