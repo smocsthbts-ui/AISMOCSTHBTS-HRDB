@@ -1631,30 +1631,52 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
                 </div>
 
                 <div className="overflow-x-auto max-h-48 border border-slate-700 rounded bg-black/30 scrollbar-thin">
-                  {uploadConfirmation.previewRows && uploadConfirmation.previewRows.length > 0 ? (
-                    <table className="w-full text-left text-[11px] font-mono border-collapse">
-                      <thead>
-                        <tr className="bg-slate-800/80 text-slate-300 border-b border-slate-700">
-                          {Object.keys(uploadConfirmation.previewRows[0]).slice(0, 10).map((colKey, i) => (
-                            <th key={i} className="p-2 font-semibold border-r border-slate-700/50 whitespace-nowrap">
-                              {colKey}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {uploadConfirmation.previewRows.map((row, rIdx) => (
-                          <tr key={rIdx} className="border-b border-slate-800 hover:bg-white/5">
-                            {Object.keys(uploadConfirmation.previewRows[0]).slice(0, 10).map((colKey, cIdx) => (
-                              <td key={cIdx} className="p-1.5 border-r border-slate-800 whitespace-nowrap text-slate-200">
-                                {String(row[colKey] ?? '')}
-                              </td>
+                  {uploadConfirmation.previewRows && uploadConfirmation.previewRows.length > 0 ? (() => {
+                    const allKeys = Object.keys(uploadConfirmation.previewRows[0]);
+                    const idKeys = allKeys.filter(k => {
+                      const lk = k.toLowerCase().replace(/[\s._-]/g, '');
+                      return lk.includes('empno') || lk.includes('name') || lk.includes('dept') || lk.includes('gid') || lk.includes('รหัส') || lk.includes('ชื่อ');
+                    });
+                    idKeys.sort((a, b) => {
+                      const la = a.toLowerCase();
+                      const lb = b.toLowerCase();
+                      const rank = (k: string) => k.includes('emp') || k.includes('รหัส') ? 1 : k.includes('name') || k.includes('ชื่อ') ? 2 : k.includes('dept') || k.includes('แผนก') ? 3 : 4;
+                      return rank(la) - rank(lb);
+                    });
+                    const dayKeys = allKeys.filter(k => !idKeys.includes(k) && /^(?:day|d|วันที่)?\s*0?([1-9]|[12]\d|3[01])$/i.test(k.trim()));
+                    dayKeys.sort((a, b) => {
+                      const na = parseInt(a.replace(/\D/g, ''), 10) || 0;
+                      const nb = parseInt(b.replace(/\D/g, ''), 10) || 0;
+                      return na - nb;
+                    });
+                    const otherKeys = allKeys.filter(k => !idKeys.includes(k) && !dayKeys.includes(k));
+                    const displayCols = [...idKeys, ...dayKeys, ...otherKeys].slice(0, 10);
+
+                    return (
+                      <table className="w-full text-left text-[11px] font-mono border-collapse">
+                        <thead>
+                          <tr className="bg-slate-800/80 text-slate-300 border-b border-slate-700">
+                            {displayCols.map((colKey, i) => (
+                              <th key={i} className="p-2 font-semibold border-r border-slate-700/50 whitespace-nowrap">
+                                {colKey}
+                              </th>
                             ))}
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  ) : (
+                        </thead>
+                        <tbody>
+                          {uploadConfirmation.previewRows.map((row, rIdx) => (
+                            <tr key={rIdx} className="border-b border-slate-800 hover:bg-white/5">
+                              {displayCols.map((colKey, cIdx) => (
+                                <td key={cIdx} className="p-1.5 border-r border-slate-800 whitespace-nowrap text-slate-200">
+                                  {String(row[colKey] ?? '')}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    );
+                  })() : (
                     <div className="p-4 text-center text-xs text-slate-400">
                       ไม่มีข้อมูลหรือ Sheet ว่างเปล่า
                     </div>

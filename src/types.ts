@@ -82,6 +82,9 @@ export interface OTRecord {
   id: string;
   empNo: string;
   gid: string;
+  section?: string;
+  department?: string;
+  employeeName?: string;
   date: string;         // "YYYY-MM-DD" (Target date)
   originalDate: string; // If submitted from previous month
   startTime: string;    // "17:30"

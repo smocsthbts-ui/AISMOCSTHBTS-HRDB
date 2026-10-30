@@ -3031,17 +3031,34 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                 ดาวน์โหลดเทมเพลตมาตรฐาน (Excel/CSV) สำหรับจัดเตรียมข้อมูลตามอัตรา OT {selectedOTRate === 3.0 ? '3.0' : '1.5'}:
               </p>
 
-              <div className="space-y-2 pt-1">
-                <button
-                  onClick={() => {
-                    const { csvContent } = generateOTApprovedTemplate(selectedOTRate);
-                    downloadBlob(csvContent, `Template_Approved_OT_${selectedOTRate === 3.0 ? '3_0' : '1_5'}.csv`, 'text/csv;charset=utf-8;');
-                  }}
-                  className="w-full flex items-center justify-center space-x-1.5 py-2 rounded border border-slate-600 text-slate-300 hover:text-white text-xs bg-slate-800/60 hover:bg-slate-800 transition cursor-pointer"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download Template (OT {selectedOTRate === 3.0 ? '3.0' : '1.5'})</span>
-                </button>
+              <div className="space-y-1.5 pt-1">
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => {
+                      const { workbook } = generateOTApprovedTemplate(selectedOTRate, employees);
+                      downloadWorkbook(workbook, `Template_Approved_OT_${selectedOTRate === 3.0 ? '3_0' : '1_5'}.xlsx`);
+                    }}
+                    className="flex items-center justify-center space-x-1.5 py-2 px-2.5 rounded border border-teal-500/40 text-[#00e5e5] hover:text-white text-xs bg-teal-500/10 hover:bg-teal-500/25 transition cursor-pointer font-semibold shadow-xs"
+                    title="ดาวน์โหลดไฟล์ Excel (.xlsx) พร้อมคอลัมน์ Section และ Name สำหรับตรวจสอบ"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Excel (.xlsx)</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      const { csvContent } = generateOTApprovedTemplate(selectedOTRate, employees);
+                      downloadBlob(csvContent, `Template_Approved_OT_${selectedOTRate === 3.0 ? '3_0' : '1_5'}.csv`, 'text/csv;charset=utf-8;');
+                    }}
+                    className="flex items-center justify-center space-x-1.5 py-2 px-2.5 rounded border border-slate-600 text-slate-300 hover:text-white text-xs bg-slate-800/60 hover:bg-slate-800 transition cursor-pointer font-semibold"
+                    title="ดาวน์โหลดไฟล์ CSV (.csv)"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>CSV (.csv)</span>
+                  </button>
+                </div>
+                <div className="text-[10px] text-teal-400/90 font-mono text-center">
+                  คอลัมน์: EmpNo → GID → Section → Name → Date ...
+                </div>
               </div>
 
               <div className={`p-2.5 rounded border text-[10px] space-y-1 ${
@@ -3542,9 +3559,17 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
                             )}
                           </td>
                           <td className="p-2 whitespace-nowrap">
-                            <div className="font-mono text-teal-300 font-bold">{ot.empNo} / {ot.gid}</div>
-                            <div className="text-[10px] text-slate-400 truncate max-w-[140px]">
-                              {emp ? `${emp.firstName || ''} ${emp.familyName || ''}`.trim() || '-' : '-'}
+                            <div className="flex items-center gap-1.5 font-mono text-teal-300 font-bold">
+                              <span>{ot.empNo || '-'}</span>
+                              {ot.gid && <span className="text-slate-400 font-normal text-[10px]">({ot.gid})</span>}
+                              {(ot.section || emp?.department) && (
+                                <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/20 text-[#00e5e5] border border-teal-500/30 font-semibold font-sans">
+                                  {ot.section || emp?.department}
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-300 truncate max-w-[180px]">
+                              {emp ? `${emp.firstName || ''} ${emp.familyName || ''}`.trim() : (ot.employeeName || '-')}
                             </div>
                           </td>
                           <td className="p-2 text-center whitespace-nowrap">

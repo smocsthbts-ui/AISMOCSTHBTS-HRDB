@@ -41,51 +41,112 @@ export async function readFileAsText(file: File): Promise<string> {
 export function parseWorksheetToRows(worksheet: XLSX.WorkSheet): any[] {
   if (!worksheet) return [];
 
+  // Self-heal missing !ref in worksheet if cell data exists
+  if (!worksheet['!ref']) {
+    const cellKeys = Object.keys(worksheet).filter(k => !k.startsWith('!'));
+    if (cellKeys.length > 0) {
+      let minR = Infinity, maxR = -1, minC = Infinity, maxC = -1;
+      for (const ck of cellKeys) {
+        try {
+          const cell = XLSX.utils.decode_cell(ck);
+          if (cell.r < minR) minR = cell.r;
+          if (cell.r > maxR) maxR = cell.r;
+          if (cell.c < minC) minC = cell.c;
+          if (cell.c > maxC) maxC = cell.c;
+        } catch {
+          // ignore non-cell properties
+        }
+      }
+      if (maxR >= 0 && maxC >= 0) {
+        worksheet['!ref'] = XLSX.utils.encode_range({ s: { r: minR, c: minC }, e: { r: maxR, c: maxC } });
+      }
+    }
+  }
+
   // Convert raw matrix first to allow deep inspection
   const rawMatrix: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
   if (!rawMatrix || rawMatrix.length === 0) return [];
 
-  // Function to count recognized employee/timesheet/shift headers in a row
-  const countRecognizedHeaders = (cells: any[]): number => {
-    let count = 0;
+  // Function to score a row as a header row based on recognized columns
+  const scoreRowAsHeader = (cells: any[]): number => {
+    if (!Array.isArray(cells) || cells.length === 0) return 0;
+    let primaryIdentityCount = 0;
+    let secondaryFieldCount = 0;
+    let uniqueDayCount = 0;
+    const seenHeaders = new Set<string>();
+
     for (const cell of cells) {
-      const s = String(cell || '').trim().toLowerCase().replace(/[\s._\-:()]/g, '');
-      if (!s) continue;
-      // Do not count long banner sentences
-      if (s.length > 35) continue;
+      if (cell === null || cell === undefined) continue;
+      const rawStr = String(cell).trim();
+      if (!rawStr || rawStr.length > 40) continue;
+      const s = rawStr.toLowerCase().replace(/[\s._:()/\-]/g, '');
+      if (!s || seenHeaders.has(s)) continue;
+      seenHeaders.add(s);
+
+      // Primary entity identity headers (High weight = 20)
       if (
-        s === 'empno' || s === 'empno.' || s === 'employeeid' || s === 'employeeno' || s === 'empid' ||
-        s === 'รหัสพนักงาน' || s === 'รหัส' || s === 'id' || s === 'no' || s === 'no.' ||
+        s === 'empno' || s === 'employeeid' || s === 'employeeno' || s === 'empid' ||
+        s === 'รหัสพนักงาน' || s === 'รหัส' || s === 'id' || s === 'no' ||
         s === 'empcode' || s === 'employeecode' || s === 'รหัส8หลัก' || s === 'payrollcode' || s === 'payroll' ||
         s === 'gid' || s === 'globalid' || s === 'zid' ||
         s === 'firstname' || s === 'ชื่อ' || s === 'ชื่อจริง' || s === 'name' || s === 'employeename' ||
         s === 'familyname' || s === 'lastname' || s === 'นามสกุล' || s === 'surname' ||
         s === 'fullname' || s === 'ชื่อนามสกุล' || s === 'ชื่อสกุล' ||
-        s === 'department' || s === 'dept' || s === 'แผนก' || s === 'สังกัด' ||
+        s === 'department' || s === 'dept' || s === 'แผนก' || s === 'สังกัด'
+      ) {
+        primaryIdentityCount++;
+        continue;
+      }
+
+      // Secondary structural attributes (Weight = 5)
+      if (
         s === 'division' || s === 'div' || s === 'ส่วนงาน' ||
         s === 'function' || s === 'position' || s === 'ตำแหน่ง' || s === 'role' ||
         s === 'costcenter' || s === 'cc' || s === 'ศูนย์ต้นทุน' ||
         s === 'isshiftworker' || s === 'shiftworker' || s === 'เข้ากะ' ||
         s === 'isactive' || s === 'active' || s === 'status' || s === 'สถานะ' ||
         s === 'date' || s === 'วันที่' || s === 'hours' || s === 'ชั่วโมง' || s === 'rate' || s === 'ot' ||
-        s === '1' || s === '01' || s === 'd1'
+        s === 'shiftcode' || s === 'starttime' || s === 'endtime' || s === 'breakminutes' || s === 'workinghours'
       ) {
-        count++;
+        secondaryFieldCount++;
+        continue;
+      }
+
+      // Day column headers (1..31 or 01..31 or Day 1..Day 31 or วันที่ 1..31)
+      // Must be unique per row, never match repeated shift codes like D1
+      const dayMatch = s.match(/^(?:day|d|วันที่)?0?([1-9]|[12]\d|3[01])$/);
+      if (dayMatch) {
+        const dayNum = parseInt(dayMatch[1], 10);
+        if (dayNum >= 1 && dayNum <= 31) {
+          uniqueDayCount++;
+        }
       }
     }
-    return count;
+
+    // Only qualify as header if there is at least 1 primary identity header,
+    // or at least 5 consecutive unique days, or at least 2 secondary fields.
+    if (primaryIdentityCount >= 1) {
+      return primaryIdentityCount * 20 + secondaryFieldCount * 5 + uniqueDayCount * 2;
+    }
+    if (uniqueDayCount >= 5) {
+      return uniqueDayCount * 2 + secondaryFieldCount * 5;
+    }
+    if (secondaryFieldCount >= 2) {
+      return secondaryFieldCount * 5;
+    }
+    return 0;
   };
 
-  // Find best header row within first 20 rows
+  // Find best header row within first 25 rows
   let headerRowIndex = -1;
-  let maxMatchedHeaders = 0;
+  let maxScore = 0;
 
-  for (let r = 0; r < Math.min(rawMatrix.length, 20); r++) {
+  for (let r = 0; r < Math.min(rawMatrix.length, 25); r++) {
     const row = rawMatrix[r];
     if (!Array.isArray(row)) continue;
-    const matches = countRecognizedHeaders(row);
-    if (matches > maxMatchedHeaders && matches >= 2) {
-      maxMatchedHeaders = matches;
+    const score = scoreRowAsHeader(row);
+    if (score > maxScore && score >= 15) {
+      maxScore = score;
       headerRowIndex = r;
     }
   }
@@ -1428,6 +1489,14 @@ export function parseApprovedOTFile(
       'GID', 'gid', 'Global ID', 'GlobalID', 'Gid', 'Global_ID'
     ]);
 
+    const section = getVal([
+      'Section', 'section', 'Department', 'department', 'Dept', 'dept', 'แผนก', 'ส่วนงาน', 'สังกัด'
+    ]);
+
+    const employeeName = getVal([
+      'Name', 'name', 'Employee Name', 'EmployeeName', 'ชื่อ', 'ชื่อ-นามสกุล', 'ชื่อพนักงาน', 'ชื่อสกุล'
+    ]);
+
     const rawDate = getVal([
       'Date', 'OT Date', 'OTDate', 'Work Date', 'WorkDate', 'วันที่', 'วันที่ทำโอที', 'OT_Date', 'Work_Date'
     ]);
@@ -1480,6 +1549,9 @@ export function parseApprovedOTFile(
       id: `ot-${primaryId}-${targetDate}-${resolvedRate}-${idx}`,
       empNo,
       gid,
+      section: section || undefined,
+      department: section || undefined,
+      employeeName: employeeName || undefined,
       date: targetDate,
       originalDate: originalDateParsed,
       startTime,
@@ -1821,7 +1893,14 @@ export function parseSpecificSheetToRows(buffer: ArrayBuffer, sheetNameOrIndex: 
     : sheetNameOrIndex;
 
   if (!targetSheetName || !workbook.Sheets[targetSheetName]) {
-    targetSheetName = workbook.SheetNames[0];
+    // Try case-insensitive, trimmed, and unquoted lookup
+    const cleanTarget = String(targetSheetName || '').replace(/['"]/g, '').trim().toLowerCase();
+    const found = workbook.SheetNames.find(s => s.replace(/['"]/g, '').trim().toLowerCase() === cleanTarget);
+    if (found && workbook.Sheets[found]) {
+      targetSheetName = found;
+    } else {
+      targetSheetName = workbook.SheetNames[0];
+    }
   }
   const worksheet = workbook.Sheets[targetSheetName];
   if (!worksheet) return [];
@@ -1954,11 +2033,16 @@ export function generateShiftCodeTemplate(shiftCodes: ShiftCode[]): { csvContent
   return { csvContent, workbook };
 }
 
-export function generateOTApprovedTemplate(targetRate: 1.5 | 3.0 = 1.5): { csvContent: string; workbook: XLSX.WorkBook } {
-  const rows = [
+export function generateOTApprovedTemplate(
+  targetRate: 1.5 | 3.0 = 1.5,
+  sampleEmployees?: Employee[]
+): { csvContent: string; workbook: XLSX.WorkBook } {
+  const defaultSamples = [
     {
       EmpNo: '0950',
       GID: 'Z00430UZ',
+      Section: 'GM',
+      Name: 'Napassawan Ngamsomsong',
       Date: '2026-05-20',
       StartTime: targetRate === 3.0 ? '08:00' : '17:30',
       EndTime: targetRate === 3.0 ? '16:00' : '20:30',
@@ -1970,6 +2054,8 @@ export function generateOTApprovedTemplate(targetRate: 1.5 | 3.0 = 1.5): { csvCo
     {
       EmpNo: '0149',
       GID: 'Z00149TH',
+      Section: 'RS',
+      Name: 'Pettanom Patatayung',
       Date: '2026-04-29', // Retroactive sample
       StartTime: targetRate === 3.0 ? '08:00' : '18:00',
       EndTime: targetRate === 3.0 ? '12:00' : '22:00',
@@ -1977,10 +2063,62 @@ export function generateOTApprovedTemplate(targetRate: 1.5 | 3.0 = 1.5): { csvCo
       Rate: targetRate,
       Reason: targetRate === 3.0 ? 'Holiday emergency track support' : 'Emergency bogie inspection after track maintenance delay',
       ApprovedBy: 'RS Depot Chief',
+    },
+    {
+      EmpNo: '0406',
+      GID: 'Z00406TH',
+      Section: 'MCC',
+      Name: 'Nontapun Morlek',
+      Date: '2026-05-15',
+      StartTime: targetRate === 3.0 ? '08:00' : '17:30',
+      EndTime: targetRate === 3.0 ? '13:00' : '21:30',
+      Hours: 4.0,
+      Rate: targetRate,
+      Reason: targetRate === 3.0 ? 'Special MCC Monitoring Support' : 'Emergency operation control support',
+      ApprovedBy: 'MCC Lead',
     }
   ];
 
-  const worksheet = XLSX.utils.json_to_sheet(rows);
+  let rows = defaultSamples;
+  if (sampleEmployees && sampleEmployees.length > 0) {
+    const activeEmps = sampleEmployees.filter(e => e.isActive !== false);
+    const empsToUse = activeEmps.length > 0 ? activeEmps.slice(0, 5) : sampleEmployees.slice(0, 5);
+    rows = empsToUse.map((emp, i) => {
+      const fullName = `${emp.firstName || ''} ${emp.familyName || ''}`.trim() || (emp as any).name || emp.empNo;
+      return {
+        EmpNo: emp.empNo || '',
+        GID: emp.gid || '',
+        Section: emp.department || 'GM',
+        Name: fullName,
+        Date: i === 0 ? '2026-05-20' : i === 1 ? '2026-05-21' : i === 2 ? '2026-05-22' : '2026-05-23',
+        StartTime: targetRate === 3.0 ? '08:00' : '17:30',
+        EndTime: targetRate === 3.0 ? '16:00' : '20:30',
+        Hours: targetRate === 3.0 ? 8.0 : 3.0,
+        Rate: targetRate,
+        Reason: targetRate === 3.0 ? 'Holiday Duty / Special OT Work' : 'Scheduled maintenance / overtime support',
+        ApprovedBy: 'Section Manager',
+      };
+    });
+  }
+
+  const headers = ['EmpNo', 'GID', 'Section', 'Name', 'Date', 'StartTime', 'EndTime', 'Hours', 'Rate', 'Reason', 'ApprovedBy'];
+  const worksheet = XLSX.utils.json_to_sheet(rows, { header: headers });
+
+  // Column formatting for comfortable inspection by Admin
+  worksheet['!cols'] = [
+    { wch: 12 }, // EmpNo
+    { wch: 14 }, // GID
+    { wch: 14 }, // Section
+    { wch: 28 }, // Name
+    { wch: 14 }, // Date
+    { wch: 12 }, // StartTime
+    { wch: 12 }, // EndTime
+    { wch: 10 }, // Hours
+    { wch: 10 }, // Rate
+    { wch: 38 }, // Reason
+    { wch: 20 }, // ApprovedBy
+  ];
+
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, `Approved_OT_${targetRate === 3.0 ? '3_0' : '1_5'}`);
 

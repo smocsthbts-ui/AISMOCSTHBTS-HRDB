@@ -316,18 +316,37 @@ export const SettingsAndTemplatesView: React.FC<SettingsAndTemplatesViewProps> =
               </span>
             </div>
             <p className="text-slate-400">
-              ไฟล์รายงานโอทีที่ได้รับการอนุมัติแล้ว พร้อมช่องระบุ OT 1.5 หรือ 3.0 เท่า เหตุผล และผู้อนุมัติ
+              ไฟล์รายงานโอทีที่ได้รับการอนุมัติแล้ว พร้อมคอลัมน์ <span className="text-[#00e5e5] font-semibold">Section</span> และ <span className="text-[#00e5e5] font-semibold">Name</span> ต่อจาก GID เพื่อให้ Admin ตรวจสอบรายชื่อและสังกัดก่อนนำเข้า
             </p>
-            <button
-              onClick={() => {
-                const { csvContent } = generateOTApprovedTemplate();
-                downloadBlob(csvContent, 'Template_Approved_OT.csv', 'text/csv;charset=utf-8;');
-              }}
-              className="w-full py-2 rounded bg-slate-700 hover:bg-slate-600 text-white font-medium flex items-center justify-center space-x-1.5 cursor-pointer"
-            >
-              <Download className="w-3.5 h-3.5 text-teal-400" />
-              <span>ดาวน์โหลด Approved OT Template</span>
-            </button>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                onClick={() => {
+                  const currentEmployees = storage.getEmployees();
+                  const { workbook } = generateOTApprovedTemplate(1.5, currentEmployees);
+                  downloadWorkbook(workbook, 'Template_Approved_OT.xlsx');
+                }}
+                className="py-2 px-2 rounded bg-teal-600 hover:bg-teal-500 text-white font-medium flex items-center justify-center space-x-1.5 cursor-pointer shadow-xs text-xs"
+                title="ดาวน์โหลดไฟล์ Excel (.xlsx) พร้อมคอลัมน์ Section และ Name"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Excel (.xlsx)</span>
+              </button>
+              <button
+                onClick={() => {
+                  const currentEmployees = storage.getEmployees();
+                  const { csvContent } = generateOTApprovedTemplate(1.5, currentEmployees);
+                  downloadBlob(csvContent, 'Template_Approved_OT.csv', 'text/csv;charset=utf-8;');
+                }}
+                className="py-2 px-2 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 hover:text-white font-medium flex items-center justify-center space-x-1.5 cursor-pointer text-xs"
+                title="ดาวน์โหลดไฟล์ CSV (.csv)"
+              >
+                <Download className="w-3.5 h-3.5 text-teal-400" />
+                <span>CSV (.csv)</span>
+              </button>
+            </div>
+            <div className="text-[10px] text-teal-400/90 font-mono text-center">
+              ลำดับคอลัมน์: EmpNo → GID → Section → Name → Date → StartTime → EndTime → Hours → Rate → Reason → ApprovedBy
+            </div>
           </div>
 
           {/* Template 5: Employee Master Database with EmpCode (8 digits) */}

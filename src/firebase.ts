@@ -1098,6 +1098,10 @@ export const firestoreSync = {
             });
           })
         );
+        // Schedule debounced bundle sync so all connected users receive real-time shift updates via app_bundles
+        if (plans && plans.length > 0) {
+          this.scheduleDebouncedShiftPlansBundleSync(plans);
+        }
         return true;
       }
 

@@ -301,7 +301,7 @@ export default function App() {
             console.log(`[Cloud Sync] Multi-user realtime update from ${source}...`);
             await storage.initCloudSync();
             reloadData();
-          }, 2000);
+          }, 800);
         }
       } catch (e) {
         console.warn('Realtime cloud sync refresh notice:', e);
