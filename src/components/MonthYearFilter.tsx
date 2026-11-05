@@ -47,19 +47,25 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
     return `${maxFutureYear}-${String(maxFutureMonth).padStart(2, '0')}`;
   }, []);
 
-  // Generate dynamic list of months covering past years down to 2024 and max 12 months in advance (next year)
+  // Generate dynamic list of months starting from Sep-2026 (2026-09) and up to max 12 months in advance
   const monthOptions = useMemo(() => {
     const list: { value: string; label: string; year: number; month: number }[] = [];
     const maxFutureParts = maxFutureVal.split('-');
     const maxFutureYear = parseInt(maxFutureParts[0], 10);
 
     const maxYear = Math.max(maxFutureYear, currentYear);
-    const minYear = 2024;
+    const minYear = 2026;
+    const MIN_MONTH_YEAR = '2026-09'; // Sep-2026 minimum cutoff
 
     for (let y = maxYear; y >= minYear; y--) {
       for (let m = 12; m >= 1; m--) {
         const mStr = String(m).padStart(2, '0');
         const value = `${y}-${mStr}`;
+
+        // Restrict retrospective options to start from Sep-2026
+        if (value < MIN_MONTH_YEAR && value !== selectedMonthYear) {
+          continue;
+        }
 
         // Limit future options to max 12 months in advance from today
         // (unless it matches the currently selected month)
@@ -92,7 +98,7 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
     return list;
   }, [selectedMonthYear, currentYear, currentMonth, maxFutureVal]);
 
-  // Handle previous month (ดูย้อนหลัง)
+  // Handle previous month (ดูย้อนหลัง - ไม่เกิน Sep-2026)
   const handlePrevMonth = () => {
     let newYear = currentYear;
     let newMonth = currentMonth - 1;
@@ -100,7 +106,11 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
       newMonth = 12;
       newYear -= 1;
     }
-    onChange(`${newYear}-${String(newMonth).padStart(2, '0')}`);
+    const prevVal = `${newYear}-${String(newMonth).padStart(2, '0')}`;
+    if (prevVal < '2026-09') {
+      return; // Do not go before Sep-2026
+    }
+    onChange(prevVal);
   };
 
   // Handle next month (จำกัดล่วงหน้าไม่เกิน 12 เดือน)
@@ -118,8 +128,8 @@ export const MonthYearFilter: React.FC<MonthYearFilterProps> = ({
     onChange(nextVal);
   };
 
-  // Check if viewing historical period (before 2026-05)
-  const isHistorical = selectedMonthYear < '2026-05';
+  // Check if viewing historical period (before 2026-09)
+  const isHistorical = selectedMonthYear < '2026-09';
 
   return (
     <div className="flex items-center space-x-1.5 shrink-0">

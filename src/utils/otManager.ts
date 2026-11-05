@@ -529,19 +529,26 @@ export function mergeAndDeduplicateOTRecords(
         inList.forEach(inRec => {
           addedCount++;
           const { canonicalEmpNo, canonicalGid, employee } = resolveEmployeeIdentity(inRec.empNo, inRec.gid, employees);
+          const normTargetDate = normalizeOTDate(inRec.retroactiveTargetDate || inRec.date) || (inRec.retroactiveTargetDate || inRec.date);
           details.push({
             empNo: canonicalEmpNo,
             gid: canonicalGid,
             empName: getEmployeeFullName(employee),
             department: employee?.department || '',
-            date: inRec.retroactiveTargetDate || inRec.date,
+            date: normTargetDate,
             rate: inRec.rate,
             status: 'NEW_ADDED',
             newHours: inRec.hours,
             reason: inRec.reason,
             timeSlot: formatTimeSlot(`${inRec.startTime}-${inRec.endTime}`),
           });
-          mergedTargetRecords.push(inRec);
+          mergedTargetRecords.push({
+            ...inRec,
+            empNo: canonicalEmpNo || inRec.empNo,
+            gid: canonicalGid || inRec.gid,
+            date: normTargetDate,
+            retroactiveTargetDate: normTargetDate,
+          });
         });
       } else {
         // Person already has record(s) on this date with this rate!
@@ -551,7 +558,8 @@ export function mergeAndDeduplicateOTRecords(
 
         inList.forEach((inRec, idx) => {
           const { canonicalEmpNo, canonicalGid, employee } = resolveEmployeeIdentity(inRec.empNo, inRec.gid, employees);
-          const targetDate = inRec.retroactiveTargetDate || inRec.date;
+          const rawTargetDate = inRec.retroactiveTargetDate || inRec.date;
+          const targetDate = normalizeOTDate(rawTargetDate) || rawTargetDate;
 
           // Try matching by normalized time slot first, or by index
           const inSlot = formatTimeSlot(`${inRec.startTime || ''}-${inRec.endTime || ''}`);
@@ -594,7 +602,13 @@ export function mergeAndDeduplicateOTRecords(
                 timeSlot: formatTimeSlot(`${inRec.startTime}-${inRec.endTime}`),
               });
               // Keep the existing record (retaining its id, approved date, etc.)
-              mergedTargetRecords.push(match);
+              mergedTargetRecords.push({
+                ...match,
+                empNo: canonicalEmpNo || match.empNo,
+                gid: canonicalGid || match.gid,
+                date: normalizeOTDate(match.date) || match.date,
+                retroactiveTargetDate: normalizeOTDate(match.retroactiveTargetDate || match.date) || match.date,
+              });
             } else {
               // Hours or reason were updated in latest approved report
               updatedCount++;
@@ -614,11 +628,15 @@ export function mergeAndDeduplicateOTRecords(
               // Update with new approved hours and reason, preserving id
               mergedTargetRecords.push({
                 ...match,
+                empNo: canonicalEmpNo || match.empNo,
+                gid: canonicalGid || match.gid,
                 hours: inRec.hours,
                 reason: inRec.reason || match.reason,
                 startTime: inRec.startTime || match.startTime,
                 endTime: inRec.endTime || match.endTime,
                 approvedBy: inRec.approvedBy || match.approvedBy,
+                date: targetDate,
+                retroactiveTargetDate: targetDate,
               });
             }
           } else {
@@ -636,7 +654,13 @@ export function mergeAndDeduplicateOTRecords(
               reason: inRec.reason,
               timeSlot: formatTimeSlot(`${inRec.startTime}-${inRec.endTime}`),
             });
-            mergedTargetRecords.push(inRec);
+            mergedTargetRecords.push({
+              ...inRec,
+              empNo: canonicalEmpNo || inRec.empNo,
+              gid: canonicalGid || inRec.gid,
+              date: targetDate,
+              retroactiveTargetDate: targetDate,
+            });
           }
         });
 

@@ -9,7 +9,7 @@ import {
 } from '../types';
 import { parseBiometricText } from './storage';
 import { normalizeOTDate, detectFileDateFormat, forceDateToTargetMonth, normalizeOTTime } from './otManager';
-import { normalizeShiftTimeString, getShiftCategoryColor, getEmployeeLookupKeys, getRecordLookupKeys } from './timeCalc';
+import { normalizeShiftTimeString, getShiftCategoryColor, getEmployeeLookupKeys, getRecordLookupKeys, calculateTimeDiffMinutes } from './timeCalc';
 import { isDemoDepartment, sanitizeEmployeeDepartment } from '../firebase';
 import { OFFICIAL_DEPARTMENT_FULL_NAMES } from '../data/initialData';
 
@@ -1506,7 +1506,7 @@ export function parseApprovedOTFile(
       originalDateParsed = `${currentMonthYear}-01`;
     }
 
-    const hours = getNum([
+    let hours = getNum([
       'Hours', 'OT Hours', 'OTHours', 'Duration', 'OT_Hours',
       'Total Hours', 'จำนวนชั่วโมง', 'ชั่วโมง', 'OT Hour', 'OT', 'Hour'
     ]);
@@ -1526,34 +1526,48 @@ export function parseApprovedOTFile(
     const rawEndTime = getVal(['EndTime', 'End Time', 'End', 'เวลาสิ้นสุด', 'End_Time']);
     const startTime = normalizeOTTime(rawStartTime, '17:30');
     const endTime = normalizeOTTime(rawEndTime, '20:30');
+
+    // Auto-calculate hours if hours is not explicitly provided or <= 0, but rawStartTime and rawEndTime exist
+    if (hours <= 0 && rawStartTime && rawEndTime) {
+      const calcMins = calculateTimeDiffMinutes(startTime, endTime);
+      if (calcMins > 0) {
+        hours = Math.round((calcMins / 60) * 10) / 10;
+      }
+    }
+
     const reason = getVal(['Reason', 'Task', 'Remark', 'ชื่องาน', 'เหตุผล']) || 'Approved OT';
     const approvedBy = getVal(['ApprovedBy', 'Approved By', 'Approver', 'ผู้อนุมัติ', 'Status', 'Approved_By']) || 'TRUE';
 
-    if ((!empNo && !gid) || !originalDateParsed || hours <= 0) return;
+    const cleanOrigDate = normalizeOTDate(originalDateParsed, fileDateFormat, currentMonthYear) || originalDateParsed;
+    if ((!empNo && !gid) || !cleanOrigDate || hours <= 0) return;
 
     // Force date strictly to currentMonthYear if requested by Admin
     const targetDate = (forceToTargetMonth && /^\d{4}-\d{2}$/.test(currentMonthYear))
-      ? forceDateToTargetMonth(originalDateParsed, currentMonthYear)
-      : originalDateParsed;
+      ? forceDateToTargetMonth(cleanOrigDate, currentMonthYear)
+      : cleanOrigDate;
+    const normalizedTargetDate = normalizeOTDate(targetDate) || targetDate;
 
-    const isDifferentMonth = originalDateParsed && !originalDateParsed.startsWith(currentMonthYear);
+    const isDifferentMonth = cleanOrigDate && !cleanOrigDate.startsWith(currentMonthYear);
     if (isDifferentMonth) {
       retroactiveCount++;
       warnings.push(
-        `แถวที่ ${idx + 2}: พนักงาน ${empNo || gid} วันที่เดิม ${originalDateParsed} ถูกบังคับบันทึกลงสู่งวดเดือน ${currentMonthYear} (วันที่ ${targetDate}) ตามคำสั่ง Admin`
+        `แถวที่ ${idx + 2}: พนักงาน ${empNo || gid} วันที่เดิม ${cleanOrigDate} ถูกบังคับบันทึกลงสู่งวดเดือน ${currentMonthYear} (วันที่ ${normalizedTargetDate}) ตามคำสั่ง Admin`
       );
     }
 
-    const primaryId = (empNo || gid).replace(/[^a-zA-Z0-9]/g, '');
+    const cleanEmpNo = String(empNo || '').trim();
+    const cleanGid = String(gid || '').trim().toUpperCase();
+    const primaryId = (cleanEmpNo || cleanGid).replace(/[^a-zA-Z0-9]/g, '');
+
     records.push({
-      id: `ot-${primaryId}-${targetDate}-${resolvedRate}-${idx}`,
-      empNo,
-      gid,
+      id: `ot-${primaryId}-${normalizedTargetDate}-${resolvedRate}-${idx}`,
+      empNo: cleanEmpNo,
+      gid: cleanGid,
       section: section || undefined,
       department: section || undefined,
       employeeName: employeeName || undefined,
-      date: targetDate,
-      originalDate: originalDateParsed,
+      date: normalizedTargetDate,
+      originalDate: cleanOrigDate,
       startTime,
       endTime,
       hours,
@@ -1561,7 +1575,7 @@ export function parseApprovedOTFile(
       reason,
       approvedBy,
       isRetroactive: false, // In target-month binding mode, all records are directly committed to target month
-      retroactiveTargetDate: targetDate,
+      retroactiveTargetDate: normalizedTargetDate,
       status: 'Approved',
     });
   });

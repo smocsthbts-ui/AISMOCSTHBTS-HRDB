@@ -83,7 +83,11 @@ function shiftMonth(my: string, offset: number): string {
   const d = new Date(y, m - 1 + offset, 1);
   const ny = d.getFullYear();
   const nm = String(d.getMonth() + 1).padStart(2, '0');
-  return `${ny}-${nm}`;
+  const res = `${ny}-${nm}`;
+  if (offset < 0 && res < '2026-09') {
+    return '2026-09';
+  }
+  return res;
 }
 
 interface UploadConfirmationState {
@@ -256,14 +260,18 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
     const maxFutureMonth = maxFutureObj.getMonth() + 1;
     const maxFutureVal = `${maxFutureYear}-${String(maxFutureMonth).padStart(2, '0')}`;
 
-    const curYear = parseInt((targetMonthYear || '2026-05').split('-')[0], 10) || nowYear;
+    const curYear = parseInt((targetMonthYear || '2026-09').split('-')[0], 10) || nowYear;
     const maxYear = Math.max(maxFutureYear, curYear);
-    const minYear = 2024;
+    const minYear = 2026;
+    const MIN_MONTH_YEAR = '2026-09';
 
-    // Dynamically generate all months up to max 12 months in advance
+    // Dynamically generate all months up to max 12 months in advance starting from Sep-2026
     for (let y = maxYear; y >= minYear; y--) {
       for (let m = 12; m >= 1; m--) {
         const val = `${y}-${String(m).padStart(2, '0')}`;
+        if (val < MIN_MONTH_YEAR && val !== targetMonthYear && val !== selectedMonthYear) {
+          continue;
+        }
         if (val <= maxFutureVal || val === targetMonthYear || val === selectedMonthYear) {
           monthsSet.add(val);
         }
@@ -272,7 +280,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
 
     // Add any months that exist in shiftPlans or currently selected
     allCompanyMonths.forEach(m => {
-      if (m <= maxFutureVal || m === targetMonthYear || m === selectedMonthYear) {
+      if ((m >= MIN_MONTH_YEAR || m === targetMonthYear || m === selectedMonthYear) && (m <= maxFutureVal || m === targetMonthYear || m === selectedMonthYear)) {
         monthsSet.add(m);
       }
     });
@@ -670,9 +678,7 @@ export const UploadShiftPlanView: React.FC<UploadShiftPlanViewProps> = ({
       });
 
       const updatedPlans = Array.from(newPlanMap.values());
-      storage.setShiftPlans(updatedPlans);
-      // Sync with Firestore
-      await firestoreSync.syncShiftPlans(updatedPlans);
+      await storage.setShiftPlans(updatedPlans);
 
       // If new Employees were discovered, persist them cleanly into Employee Master Database (no duplicate rows)
       if (aggregatedNewEmployees.length > 0) {

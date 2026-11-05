@@ -414,15 +414,10 @@ export default function App() {
       // Clear local quota exceeded flag to attempt fresh cloud probe
       await firestoreSync.resetQuotaState();
       
-      // Ample 35-second timeout promise for complete bi-directional dataset transfer
+      // Ample 120-second timeout promise for pulling and merging latest Cloud dataset
       await Promise.race([
-        (async () => {
-          // 1. Download & merge from Cloud
-          await storage.initCloudSync();
-          // 2. Upload merged master state to Cloud if needed
-          await storage.syncAllToCloud().catch(console.warn);
-        })(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Manual sync timeout')), 35000))
+        storage.initCloudSync(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Manual sync timeout (120s)')), 120000))
       ]);
     } catch (e: any) {
       console.warn('Manual sync notice:', e?.message || e);

@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { storage } from '../utils/storage';
 import { cleanDocId, deduplicateAndCanonicalizeEmployees, deduplicateAndCanonicalizeShiftPlans } from '../firebase';
-import { generateShiftPlanTemplate, downloadBlob, downloadWorkbook, isSameDepartment, toCanonicalDepartment } from '../utils/fileParser';
+import { generateShiftPlanTemplate, downloadBlob, downloadWorkbook, isSameDepartment, toCanonicalDepartment, canonicalEmpNo } from '../utils/fileParser';
 import { getShiftCategoryColor, resolveShiftInfo, parseShiftCodeTags, getRecordLookupKeys, getEmployeeLookupKeys } from '../utils/timeCalc';
 import { MonthYearFilter } from './MonthYearFilter';
 import { ShiftPickerModal } from './ShiftPickerModal';
@@ -399,13 +399,15 @@ export const ShiftRosterView: React.FC<ShiftRosterViewProps> = ({
       const targetEmp = cleanEmp || cleanGid;
       const deterministicId = `plan_${cleanDocId(targetEmp)}_${dStr}`;
 
+      const canonDept = toCanonicalDepartment(emp.department);
+      const canonNo = canonicalEmpNo(emp.empNo);
       const newPlan: DailyShiftPlan = {
         id: deterministicId,
-        empNo: emp.empNo,
-        gid: emp.gid,
+        empNo: canonNo || (emp.empNo ? emp.empNo.trim() : ''),
+        gid: cleanGid,
         date: dStr,
         shiftCode: newCode,
-        department: emp.department,
+        department: canonDept,
         updatedBy: currentUser.email,
         updatedAt: nowIso,
       };

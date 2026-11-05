@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { UserAccount } from '../types';
 import { storage } from '../utils/storage';
 import { firestoreSync, db, cleanDocId, logOut } from '../firebase';
-import { doc, onSnapshot } from 'firebase/firestore';
+import { doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { 
   Clock, 
   RefreshCw, 
@@ -39,8 +39,10 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
   // Function to check if Admin has activated the user
   const checkApprovalStatus = async (showToast = true) => {
     if (hasActivatedRef.current) return;
-    setIsChecking(true);
-    setCheckMessage(null);
+    if (showToast) {
+      setIsChecking(true);
+      setCheckMessage(null);
+    }
     try {
       const cleanEmail = currentUser.email.trim().toLowerCase();
 
@@ -61,30 +63,29 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
         return;
       }
 
-      // 2. Fetch fresh cloud state
-      const fresh = await firestoreSync.fetchAllFromCloud();
-      let users = storage.getUsers();
-      if (fresh && fresh.users && fresh.users.length > 0) {
-        users = fresh.users;
-        storage.setUsers(fresh.users);
+      // 2. Targeted direct query of this specific user account document from Firestore (non-destructive, zero event storm)
+      const docKey = cleanDocId(cleanEmail);
+      if (db) {
+        const snap = await getDoc(doc(db, 'user_accounts', docKey));
+        if (snap.exists()) {
+          const cloudUser = snap.data() as UserAccount;
+          if (cloudUser && cloudUser.status === 'Active') {
+            hasActivatedRef.current = true;
+            const activeUser: UserAccount = {
+              ...currentUser,
+              ...cloudUser,
+              status: 'Active',
+              updatedAt: cloudUser.updatedAt || new Date().toISOString(),
+            };
+            storage.setCurrentUser(activeUser);
+            await storage.saveUser(activeUser);
+            onUserActivated(activeUser);
+            return;
+          }
+        }
       }
 
-      const latestUser = users.find(u => u.email.trim().toLowerCase() === cleanEmail || u.id === currentUser.id);
       setLastCheckTime(new Date().toLocaleTimeString('th-TH'));
-
-      if (latestUser && latestUser.status === 'Active') {
-        hasActivatedRef.current = true;
-        const activeUser: UserAccount = {
-          ...currentUser,
-          ...latestUser,
-          status: 'Active',
-          updatedAt: latestUser.updatedAt || new Date().toISOString(),
-        };
-        storage.setCurrentUser(activeUser);
-        await storage.saveUser(activeUser);
-        onUserActivated(activeUser);
-        return;
-      }
 
       if (showToast) {
         setCheckMessage('สถานะ: ยังอยู่ระหว่างรอ Admin อนุมัติและกำหนดแผนก กรุณารอสักครู่หรือแจ้ง Admin');
@@ -95,11 +96,13 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
         setCheckMessage('ไม่สามารถตรวจสอบสถานะได้ในขณะนี้ โปรดลองอีกครั้ง');
       }
     } finally {
-      setIsChecking(false);
+      if (showToast) {
+        setIsChecking(false);
+      }
     }
   };
 
-  // Direct Real-time WebSocket Listeners for Instant Activation
+  // Direct Real-time WebSocket Listeners for Instant Activation (Zero UI Flicker)
   useEffect(() => {
     if (!currentUser || !currentUser.email) return;
 
@@ -120,8 +123,8 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
       onUserActivated(activeUser);
     };
 
-    // 1. Direct listener on individual user_accounts doc
-    const unsubUserDoc = !firestoreSync.isQuotaExceeded() ? onSnapshot(doc(db, 'user_accounts', docKey), (snap) => {
+    // 1. Direct real-time listener on individual user_accounts doc
+    const unsubUserDoc = (!firestoreSync.isQuotaExceeded() && db) ? onSnapshot(doc(db, 'user_accounts', docKey), (snap) => {
       if (snap.exists()) {
         const data = snap.data() as UserAccount;
         if (data && data.status === 'Active') {
@@ -130,8 +133,8 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
       }
     }, err => console.warn('user_accounts snapshot error:', err)) : () => {};
 
-    // 2. Direct listener on app_bundles/users doc
-    const unsubBundle = !firestoreSync.isQuotaExceeded() ? onSnapshot(doc(db, 'app_bundles', 'users'), (snap) => {
+    // 2. Direct real-time listener on app_bundles/users doc
+    const unsubBundle = (!firestoreSync.isQuotaExceeded() && db) ? onSnapshot(doc(db, 'app_bundles', 'users'), (snap) => {
       if (snap.exists()) {
         const list: UserAccount[] = snap.data()?.data || [];
         const found = list.find(u => u && (u.email?.trim().toLowerCase() === cleanEmail || u.id === currentUser.id));
@@ -141,32 +144,19 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
       }
     }, err => console.warn('app_bundles/users snapshot error:', err)) : () => {};
 
-    // 3. Fast fallback interval (every 3s)
+    // 3. Gentle passive fallback interval (30s) without showing spinner or thrashing UI
     const interval = setInterval(() => {
       if (!hasActivatedRef.current) {
         checkApprovalStatus(false);
       }
-    }, 3000);
-
-    const handleLocalSync = () => {
-      if (!hasActivatedRef.current) {
-        checkApprovalStatus(false);
-      }
-    };
-
-    window.addEventListener('firestore-sync-completed', handleLocalSync);
-    window.addEventListener('storage-changed', handleLocalSync);
-    window.addEventListener('siemens-data-updated', handleLocalSync);
+    }, 30000);
 
     return () => {
       unsubUserDoc();
       unsubBundle();
       clearInterval(interval);
-      window.removeEventListener('firestore-sync-completed', handleLocalSync);
-      window.removeEventListener('storage-changed', handleLocalSync);
-      window.removeEventListener('siemens-data-updated', handleLocalSync);
     };
-  }, [currentUser]);
+  }, [currentUser?.email, currentUser?.id]);
 
   const isSiemensEmail = currentUser.email.toLowerCase().endsWith('@siemens.com');
 
@@ -191,7 +181,7 @@ export const WaitingVerificationScreen: React.FC<WaitingVerificationScreenProps>
           isDark ? 'bg-[#152332] border-[#223344]' : 'bg-slate-50 border-slate-200'
         }`}>
           <div className="inline-flex items-center justify-center p-3 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 mb-3 shadow-inner">
-            <Clock className="w-8 h-8 animate-pulse" />
+            <Clock className="w-8 h-8 text-amber-400" />
           </div>
           <h1 className="text-xl font-bold tracking-tight flex items-center justify-center gap-2">
             <span>รอการตรวจสอบและอนุมัติสิทธิ์จาก Admin</span>

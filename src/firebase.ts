@@ -48,6 +48,7 @@ import {
   TimeSheetRow,
   Department
 } from './types';
+import { normalizeOTDate, sanitizeOTRecords } from './utils/otManager';
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -758,11 +759,31 @@ async function writeBiometricPunchesChunksInternal(punches: BiometricRawPunch[],
 }
 
 let shiftPlansBundleDebounceTimer: any = null;
+let lastLocalBundleWriteTimestamp = 0;
+let shiftPlansProvider: (() => DailyShiftPlan[]) | null = null;
+let pendingShiftPlansToBundle: DailyShiftPlan[] | null = null;
 
 // Firestore Database Sync Service using High-Efficiency Bundling
 export const firestoreSync = {
   isQuotaExceeded: getIsQuotaExceeded,
   resetQuotaState,
+
+  // Register local storage provider so debounced bundle syncs always pull freshest state
+  setShiftPlansProvider(fn: () => DailyShiftPlan[]) {
+    shiftPlansProvider = fn;
+  },
+
+  // Immediately flush any pending debounced shift plan bundle write (e.g. on exit or page unload)
+  flushPendingShiftPlansBundle() {
+    if (shiftPlansBundleDebounceTimer) {
+      clearTimeout(shiftPlansBundleDebounceTimer);
+      shiftPlansBundleDebounceTimer = null;
+    }
+    const freshPlans = shiftPlansProvider ? shiftPlansProvider() : pendingShiftPlansToBundle;
+    if (freshPlans && freshPlans.length > 0) {
+      this.writeShiftPlansBundle(freshPlans).catch(console.warn);
+    }
+  },
 
   // Sync all entities to Cloud Firestore using bundled documents (drastically reduces writes from 10,000+ to ~8 writes)
   async syncAllToCloud(data: {
@@ -906,7 +927,7 @@ export const firestoreSync = {
         })
       );
 
-      await promiseWithTimeout(Promise.all(promises), 35000, []);
+      await promiseWithTimeout(Promise.all(promises), 120000, []);
       console.log('Successfully synced bundled data to Cloud Firestore!');
       return true;
     } catch (error: any) {
@@ -952,7 +973,7 @@ export const firestoreSync = {
     try {
       const now = new Date().toISOString();
       const promises = await writeBiometricPunchesChunksInternal(punches, now);
-      await promiseWithTimeout(Promise.all(promises), 35000, []);
+      await promiseWithTimeout(Promise.all(promises), 120000, []);
       return true;
     } catch (error: any) {
       if (isQuotaExceededError(error)) markQuotaExceeded(error);
@@ -962,45 +983,86 @@ export const firestoreSync = {
   },
 
   // Debounced bundle synchronization timer for Shift Plans
-  scheduleDebouncedShiftPlansBundleSync(plans: DailyShiftPlan[]) {
+  scheduleDebouncedShiftPlansBundleSync(plans?: DailyShiftPlan[]) {
+    if (plans && plans.length > 0) {
+      pendingShiftPlansToBundle = plans;
+    }
     if (shiftPlansBundleDebounceTimer) clearTimeout(shiftPlansBundleDebounceTimer);
     shiftPlansBundleDebounceTimer = setTimeout(() => {
-      this.writeShiftPlansBundle(plans).catch(console.warn);
-    }, 400);
+      shiftPlansBundleDebounceTimer = null;
+      const freshPlans = shiftPlansProvider ? shiftPlansProvider() : pendingShiftPlansToBundle;
+      if (freshPlans && freshPlans.length > 0) {
+        this.writeShiftPlansBundle(freshPlans).catch(console.warn);
+      }
+    }, 1500);
   },
 
-  // Write full shift plans bundle to Cloud Firestore (chunked in 1500 items)
+  // Write full shift plans bundle to Cloud Firestore (chunked in 1500 items, with 120s timeout)
   async writeShiftPlansBundle(plans: DailyShiftPlan[]): Promise<boolean> {
     if (isFirestoreQuotaExceeded) return false;
+    lastLocalBundleWriteTimestamp = Date.now();
     try {
       const now = new Date().toISOString();
 
-      // Preserve existing plans in cloud bundle so departmental uploads NEVER wipe out other departments
+      // Preserve existing plans across all chunks in cloud bundle so departmental uploads NEVER wipe out other departments
       let plansToBundle = plans || [];
       try {
-        const existingBundleSnap = await promiseWithTimeout(
-          getDoc(doc(db, 'app_bundles', 'shift_plans_0')),
-          8000,
+        const manifestSnap = await promiseWithTimeout(
+          getDoc(doc(db, 'app_bundles', 'shift_plans_manifest')),
+          25000,
           null
         );
-        if (existingBundleSnap?.exists()) {
-          const existingList: DailyShiftPlan[] = existingBundleSnap.data()?.data || [];
-          if (existingList.length > 0) {
-            const planMap = new Map<string, DailyShiftPlan>();
-            existingList.forEach(p => {
+        const chunkCount = manifestSnap?.exists() && typeof manifestSnap.data()?.chunks === 'number'
+          ? Math.max(1, manifestSnap.data().chunks)
+          : 1;
+
+        const chunkSnaps = await Promise.all(
+          Array.from({ length: chunkCount }, (_, i) =>
+            promiseWithTimeout(getDoc(doc(db, 'app_bundles', `shift_plans_${i}`)), 25000, null).catch(() => null)
+          )
+        );
+
+        const planMap = new Map<string, DailyShiftPlan>();
+        chunkSnaps.forEach(snap => {
+          if (snap?.exists()) {
+            const list: DailyShiftPlan[] = snap.data()?.data || [];
+            list.forEach(p => {
               if (p && p.date && (p.empNo || p.gid)) {
-                const k = `${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`;
-                planMap.set(k, p);
+                const canonNo = canonicalEmpNo(p.empNo);
+                const gid = (p.gid || '').trim().toUpperCase();
+                const key = `${canonNo || gid}_${p.date}`;
+                planMap.set(key, p);
               }
             });
-            plansToBundle.forEach(p => {
-              if (p && p.date && (p.empNo || p.gid)) {
-                const k = `${(p.empNo || p.gid).trim().toUpperCase()}_${p.date}`;
-                planMap.set(k, p);
-              }
-            });
-            plansToBundle = Array.from(planMap.values());
           }
+        });
+
+        // Guard: If incoming is empty and cloud already has plans, do NOT wipe out cloud!
+        if (plansToBundle.length === 0 && planMap.size > 0) {
+          console.info('writeShiftPlansBundle: Retaining existing cloud shift plans.');
+          return true;
+        }
+
+        plansToBundle.forEach(p => {
+          if (p && p.date && (p.empNo || p.gid)) {
+            const canonNo = canonicalEmpNo(p.empNo);
+            const gid = (p.gid || '').trim().toUpperCase();
+            const key = `${canonNo || gid}_${p.date}`;
+            const existing = planMap.get(key);
+            if (!existing) {
+              planMap.set(key, p);
+            } else {
+              const existingTime = existing.updatedAt || '';
+              const incomingTime = p.updatedAt || '';
+              if (!existingTime || incomingTime >= existingTime) {
+                planMap.set(key, { ...existing, ...p });
+              }
+            }
+          }
+        });
+
+        if (planMap.size > 0) {
+          plansToBundle = Array.from(planMap.values());
         }
       } catch {}
 
@@ -1010,7 +1072,7 @@ export const firestoreSync = {
         .filter(p => !p.date || p.date >= '2025-01-01')
         .map(p => ({
           ...p,
-          updatedAt: p.updatedAt || now,
+          updatedAt: p.updatedAt || '2026-09-01T00:00:00.000Z',
         }));
       const planChunks = chunkArray(stampedPlans, 1500);
 
@@ -1064,7 +1126,8 @@ export const firestoreSync = {
         }, { merge: true }).catch(() => null)
       );
 
-      await promiseWithTimeout(Promise.all(promises), 30000, []);
+      await promiseWithTimeout(Promise.all(promises), 120000, []);
+      lastLocalBundleWriteTimestamp = Date.now();
       return true;
     } catch (error: any) {
       if (isQuotaExceededError(error)) markQuotaExceeded(error);
@@ -1292,7 +1355,7 @@ export const firestoreSync = {
   },
 
   // Sync Employees list (Pure bundle write: 1 write per update, eliminates multi-doc race conditions)
-  async syncEmployees(employees: Employee[], timeoutMs = 35000): Promise<boolean> {
+  async syncEmployees(employees: Employee[], timeoutMs = 90000): Promise<boolean> {
     if (isFirestoreQuotaExceeded) return false;
     try {
       const now = new Date().toISOString();
@@ -1352,15 +1415,75 @@ export const firestoreSync = {
   },
 
   // Sync OT Records with safe chunking and multi-user resilience
-  async syncOTRecords(records: OTRecord[]): Promise<boolean> {
+  async syncOTRecords(records: OTRecord[], timeoutMs = 90000): Promise<boolean> {
     if (isFirestoreQuotaExceeded) return false;
     try {
       const now = new Date().toISOString();
-      const cleanRecords = (records || []).filter(o => {
+      const sanitized = sanitizeOTRecords(records || []);
+      const cleanRecords = sanitized.filter(o => {
         const targetD = o.retroactiveTargetDate || o.date;
-        return !targetD || targetD >= '2025-01-01';
+        const normD = normalizeOTDate(targetD) || targetD;
+        return !normD || normD >= '2025-01-01';
       });
-      const otChunks = chunkArray(cleanRecords, 1200);
+
+      // Preserve existing cloud OT records so single month/department uploads NEVER wipe out others
+      let recordsToSync = cleanRecords;
+      try {
+        // Fast parallel lookup for existing OT records in cloud bundles (5-second timeout)
+        const [manifestSnap, directBundleSnap, chunk0Snap] = await Promise.all([
+          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records_manifest')), 5000, null).catch(() => null),
+          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records')), 5000, null).catch(() => null),
+          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records_0')), 5000, null).catch(() => null),
+        ]);
+
+        const otMap = new Map<string, OTRecord>();
+
+        // Load records from chunk0 if present
+        if (chunk0Snap?.exists()) {
+          const list: OTRecord[] = chunk0Snap.data()?.data || [];
+          list.forEach(o => {
+            if (o && (o.empNo || o.gid)) {
+              const targetD = o.retroactiveTargetDate || o.date;
+              const normD = normalizeOTDate(targetD) || targetD;
+              const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+              otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+            }
+          });
+        }
+
+        // Load records from direct fallback bundle if present
+        if (directBundleSnap?.exists()) {
+          const list: OTRecord[] = directBundleSnap.data()?.data || [];
+          list.forEach(o => {
+            if (o && (o.empNo || o.gid)) {
+              const targetD = o.retroactiveTargetDate || o.date;
+              const normD = normalizeOTDate(targetD) || targetD;
+              const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+              if (!otMap.has(k)) {
+                otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+              }
+            }
+          });
+        }
+
+        // Overlay incoming uploaded records (authoritative precedence)
+        recordsToSync.forEach(o => {
+          if (o && (o.empNo || o.gid)) {
+            const targetD = o.retroactiveTargetDate || o.date;
+            const normD = normalizeOTDate(targetD) || targetD;
+            const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+            otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+          }
+        });
+
+        if (otMap.size > 0) {
+          recordsToSync = Array.from(otMap.values());
+        }
+      } catch (mergeErr) {
+        console.warn('syncOTRecords cloud merge notice:', mergeErr);
+      }
+
+      const otChunks = chunkArray(recordsToSync, 1200);
 
       const syncTask = async () => {
         const promises: Promise<any>[] = [];
@@ -1369,9 +1492,9 @@ export const firestoreSync = {
         promises.push(
           setDoc(doc(db, 'app_bundles', 'ot_records_manifest'), {
             chunks: otChunks.length,
-            totalRecords: cleanRecords.length,
+            totalRecords: recordsToSync.length,
             updatedAt: now,
-          })
+          }, { merge: true })
         );
 
         // 2. Write chunked documents
@@ -1382,7 +1505,7 @@ export const firestoreSync = {
               chunkIndex: 0,
               count: 0,
               updatedAt: now,
-            })
+            }, { merge: true })
           );
         } else {
           for (let i = 0; i < otChunks.length; i++) {
@@ -1392,32 +1515,32 @@ export const firestoreSync = {
                 chunkIndex: i,
                 count: otChunks[i].length,
                 updatedAt: now,
-              })
+              }, { merge: true })
             );
           }
         }
 
-        // Manifest specifies the exact chunk count; fetchAllFromCloud strictly loads valid chunks
-        // 3. Write primary ot_records document for backward compatibility
+        // 3. Write primary ot_records document for backward compatibility and fast direct reads
         promises.push(
           setDoc(doc(db, 'app_bundles', 'ot_records'), {
             data: otChunks.length <= 1 ? (otChunks[0] || []) : otChunks[0],
-            count: cleanRecords.length,
-            totalRecords: cleanRecords.length,
+            count: recordsToSync.length,
+            totalRecords: recordsToSync.length,
             isChunked: otChunks.length > 1,
             updatedAt: now,
-          })
+          }, { merge: true })
         );
 
         await Promise.all(promises);
+        lastLocalBundleWriteTimestamp = Date.now();
         return true;
       };
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncOTRecords] Cloud sync timeout (45s)');
+          console.warn(`[syncOTRecords] Cloud sync timeout (${Math.round(timeoutMs / 1000)}s); local storage active.`);
           resolve(true);
-        }, 45000)
+        }, timeoutMs)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1443,9 +1566,9 @@ export const firestoreSync = {
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncOtherAllowances] Cloud sync timeout (35s)');
+          console.warn('[syncOtherAllowances] Cloud sync timeout (90s); local storage active.');
           resolve(true);
-        }, 35000)
+        }, 90000)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1470,9 +1593,9 @@ export const firestoreSync = {
 
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
-          console.warn('[syncManualOverrides] Cloud sync timeout (35s)');
+          console.warn('[syncManualOverrides] Cloud sync timeout (90s); local storage active.');
           resolve(true);
-        }, 35000)
+        }, 90000)
       );
 
       return await Promise.race([syncTask(), timeoutTask]);
@@ -1795,12 +1918,12 @@ export const firestoreSync = {
       };
     }
     try {
-      // 1. First attempt to read from high-efficiency app_bundles (with 35000ms safety timeout for high-capacity transfer)
+      // 1. First attempt to read from high-efficiency app_bundles (with 90000ms safety timeout for high-capacity transfer)
       let bundleSnap = null;
       try {
         bundleSnap = await promiseWithTimeout(
           getDocs(collection(db, 'app_bundles')),
-          35000,
+          90000,
           null
         );
       } catch (_err: any) {
@@ -1995,24 +2118,59 @@ export const firestoreSync = {
         }
       }
 
-      // Reconstruct OT Records
-      if (otManifestTotal === 0 || otManifestChunks === 0) {
+      // Also retrieve recent individual direct shift plan writes from 'shift_plans' collection
+      // to ensure quick painter edits are never lost even if app_bundles write was pending
+      try {
+        const directPlansSnap = await promiseWithTimeout(
+          getDocs(collection(db, 'shift_plans')),
+          6000,
+          null
+        );
+        if (directPlansSnap && !directPlansSnap.empty) {
+          const directPlans: DailyShiftPlan[] = [];
+          directPlansSnap.forEach(d => {
+            const data = d.data() as DailyShiftPlan;
+            if (data && data.date && (data.empNo || data.gid)) {
+              directPlans.push(data);
+            }
+          });
+          if (directPlans.length > 0) {
+            shiftPlans = deduplicateAndCanonicalizeShiftPlans([...shiftPlans, ...directPlans]);
+          }
+        }
+      } catch {}
+
+      // Reconstruct OT Records: Pool all available chunks and legacy bundle with date normalization
+      const rawOTList: OTRecord[] = [];
+      rawChunkedOTDocs.forEach(c => {
+        if (Array.isArray(c.data)) rawOTList.push(...c.data);
+      });
+      if (legacyOTRecords.length > 0) {
+        rawOTList.push(...legacyOTRecords);
+      }
+
+      if (rawOTList.length > 0) {
+        const poolMap = new Map<string, OTRecord>();
+        rawOTList.forEach(o => {
+          if (!o || (!o.empNo && !o.gid)) return;
+          const targetD = o.retroactiveTargetDate || o.date;
+          const normD = normalizeOTDate(targetD) || targetD;
+          if (normD && normD < '2025-01-01') return;
+          const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+          if (!poolMap.has(k)) {
+            poolMap.set(k, {
+              ...o,
+              date: normD || o.date,
+              originalDate: normalizeOTDate(o.originalDate) || o.originalDate || normD,
+              retroactiveTargetDate: normD || o.retroactiveTargetDate,
+            });
+          }
+        });
+        otRecords = Array.from(poolMap.values());
+      } else if (otManifestTotal === 0 || otManifestChunks === 0) {
         otRecords = [];
       } else {
-        const validOTDocs = otManifestChunks !== null
-          ? rawChunkedOTDocs.filter(c => c.index < otManifestChunks)
-          : rawChunkedOTDocs;
-        validOTDocs.sort((a, b) => a.index - b.index);
-        const combinedOT: OTRecord[] = [];
-        validOTDocs.forEach(c => {
-          const valid = c.data.filter((o: any) => o && (!o.date || o.date >= '2025-01-01'));
-          combinedOT.push(...valid);
-        });
-        if (combinedOT.length > 0) {
-          otRecords = combinedOT;
-        } else {
-          otRecords = legacyOTRecords;
-        }
+        otRecords = legacyOTRecords;
       }
 
       // 2. If bundles did not have specific datasets, fallback to legacy individual collections
@@ -2348,12 +2506,18 @@ export const firestoreSync = {
       // Filter and deduplicate OT records (>= 2025-01-01, key: id or emp_targetDate_rate_startTime)
       const otMap = new Map<string, OTRecord>();
       otRecords.forEach(o => {
-        if (!o) return;
+        if (!o || (!o.empNo && !o.gid)) return;
         const targetD = o.retroactiveTargetDate || o.date;
-        if (targetD && targetD < '2025-01-01') return;
-        const key = o.id || `${(o.empNo || o.gid || '').trim().toUpperCase()}_${targetD}_${o.rate}_${o.startTime || ''}`;
+        const normD = normalizeOTDate(targetD) || targetD;
+        if (normD && normD < '2025-01-01') return;
+        const key = o.id || `${(o.empNo || o.gid || '').trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
         if (!otMap.has(key)) {
-          otMap.set(key, o);
+          otMap.set(key, {
+            ...o,
+            date: normD || o.date,
+            originalDate: normalizeOTDate(o.originalDate) || o.originalDate || normD,
+            retroactiveTargetDate: normD || o.retroactiveTargetDate,
+          });
         }
       });
       const cleanOT = Array.from(otMap.values());
@@ -2638,6 +2802,11 @@ export const firestoreSync = {
             isFirstBundles = false;
             return;
           }
+          if (snap.metadata.hasPendingWrites) return;
+          // Ignore echo if this client itself wrote to bundles within the last 15 seconds
+          if (Date.now() - lastLocalBundleWriteTimestamp < 15000) {
+            return;
+          }
           onUpdate('app_bundles');
         }, err => {
           if (isFirestoreInternalAssertion(err)) return;
@@ -2709,4 +2878,16 @@ export const firestoreSync = {
 export const subscribeToCloudChanges = firestoreSync.subscribeToCloudChanges;
 export const subscribeToUserChanges = firestoreSync.subscribeToUserChanges;
 export const subscribeToCurrentUser = firestoreSync.subscribeToCurrentUser;
+
+// Automatically flush any pending shift plan debounces when the user closes or exits the page
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    firestoreSync.flushPendingShiftPlansBundle();
+  });
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      firestoreSync.flushPendingShiftPlansBundle();
+    }
+  });
+}
 

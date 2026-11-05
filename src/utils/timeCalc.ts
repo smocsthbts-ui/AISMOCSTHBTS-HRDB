@@ -1303,6 +1303,28 @@ export function filterDeduplicatedPunches(
   };
 }
 
+function toStandardIsoDate(raw: any): string {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+  if (m) {
+    let y = parseInt(m[3], 10);
+    if (m[3].length === 2) y += (y >= 70 ? 1900 : 2000);
+    if (y > 2400) y -= 543;
+    const p1 = parseInt(m[1], 10);
+    const p2 = parseInt(m[2], 10);
+    let month = p1;
+    let day = p2;
+    if (p1 > 12 && p2 <= 12) {
+      day = p1;
+      month = p2;
+    }
+    return `${y}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+  return s;
+}
+
 /**
  * Generate full monthly TimeSheet rows for a specific employee and monthYear (e.g. "2026-05")
  */
@@ -1334,12 +1356,14 @@ export function buildTimeSheetForEmployee(
     return isEmployeeMatch(pId, employee);
   });
 
-  // Filter approved OT for this month or retroactive OT assigned to this month
+  // Filter approved OT for this month or retroactive OT assigned to this month (robust ISO date normalization)
   const empOT = otRecords.filter(ot => {
     const isEmpMatch = isEmployeePlanMatch(ot, employee);
     if (!isEmpMatch) return false;
-    const targetDate = ot.retroactiveTargetDate || ot.date;
-    return targetDate.startsWith(monthYear) && ot.status === 'Approved';
+    const rawTarget = ot.retroactiveTargetDate || ot.date || '';
+    const normTarget = toStandardIsoDate(rawTarget) || rawTarget;
+    const isApproved = !ot.status || ot.status === 'Approved' || String(ot.status).toLowerCase() === 'approved';
+    return normTarget.startsWith(monthYear) && isApproved;
   });
 
   // Filter other allowances for this month
@@ -1381,13 +1405,14 @@ export function buildTimeSheetForEmployee(
 
   const empOTByDate = new Map<string, OTRecord[]>();
   for (const ot of empOT) {
-    const targetDate = ot.retroactiveTargetDate || ot.date;
-    let list = empOTByDate.get(targetDate);
+    const rawTarget = ot.retroactiveTargetDate || ot.date || '';
+    const normTarget = toStandardIsoDate(rawTarget) || rawTarget;
+    let list = empOTByDate.get(normTarget);
     if (!list) {
       list = [];
-      empOTByDate.set(targetDate, list);
+      empOTByDate.set(normTarget, list);
     }
-    list.push(ot);
+    list.push({ ...ot, date: normTarget, retroactiveTargetDate: normTarget });
   }
 
   const empAllowancesByDate = new Map<string, OtherAllowance[]>();

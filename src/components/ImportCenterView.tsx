@@ -359,14 +359,15 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
       if (item.totalHours > 60) {
         reasons.push(`ชั่วโมงรวมสูงผิดปกติ (${item.totalHours.toFixed(1)} ชม.)`);
       }
-      const dateCounts: Record<string, number> = {};
+      const dateSlotCounts: Record<string, number> = {};
       item.records.forEach(r => {
         const d = r.retroactiveTargetDate || r.date;
-        dateCounts[d] = (dateCounts[d] || 0) + 1;
+        const slotKey = `${d}_${r.rate}_${r.startTime || ''}_${r.endTime || ''}`;
+        dateSlotCounts[slotKey] = (dateSlotCounts[slotKey] || 0) + 1;
       });
-      const dupDates = Object.entries(dateCounts).filter(([_, count]) => count > 1);
-      if (dupDates.length > 0) {
-        reasons.push(`พบรายการซ้ำในวันเดียวกัน ${dupDates.length} วัน (${dupDates.map(d => d[0]).slice(0, 2).join(', ')})`);
+      const dupSlots = Object.entries(dateSlotCounts).filter(([_, count]) => count > 1);
+      if (dupSlots.length > 0) {
+        reasons.push(`พบรายการโอทีซ้ำช่วงเวลาเดียวกัน (${dupSlots.length} รายการ)`);
       }
       if (!employees.some(e => e.empNo === item.empNo || e.gid === item.gid)) {
         reasons.push('ไม่พบรหัสในฐานข้อมูล Employee Master');
@@ -967,7 +968,6 @@ export const ImportCenterView: React.FC<ImportCenterViewProps> = ({
 
       const updatedPlans = Array.from(newPlanMap.values());
       await storage.setShiftPlans(updatedPlans);
-      await firestoreSync.syncShiftPlans(updatedPlans);
 
       // If new Employees were discovered & auto-created from template, persist them cleanly into Employee Master Database
       if (result.newEmployees && result.newEmployees.length > 0) {

@@ -37,7 +37,7 @@ import {
   deduplicateAndCanonicalizeShiftPlans,
   subscribeToCloudChanges 
 } from '../firebase';
-import { mergeAndDeduplicateOTRecords, sanitizeOTRecords } from './otManager';
+import { mergeAndDeduplicateOTRecords, sanitizeOTRecords, normalizeOTDate } from './otManager';
 import { normalizeShiftTimeString } from './timeCalc';
 import { idbGet, idbSet, IDB_KEYS } from './indexedDBStorage';
 
@@ -1709,7 +1709,12 @@ export const storage = {
       const validExisting = isNaN(existingTime) ? 0 : existingTime;
       const validNew = isNaN(newTime) ? 0 : newTime;
 
-      if (!existing || validNew >= validExisting) {
+      // Cloud only overwrites local if Cloud is STRICTLY newer
+      // AND if local was modified recently (within 15 minutes), local takes precedence over stale Cloud bundles
+      const isLocalRecent = existing && (Date.now() - validExisting < 15 * 60 * 1000);
+      const shouldAdoptCloud = !existing || (validNew > validExisting && !isLocalRecent);
+
+      if (shouldAdoptCloud) {
         planMap.set(key, {
           ...(existing || {}),
           ...p,
@@ -1861,7 +1866,11 @@ export const storage = {
     try {
       const parsed = JSON.parse(data);
       if (Array.isArray(parsed)) {
-        return sanitizeOTRecords(parsed).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+        return sanitizeOTRecords(parsed).filter(o => {
+          const d = o.retroactiveTargetDate || o.date;
+          const normD = normalizeOTDate(d) || d;
+          return !normD || normD >= HISTORY_CUTOFF_DATE;
+        });
       }
       return [];
     } catch {
@@ -1870,10 +1879,16 @@ export const storage = {
   },
   async setOTRecords(records: OTRecord[]): Promise<boolean> {
     const sanitized = sanitizeOTRecords(records || []);
-    const cleanRecords = sanitized.filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
+    const cleanRecords = sanitized.filter(o => {
+      const d = o.retroactiveTargetDate || o.date;
+      const normD = normalizeOTDate(d) || d;
+      return !normD || normD >= HISTORY_CUTOFF_DATE;
+    });
     safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanRecords));
-    notifyDataChanged();
-    return await firestoreSync.syncOTRecords(cleanRecords);
+    notifyDataChangedImmediate();
+    const result = await firestoreSync.syncOTRecords(cleanRecords);
+    notifyDataChangedImmediate();
+    return result;
   },
 
   getOtherAllowances(): OtherAllowance[] {
@@ -2152,10 +2167,39 @@ export const storage = {
         safeSetItem(STORAGE_KEYS.DEPARTMENTS, JSON.stringify(cleanDepts));
         safeSetItem(STORAGE_KEYS.DEPARTMENTS_MODIFIED, String(Date.now()));
 
-        // 6. OT RECORDS (Cloud is authoritative master)
+        // 6. OT RECORDS (Cloud is authoritative master with resilient merge)
         if ((cloudData as any).hasOTBundle || (cloudData.otRecords && cloudData.otRecords.length > 0)) {
-          const cleanOT = (cloudData.otRecords || []).filter(o => !o.date || o.date >= HISTORY_CUTOFF_DATE);
-          safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanOT));
+          const cleanCloudOT = (cloudData.otRecords || []).filter(o => {
+            const d = o.retroactiveTargetDate || o.date;
+            const normD = normalizeOTDate(d) || d;
+            return !normD || normD >= HISTORY_CUTOFF_DATE;
+          });
+
+          // Reconcile with local OT records to guarantee zero loss across devices
+          const localOT = this.getOTRecords();
+          const mergedOTMap = new Map<string, OTRecord>();
+
+          localOT.forEach(o => {
+            if (o && (o.empNo || o.gid)) {
+              const d = o.retroactiveTargetDate || o.date;
+              const normD = normalizeOTDate(d) || d;
+              const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+              mergedOTMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+            }
+          });
+
+          // Cloud records take authoritative precedence
+          cleanCloudOT.forEach(o => {
+            if (o && (o.empNo || o.gid)) {
+              const d = o.retroactiveTargetDate || o.date;
+              const normD = normalizeOTDate(d) || d;
+              const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+              mergedOTMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+            }
+          });
+
+          const finalOT = Array.from(mergedOTMap.values());
+          safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(finalOT));
         }
 
         // 7. OTHER ALLOWANCES (Cloud is authoritative master)
@@ -2181,11 +2225,8 @@ export const storage = {
 
         return { connected: true, source: 'cloud' };
       } else {
-        // Cloud returned no bundled data. If local has initial data, seed once safely
-        const localEmps = this.getEmployees();
-        if (localEmps.length > 0 && isCloudReady) {
-          await this.syncAllToCloud().catch(console.warn);
-        }
+        // Cloud connection ready but no bundled data returned.
+        // Never overwrite Cloud with local state on boot to prevent wiping other users' uploads.
         return { connected: isCloudReady, source: 'local' };
       }
     } catch (e) {
@@ -2412,3 +2453,7 @@ export const storage = {
     return true;
   }
 };
+
+// Register shift plans provider so debounced bundle sync always captures the complete local array
+firestoreSync.setShiftPlansProvider(() => storage.getShiftPlans());
+
