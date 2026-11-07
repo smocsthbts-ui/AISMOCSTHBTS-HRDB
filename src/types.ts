@@ -85,6 +85,7 @@ export interface OTRecord {
   section?: string;
   department?: string;
   employeeName?: string;
+  name?: string;
   date: string;         // "YYYY-MM-DD" (Target date)
   originalDate: string; // If submitted from previous month
   startTime: string;    // "17:30"
@@ -96,6 +97,7 @@ export interface OTRecord {
   isRetroactive: boolean; // Is from previous month? Needs Admin review
   retroactiveTargetDate?: string;
   status: 'Approved' | 'Pending_Admin_Review' | 'Rejected';
+  updatedAt?: string;
 }
 
 export interface OtherAllowance {

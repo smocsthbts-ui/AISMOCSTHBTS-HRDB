@@ -110,6 +110,16 @@ export function safeSetItem(key: string, value: string): void {
     } catch {}
   }
 
+  // If storing OT records, also asynchronously persist to IndexedDB (unlimited capacity, survives browser restarts)
+  if (key === STORAGE_KEYS.OT_RECORDS) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        idbSet(IDB_KEYS.OT_RECORDS, parsed).catch(() => {});
+      }
+    } catch {}
+  }
+
   // 2. Persist to localStorage safely if within size limits without slicing
   try {
     if (typeof window !== 'undefined' && window.localStorage) {
@@ -387,6 +397,7 @@ export const notifyDataChangedImmediate = () => {
 
 // In-memory cache for high-volume biometric punches to eliminate synchronous JSON stringify overhead
 let memoryPunchesCache: BiometricRawPunch[] | null = null;
+let memoryOTCache: OTRecord[] | null = null;
 let cloudListenerAttached = false;
 let isLocalSavingPunches = false;
 
@@ -1787,7 +1798,21 @@ export const storage = {
     }
   },
 
-  async hydrateFromIndexedDB(): Promise<{ count: number }> {
+  async hydrateFromIndexedDB(): Promise<{ count: number; otCount: number }> {
+    let punchesCount = 0;
+    let otCount = 0;
+    try {
+      const punchRes = await this.hydratePunchesFromIndexedDB();
+      punchesCount = punchRes.count;
+    } catch {}
+    try {
+      const otRes = await this.hydrateOTFromIndexedDB();
+      otCount = otRes.count;
+    } catch {}
+    return { count: punchesCount, otCount };
+  },
+
+  async hydratePunchesFromIndexedDB(): Promise<{ count: number }> {
     try {
       const idbPunches = await idbGet<BiometricRawPunch[]>(IDB_KEYS.BIOMETRIC_PUNCHES);
       if (Array.isArray(idbPunches) && idbPunches.length > 0) {
@@ -1815,6 +1840,41 @@ export const storage = {
       console.warn('Hydrate punches from IndexedDB warning:', err);
     }
     return { count: memoryPunchesCache ? memoryPunchesCache.length : 0 };
+  },
+
+  async hydrateOTFromIndexedDB(): Promise<{ count: number }> {
+    try {
+      const idbOT = await idbGet<OTRecord[]>(IDB_KEYS.OT_RECORDS);
+      if (Array.isArray(idbOT) && idbOT.length > 0) {
+        const otMap = new Map<string, OTRecord>();
+        idbOT.forEach(o => {
+          if (!o || (!o.empNo && !o.gid)) return;
+          const d = o.retroactiveTargetDate || o.date;
+          const normD = normalizeOTDate(d) || d;
+          if (normD && normD < HISTORY_CUTOFF_DATE) return;
+          const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+          otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+        });
+        if (memoryOTCache && memoryOTCache.length > 0) {
+          memoryOTCache.forEach(o => {
+            if (!o || (!o.empNo && !o.gid)) return;
+            const d = o.retroactiveTargetDate || o.date;
+            const normD = normalizeOTDate(d) || d;
+            if (normD && normD < HISTORY_CUTOFF_DATE) return;
+            const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
+            if (!otMap.has(k)) otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+          });
+        }
+        const merged = Array.from(otMap.values());
+        memoryOTCache = merged;
+        safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(merged));
+        notifyDataChangedImmediate();
+        return { count: merged.length };
+      }
+    } catch (err) {
+      console.warn('Hydrate OT from IndexedDB warning:', err);
+    }
+    return { count: memoryOTCache ? memoryOTCache.length : 0 };
   },
 
   async setBiometricPunches(punches: BiometricRawPunch[]): Promise<boolean> {
@@ -1859,30 +1919,53 @@ export const storage = {
   },
 
   getOTRecords(): OTRecord[] {
+    if (memoryOTCache !== null && memoryOTCache.length > 0) {
+      return memoryOTCache;
+    }
     const data = safeGetItem(STORAGE_KEYS.OT_RECORDS);
-    if (!data) {
-      return [];
+    if (data) {
+      try {
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const sanitized = sanitizeOTRecords(parsed).filter(o => {
+            const d = o.retroactiveTargetDate || o.date;
+            const normD = normalizeOTDate(d) || d;
+            return !normD || normD >= HISTORY_CUTOFF_DATE;
+          });
+          memoryOTCache = sanitized;
+          return sanitized;
+        }
+      } catch {}
     }
-    try {
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        return sanitizeOTRecords(parsed).filter(o => {
-          const d = o.retroactiveTargetDate || o.date;
-          const normD = normalizeOTDate(d) || d;
-          return !normD || normD >= HISTORY_CUTOFF_DATE;
-        });
-      }
-      return [];
-    } catch {
-      return [];
-    }
+    // Asynchronously trigger IndexedDB hydration if not yet loaded
+    this.hydrateOTFromIndexedDB().catch(() => {});
+    return memoryOTCache || [];
   },
+
+  setOTRecordsLocalOnly(records: OTRecord[]): void {
+    const sanitized = sanitizeOTRecords(records || []);
+    const cleanRecords = sanitized.filter(o => {
+      const d = o.retroactiveTargetDate || o.date;
+      const normD = normalizeOTDate(d) || d;
+      return !normD || normD >= HISTORY_CUTOFF_DATE;
+    });
+    memoryOTCache = cleanRecords;
+    idbSet(IDB_KEYS.OT_RECORDS, cleanRecords).catch(err => {
+      console.warn('IndexedDB setOTRecordsLocalOnly error:', err);
+    });
+    safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanRecords));
+  },
+
   async setOTRecords(records: OTRecord[]): Promise<boolean> {
     const sanitized = sanitizeOTRecords(records || []);
     const cleanRecords = sanitized.filter(o => {
       const d = o.retroactiveTargetDate || o.date;
       const normD = normalizeOTDate(d) || d;
       return !normD || normD >= HISTORY_CUTOFF_DATE;
+    });
+    memoryOTCache = cleanRecords;
+    idbSet(IDB_KEYS.OT_RECORDS, cleanRecords).catch(err => {
+      console.warn('IndexedDB setOTRecords error:', err);
     });
     safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(cleanRecords));
     notifyDataChangedImmediate();
@@ -2199,7 +2282,13 @@ export const storage = {
           });
 
           const finalOT = Array.from(mergedOTMap.values());
-          safeSetItem(STORAGE_KEYS.OT_RECORDS, JSON.stringify(finalOT));
+          if (finalOT.length > 0 || cleanCloudOT.length > 0) {
+            this.setOTRecordsLocalOnly(finalOT);
+          }
+          // If local had OT records that were not yet in cloud, push them to cloud in background
+          if (localOT.length > 0 && cleanCloudOT.length === 0) {
+            firestoreSync.syncOTRecords(finalOT).catch(() => null);
+          }
         }
 
         // 7. OTHER ALLOWANCES (Cloud is authoritative master)

@@ -139,10 +139,13 @@ export default function App() {
   useEffect(() => {
     reloadData();
 
-    // Hydrate biometric punches from IndexedDB to guarantee 100% complete records across all months
+    // Hydrate biometric punches and OT records from IndexedDB to guarantee 100% complete records across all months
     storage.hydrateFromIndexedDB().then((res) => {
       if (res && res.count > 0) {
         setBiometricPunches(storage.getBiometricPunches());
+      }
+      if (res && res.otCount > 0) {
+        setOTRecords(storage.getOTRecords());
       }
     }).catch(() => {});
 

@@ -685,6 +685,37 @@ export function cleanDepartmentForFirestore(dept: Department, defaultTime?: stri
   });
 }
 
+export function cleanOTRecordForFirestore(record: OTRecord, defaultTime?: string): OTRecord {
+  const baseTime = defaultTime || new Date().toISOString();
+  const rawTarget = record.retroactiveTargetDate || record.date || '';
+  const normDate = normalizeOTDate(rawTarget) || rawTarget;
+  const empNoClean = String(record.empNo || '').trim();
+  const gidClean = String(record.gid || '').trim().toUpperCase();
+  const cleanId = record.id || `${(empNoClean || gidClean || 'OT')}_${normDate}_${record.rate || 1.5}_${record.startTime || ''}`;
+
+  const clean: any = {
+    id: cleanId,
+    empNo: empNoClean,
+    gid: gidClean,
+    date: normDate,
+    startTime: String(record.startTime || '').trim(),
+    endTime: String(record.endTime || '').trim(),
+    hours: typeof record.hours === 'number' ? record.hours : (parseFloat(String(record.hours)) || 0),
+    rate: record.rate === 3.0 ? 3.0 : 1.5,
+    status: record.status || 'Approved',
+    department: String(record.department || '').trim(),
+    section: String(record.section || '').trim(),
+    name: String(record.name || record.employeeName || '').trim(),
+    employeeName: String(record.employeeName || record.name || '').trim(),
+    reason: String(record.reason || '').trim(),
+    approvedBy: String(record.approvedBy || '').trim(),
+    originalDate: normalizeOTDate(record.originalDate) || record.originalDate || normDate,
+    retroactiveTargetDate: normDate,
+    updatedAt: record.updatedAt || baseTime,
+  };
+  return removeUndefinedFields(clean) as OTRecord;
+}
+
 // Chunk helper for large arrays
 function chunkArray<T>(arr: T[], chunkSize: number): T[][] {
   const chunks: T[][] = [];
@@ -1420,20 +1451,22 @@ export const firestoreSync = {
     try {
       const now = new Date().toISOString();
       const sanitized = sanitizeOTRecords(records || []);
-      const cleanRecords = sanitized.filter(o => {
-        const targetD = o.retroactiveTargetDate || o.date;
-        const normD = normalizeOTDate(targetD) || targetD;
-        return !normD || normD >= '2025-01-01';
-      });
+      const cleanRecords = sanitized
+        .filter(o => {
+          const targetD = o.retroactiveTargetDate || o.date;
+          const normD = normalizeOTDate(targetD) || targetD;
+          return !normD || normD >= '2025-01-01';
+        })
+        .map(o => cleanOTRecordForFirestore(o, now));
 
       // Preserve existing cloud OT records so single month/department uploads NEVER wipe out others
       let recordsToSync = cleanRecords;
       try {
-        // Fast parallel lookup for existing OT records in cloud bundles (5-second timeout)
+        // Fast parallel lookup for existing OT records in cloud bundles (2500ms timeout)
         const [manifestSnap, directBundleSnap, chunk0Snap] = await Promise.all([
-          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records_manifest')), 5000, null).catch(() => null),
-          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records')), 5000, null).catch(() => null),
-          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records_0')), 5000, null).catch(() => null),
+          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records_manifest')), 2500, null).catch(() => null),
+          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records')), 2500, null).catch(() => null),
+          promiseWithTimeout(getDoc(doc(db, 'app_bundles', 'ot_records_0')), 2500, null).catch(() => null),
         ]);
 
         const otMap = new Map<string, OTRecord>();
@@ -1443,10 +1476,8 @@ export const firestoreSync = {
           const list: OTRecord[] = chunk0Snap.data()?.data || [];
           list.forEach(o => {
             if (o && (o.empNo || o.gid)) {
-              const targetD = o.retroactiveTargetDate || o.date;
-              const normD = normalizeOTDate(targetD) || targetD;
-              const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
-              otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+              const cleaned = cleanOTRecordForFirestore(o);
+              otMap.set(cleaned.id, cleaned);
             }
           });
         }
@@ -1456,11 +1487,9 @@ export const firestoreSync = {
           const list: OTRecord[] = directBundleSnap.data()?.data || [];
           list.forEach(o => {
             if (o && (o.empNo || o.gid)) {
-              const targetD = o.retroactiveTargetDate || o.date;
-              const normD = normalizeOTDate(targetD) || targetD;
-              const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
-              if (!otMap.has(k)) {
-                otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+              const cleaned = cleanOTRecordForFirestore(o);
+              if (!otMap.has(cleaned.id)) {
+                otMap.set(cleaned.id, cleaned);
               }
             }
           });
@@ -1469,10 +1498,7 @@ export const firestoreSync = {
         // Overlay incoming uploaded records (authoritative precedence)
         recordsToSync.forEach(o => {
           if (o && (o.empNo || o.gid)) {
-            const targetD = o.retroactiveTargetDate || o.date;
-            const normD = normalizeOTDate(targetD) || targetD;
-            const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
-            otMap.set(k, { ...o, date: normD, retroactiveTargetDate: normD });
+            otMap.set(o.id, o);
           }
         });
 
@@ -1483,9 +1509,11 @@ export const firestoreSync = {
         console.warn('syncOTRecords cloud merge notice:', mergeErr);
       }
 
-      const otChunks = chunkArray(recordsToSync, 1200);
+      // Chunk at 500 records to stay safely below 1MB Firestore document limit
+      const otChunks = chunkArray(recordsToSync, 500);
 
       const syncTask = async () => {
+        lastLocalBundleWriteTimestamp = Date.now();
         const promises: Promise<any>[] = [];
 
         // 1. Write manifest
@@ -1494,7 +1522,7 @@ export const firestoreSync = {
             chunks: otChunks.length,
             totalRecords: recordsToSync.length,
             updatedAt: now,
-          }, { merge: true })
+          })
         );
 
         // 2. Write chunked documents
@@ -1505,7 +1533,7 @@ export const firestoreSync = {
               chunkIndex: 0,
               count: 0,
               updatedAt: now,
-            }, { merge: true })
+            })
           );
         } else {
           for (let i = 0; i < otChunks.length; i++) {
@@ -1515,7 +1543,7 @@ export const firestoreSync = {
                 chunkIndex: i,
                 count: otChunks[i].length,
                 updatedAt: now,
-              }, { merge: true })
+              })
             );
           }
         }
@@ -1528,7 +1556,7 @@ export const firestoreSync = {
             totalRecords: recordsToSync.length,
             isChunked: otChunks.length > 1,
             updatedAt: now,
-          }, { merge: true })
+          })
         );
 
         await Promise.all(promises);
@@ -1539,7 +1567,7 @@ export const firestoreSync = {
       const timeoutTask = new Promise<boolean>((resolve) =>
         setTimeout(() => {
           console.warn(`[syncOTRecords] Cloud sync timeout (${Math.round(timeoutMs / 1000)}s); local storage active.`);
-          resolve(true);
+          resolve(false);
         }, timeoutMs)
       );
 
@@ -2142,10 +2170,14 @@ export const firestoreSync = {
 
       // Reconstruct OT Records: Pool all available chunks and legacy bundle with date normalization
       const rawOTList: OTRecord[] = [];
-      rawChunkedOTDocs.forEach(c => {
+      const validOTDocs = otManifestChunks !== null
+        ? rawChunkedOTDocs.filter(c => c.index < otManifestChunks)
+        : rawChunkedOTDocs;
+      validOTDocs.sort((a, b) => a.index - b.index);
+      validOTDocs.forEach(c => {
         if (Array.isArray(c.data)) rawOTList.push(...c.data);
       });
-      if (legacyOTRecords.length > 0) {
+      if (rawOTList.length === 0 && legacyOTRecords.length > 0) {
         rawOTList.push(...legacyOTRecords);
       }
 
@@ -2153,24 +2185,17 @@ export const firestoreSync = {
         const poolMap = new Map<string, OTRecord>();
         rawOTList.forEach(o => {
           if (!o || (!o.empNo && !o.gid)) return;
-          const targetD = o.retroactiveTargetDate || o.date;
-          const normD = normalizeOTDate(targetD) || targetD;
-          if (normD && normD < '2025-01-01') return;
-          const k = o.id || `${(o.empNo || o.gid).trim().toUpperCase()}_${normD}_${o.rate}_${o.startTime || ''}`;
-          if (!poolMap.has(k)) {
-            poolMap.set(k, {
-              ...o,
-              date: normD || o.date,
-              originalDate: normalizeOTDate(o.originalDate) || o.originalDate || normD,
-              retroactiveTargetDate: normD || o.retroactiveTargetDate,
-            });
+          const cleaned = cleanOTRecordForFirestore(o);
+          if (cleaned.date && cleaned.date < '2025-01-01') return;
+          if (!poolMap.has(cleaned.id)) {
+            poolMap.set(cleaned.id, cleaned);
           }
         });
         otRecords = Array.from(poolMap.values());
       } else if (otManifestTotal === 0 || otManifestChunks === 0) {
         otRecords = [];
       } else {
-        otRecords = legacyOTRecords;
+        otRecords = legacyOTRecords.map(o => cleanOTRecordForFirestore(o));
       }
 
       // 2. If bundles did not have specific datasets, fallback to legacy individual collections
